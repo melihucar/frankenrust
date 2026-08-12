@@ -10,6 +10,8 @@ notice. It runs in every gate profile.
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import re
 import subprocess
 import sys
@@ -63,8 +65,40 @@ def check_prompts() -> int:
     return 0
 
 
+def check_dep_parsing() -> int:
+    """The queue's ordering guarantee, pinned by the cases that broke it.
+
+    An issue whose dependencies parse to [] is claimable immediately, so it
+    reaches an agent before the code it builds on exists and burns every
+    attempt on a failure the implementer cannot fix. The first two cases are
+    verbatim prose from issues the planner filed, which really did parse as
+    unblocked. The bullet case is here because the obvious fix -- anchoring the
+    pattern to the line start -- silently breaks it in the same direction.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import gh
+
+    cases = [
+        ("prose before the metadata line",
+         "will all change behaviour on paths #10 depends on.\n\nDepends on: #7\n", [7]),
+        ("prose after an issue reference",
+         "because #12's `go_ub_write` depends on this distinction.\n\n"
+         "Depends on: #10, #12\n", [10, 12]),
+        ("bullet form", "- Depends on: #5\n", [5]),
+        ("no dependency line", "Nothing to wait for.\n", []),
+        ("a version number is not a dependency", "Depends on: PHP 8.5\n", []),
+    ]
+    bad = 0
+    for name, body, want in cases:
+        with contextlib.redirect_stderr(io.StringIO()):   # the last case warns by design
+            got = gh.Issue(number=1, title="t", body=body).deps
+        if got != want:
+            bad += fail(f"dependency parsing regressed on {name}: got {got}, want {want}")
+    return bad
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
         sys.exit(1)
-    sys.exit(1 if check_runs() + check_prompts() else 0)
+    sys.exit(1 if check_runs() + check_prompts() + check_dep_parsing() else 0)

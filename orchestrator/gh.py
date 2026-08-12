@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 
 LABELS = {
@@ -45,6 +46,13 @@ LABELS = {
 
 DEP_RE = re.compile(r"depends on:?\s*(.+)", re.I)
 ISSUE_RE = re.compile(r"#(\d+)")
+# A line that opens with "depends on" is metadata, not prose. If one of those
+# yields no #N at all -- "Depends on: issues 7 and 8" -- the issue reads as
+# unblocked and gets claimed before its prerequisites exist. Bare numbers are
+# deliberately NOT parsed as a fallback: "Depends on: PHP 8.5" would invent
+# dependencies on #8 and #5, which is a worse failure than the one it fixes.
+DEP_LINE_RE = re.compile(r"^[ \t]*[-*]?[ \t]*depends on\b", re.I | re.M)
+_warned: set[tuple[int, str]] = set()
 
 
 def gh(args: list[str], check: bool = False, stdin: str | None = None) -> tuple[int, str]:
@@ -74,8 +82,17 @@ class Issue:
         up blocked. Unioning is also right for a body listing deps as bullets,
         and prose that mentions no issue number contributes nothing.
         """
-        found = {int(n) for m in DEP_RE.finditer(self.body or "")
+        body = self.body or ""
+        found = {int(n) for m in DEP_RE.finditer(body)
                  for n in ISSUE_RE.findall(m.group(1))}
+        for line in body.splitlines():
+            if DEP_LINE_RE.match(line) and not ISSUE_RE.search(line):
+                key = (self.number, line.strip()[:80])
+                if key not in _warned:      # deps is read on every queue poll
+                    _warned.add(key)
+                    print(f"WARN #{self.number}: dependency line parsed to nothing, "
+                          f"issue reads as unblocked: {line.strip()[:120]!r}",
+                          file=sys.stderr)
         return sorted(found)
 
     @property
