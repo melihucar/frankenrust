@@ -155,7 +155,7 @@ def run(cmd: list[str], cwd: Path, timeout: int, log_path: Path | None = None) -
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, errors="replace",
-                                env={**os.environ, "FRANKENRUST_AGENT": "1"})
+                                env=agent_env())
     except FileNotFoundError as exc:
         return 127, f"command not found: {exc}"
     fh = log_path.open("a") if log_path else None
@@ -245,6 +245,24 @@ def _final_text(logpath: Path, agent: str) -> tuple[str, str]:
     return final, err
 
 
+def agent_env() -> dict[str, str]:
+    """Environment for agents and the gate.
+
+    This process is not an interactive shell, so it never sourced the profile
+    that puts rustup's ~/.cargo/bin (and homebrew) on PATH. Agents inherit that
+    gap, and every cargo command then fails as "command not found" -- which the
+    gate reports as the agent's code being broken, three attempts per issue,
+    all night.
+    """
+    env = {**os.environ, "FRANKENRUST_AGENT": "1"}
+    have = env.get("PATH", "").split(os.pathsep)
+    extra = [str(Path.home() / ".cargo" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
+    add = [p for p in extra if p not in have and Path(p).is_dir()]
+    if add:
+        env["PATH"] = os.pathsep.join([*add, *have])
+    return env
+
+
 def _hit_limit(logpath: Path) -> bool:
     if not logpath.exists():
         return False
@@ -271,7 +289,7 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
         with pf.open("rb") as stdin_fh, logpath.open("ab") as out_fh:
             proc = subprocess.Popen(agent_cmd(use, model), cwd=str(wt), stdin=stdin_fh,
                                     stdout=out_fh, stderr=subprocess.STDOUT,
-                                    env={**os.environ, "FRANKENRUST_AGENT": "1"})
+                                    env=agent_env())
             # Heartbeat rather than a bare wait(). Agents emit nothing until
             # they exit -- `--output-format text` buffers, and codex is quiet
             # too -- so an hour-long task and a hung one look identical from

@@ -14,6 +14,12 @@ PROFILE="${1:-default}"
 cd "$(dirname "$0")/.." || exit 1
 FAILED=()
 
+# rustup installs cargo to ~/.cargo/bin and leaves it to an interactive shell
+# profile to put that on PATH. The orchestrator is not an interactive shell and
+# neither are the agents it spawns, so without this every cargo step fails as
+# "command not found" and the gate reports it as the agent's code being broken.
+command -v cargo >/dev/null 2>&1 || export PATH="$HOME/.cargo/bin:$PATH"
+
 step() {
   local name="$1"; shift
   echo "--- gate: $name"
