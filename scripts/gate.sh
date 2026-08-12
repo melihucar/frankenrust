@@ -35,6 +35,13 @@ step "test-suite-intact" bash -c '
     echo "found #[ignore] without a GATE-OK justification"; exit 1; }
 '
 
+# The orchestrator can now merge changes to itself and restart into them, so a
+# broken loop.py would end the run with no human around to restart it. This is
+# the check that makes self-modification survivable: it runs in every profile,
+# and it is why a syntax error, an import-time crash, or a role with no prompt
+# file can never reach main.
+step "orchestrator-runnable" python3 scripts/check_orchestrator.py
+
 # Early backlog tasks (the PHP base image, the conformance harness) legitimately
 # produce no Rust. Tolerate a missing workspace ONLY in bootstrap; in any other
 # profile a vanished Cargo.toml means someone deleted the project.

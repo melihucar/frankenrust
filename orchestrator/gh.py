@@ -40,8 +40,8 @@ DEP_RE = re.compile(r"depends on:?\s*(.+)", re.I)
 ISSUE_RE = re.compile(r"#(\d+)")
 
 
-def gh(args: list[str], check: bool = False) -> tuple[int, str]:
-    p = subprocess.run(["gh", *args], capture_output=True, text=True)
+def gh(args: list[str], check: bool = False, stdin: str | None = None) -> tuple[int, str]:
+    p = subprocess.run(["gh", *args], capture_output=True, text=True, input=stdin)
     out = (p.stdout + p.stderr).strip()
     if check and p.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)} failed: {out}")
@@ -71,6 +71,18 @@ class Issue:
     def agent(self) -> str:
         m = re.search(r"^\s*agent:\s*(\w+)", self.body or "", re.I | re.M)
         return m.group(1).lower() if m else "codex"
+
+    @property
+    def revisions(self) -> int:
+        """How many times the resolver has already re-scoped this issue.
+
+        Highest match wins, not the first. The resolver rewrites the body
+        itself, so it can leave a stale counter above the new one; reading the
+        first would freeze the count and let critic and resolver hand the issue
+        back and forth forever with nobody watching.
+        """
+        found = re.findall(r"^\s*revisions:\s*(\d+)", self.body or "", re.I | re.M)
+        return max((int(n) for n in found), default=0)
 
 
 def ensure_labels() -> None:
@@ -144,6 +156,33 @@ def block(n: int, why: str) -> None:
 def question(n: int, critique: str) -> None:
     comment(n, f"**An agent challenged this issue rather than implementing it.**\n\n{critique[:60000]}")
     gh(["issue", "edit", str(n), "--add-label", "fr:questioned", "--remove-label", "fr:claimed"])
+
+
+def requeue(n: int, revision: int) -> bool:
+    """Return a re-scoped issue to the queue, stamping the revision count.
+
+    The resolver rewrites the body itself; this re-reads whatever it wrote so a
+    concurrent edit is not clobbered, then upserts the counter that stops the
+    critic and the resolver passing an issue back and forth indefinitely.
+    """
+    rc, out = gh(["issue", "view", str(n), "--json", "body"])
+    if rc != 0:
+        return False
+    try:
+        body = json.loads(out).get("body") or ""
+    except json.JSONDecodeError:
+        return False
+    line = f"Revisions: {revision}"
+    if re.search(r"^\s*revisions:\s*\d+", body, re.I | re.M):
+        body = re.sub(r"^\s*revisions:\s*\d+", line, body, count=1, flags=re.I | re.M)
+    else:
+        body = f"{body.rstrip()}\n\n{line}\n"
+    rc, _ = gh(["issue", "edit", str(n), "--body-file", "-"], stdin=body)
+    if rc != 0:
+        return False
+    rc, _ = gh(["issue", "edit", str(n), "--add-label", "fr:ready",
+                "--remove-label", "fr:claimed,fr:questioned"])
+    return rc == 0
 
 
 def comment(n: int, body: str) -> None:

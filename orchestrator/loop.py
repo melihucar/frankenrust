@@ -53,7 +53,8 @@ AGENT_TIMEOUT = int(os.environ.get("FR_AGENT_TIMEOUT", str(60 * 60)))
 GATE_TIMEOUT = int(os.environ.get("FR_GATE_TIMEOUT", str(30 * 60)))
 WALLCLOCK_LIMIT = int(os.environ.get("FR_WALLCLOCK", str(8 * 60 * 60)))
 HEARTBEAT = int(os.environ.get("FR_HEARTBEAT", "60"))
-RETRO_EVERY = int(os.environ.get("FR_RETRO_EVERY", "2"))   # cycles per retrospective
+# The retrospective is triggered by merges, not by a cycle count -- see
+# retro_thread(). A cycle that merges nothing produces no new evidence.
 # -----------------------------------------------------------------------------
 
 # Implementation is bulk mechanical translation against a spec that already
@@ -66,7 +67,15 @@ MODELS = {
     "reviewer": os.environ.get("FR_MODEL_REVIEW", "claude-opus-5"),
     "fixer": os.environ.get("FR_MODEL_FIX", "claude-opus-5"),
     "planner": os.environ.get("FR_MODEL_PLAN", "claude-opus-5"),
+    "resolver": os.environ.get("FR_MODEL_RESOLVE", "claude-opus-5"),
 }
+# How many times an issue may be re-scoped before the resolver must decide it
+# outright. Without a cap, critic and resolver can hand an issue back and forth
+# forever and it never gets built.
+MAX_REVISIONS = int(os.environ.get("FR_MAX_REVISIONS", "2"))
+# Consecutive empty polls before believing the queue is finished. GitHub's
+# issue list lags writes by seconds, and one empty read ends the whole run.
+DRAIN_CONFIRMATIONS = int(os.environ.get("FR_DRAIN_CONFIRMATIONS", "3"))
 ESCALATED_MODEL = os.environ.get("FR_MODEL_ESCALATE", "claude-opus-5")
 
 # Codex runs on a separate quota that will likely run out mid-run. When it does,
@@ -379,6 +388,47 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path, tag: str) -> str | Non
     return "\n\n".join(found) if found else None
 
 
+def resolve_question(issue: gh.Issue, wt: Path, logdir: Path, critique: str) -> bool:
+    """Adjudicate a critic's objection. Returns True to implement anyway.
+
+    Without this, `VERDICT: REVISE` is where work goes to die: the issue gets
+    parked as fr:questioned and waits for a human who is not coming. The
+    resolver has to research the objection against the code and upstream and
+    come back with a decision -- re-scope it, kill it, or overrule the critic.
+    Parking is not one of the options.
+    """
+    rounds = issue.revisions
+    extra = f"\n# The critic's objection\n\n{critique[-8000:]}\n"
+    if rounds >= MAX_REVISIONS:
+        extra += (f"\n# This issue has already been re-scoped {rounds} times.\n"
+                  "REWRITE is no longer available to you. Decide PROCEED or "
+                  "CLOSE, and justify it.\n")
+    _, _, out = invoke("claude", wt, prompt_for("resolver", issue, extra),
+                       logdir, f"resolve.{rounds}", role="resolver")
+
+    if "RESOLUTION: PROCEED" in out:
+        gh.comment(issue.number, f"**Resolver: the objection does not hold.**\n\n{out[-30000:]}")
+        record("resolved", issue=issue.number, decision="proceed", round=rounds)
+        return True
+    if "RESOLUTION: CLOSE" in out:
+        gh.close(issue.number, f"**Resolver: this issue should not be built.**\n\n{out[-30000:]}")
+        record("resolved", issue=issue.number, decision="close", round=rounds)
+        return False
+    if "RESOLUTION: REWRITE" in out and rounds < MAX_REVISIONS:
+        if gh.requeue(issue.number, rounds + 1):
+            gh.comment(issue.number, f"**Resolver: re-scoped, back in the queue.**\n\n{out[-30000:]}")
+            record("resolved", issue=issue.number, decision="rewrite", round=rounds + 1)
+            return False
+        record("resolve_failed", issue=issue.number, reason="requeue failed")
+
+    # No usable decision. Park it rather than spin -- but this is a loop defect,
+    # so make sure the retrospective sees it.
+    log(f"    !! #{issue.number} resolver gave no decision; parking")
+    record("resolve_failed", issue=issue.number, round=rounds, excerpt=out[-1500:])
+    gh.question(issue.number, critique[-40000:])
+    return False
+
+
 def work(issue: gh.Issue) -> None:
     tid = f"{issue.number}"
     logdir = LOGS / tid
@@ -396,9 +446,12 @@ def work(issue: gh.Issue) -> None:
         log(f"    ?? #{issue.number} questioned by the critic")
         record("critic_revise", issue=issue.number, title=issue.title,
                excerpt=critique[-1500:])
-        gh.question(issue.number, critique[-40000:])
-        git(["worktree", "remove", "--force", str(wt)])
-        return
+        gh.comment(issue.number,
+                   f"**The critic challenged this issue.**\n\n{critique[-40000:]}")
+        if not resolve_question(issue, wt, logdir, critique):
+            git(["worktree", "remove", "--force", str(wt)])
+            return
+        log(f"    -> #{issue.number} objection overruled; implementing")
     if "VERDICT: PROCEED" not in critique:
         log(f"    .. #{issue.number} critic gave no verdict; proceeding")
 
@@ -449,6 +502,7 @@ def work(issue: gh.Issue) -> None:
             record("merged", issue=issue.number, title=issue.title,
                    attempts=attempt, agent=agent, gate=issue.gate)
             git(["worktree", "remove", "--force", str(wt)])
+            _merge_signal.set()
             return
         failure = "Passed gate and review but could not merge (rebase conflict or "\
                   "gate regression against latest main). Re-sync and redo."
@@ -472,16 +526,16 @@ def cmd_seed() -> int:
     return 0 if issues else 1
 
 
-def retrospective(cycle: int) -> None:
+def retrospective(cycle: int | str) -> None:
     """Diagnose the loop, not the issues, and file fixes for itself."""
     if not JOURNAL.exists():
         return
-    log(f"== retrospective (cycle {cycle})")
+    log(f"== retrospective ({cycle})")
     p = "\n".join([(PROMPTS / "shared.md").read_text(),
                     (PROMPTS / "retrospective.md").read_text(),
-                    f"\n# This is cycle {cycle}. Write to "
+                    f"\n# This is retrospective {cycle}. Write to "
                     f"orchestrator/logs/retro-{cycle}.md\n"])
-    invoke("claude", ROOT, p, LOGS / "retro", f"cycle{cycle}", role="critic")
+    invoke("claude", ROOT, p, LOGS / "retro", f"r{cycle}", role="critic")
     record("retrospective", cycle=cycle)
 
 
@@ -490,34 +544,118 @@ def cmd_retro() -> int:
     return 0
 
 
+# A merge is the only event that produces new evidence, so it is the only thing
+# worth retrospecting on. This runs on its own thread: doing it inline would
+# stall a worker for the length of an Opus call, and doing it once per batch
+# would skip merges whenever several land together.
+_merge_signal = threading.Event()
+_retro_stop = threading.Event()
+
+
+def retro_thread() -> None:
+    n = 0
+    while not _retro_stop.is_set():
+        if not _merge_signal.wait(timeout=5):
+            continue
+        _merge_signal.clear()          # cleared before the run, so merges that
+        n += 1                         # land during it trigger another pass
+        try:
+            retrospective(n)
+        except Exception as exc:       # never let the retro kill the run
+            log(f"!! retrospective failed: {exc}")
+            record("retro_error", reason=str(exc))
+
+
+def self_update_pending() -> bool:
+    """Did anything just merged change the code this process is running?"""
+    _, out = git(["log", "-1", "--name-only", "--format=", "HEAD"])
+    return any(f in out for f in ("orchestrator/loop.py", "orchestrator/gh.py"))
+
+
+def restart_into_new_code() -> None:
+    """Re-exec so a merged change to the loop actually takes effect.
+
+    The loop cannot edit itself while running -- Python has the old module in
+    memory -- but it can hand over to a new process. All state lives in GitHub
+    issues, so the successor rebuilds it and carries on. The gate already
+    proved the new code parses and runs, so this is not a leap of faith.
+    """
+    log("== self-update merged; restarting into the new code")
+    record("self_restart", head=git(["rev-parse", "--short", "HEAD"])[1].strip())
+    _retro_stop.set()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Hand the remaining wallclock to the successor so repeated restarts cannot
+    # extend the run past the budget it was given.
+    left = max(int(WALLCLOCK_LIMIT - (time.time() - _start)), 60)
+    env = {**os.environ, "FR_WALLCLOCK": str(left),
+           "FR_RESTARTS": str(int(os.environ.get("FR_RESTARTS", "0")) + 1)}
+    os.execve(sys.executable,
+              [sys.executable, str(Path(__file__).resolve()), "run"], env)
+
+
 def cmd_run() -> int:
     gh.ensure_labels()
-    log(f"loop start: parallel={MAX_PARALLEL}, wallclock={WALLCLOCK_LIMIT}s")
-    cycle = 0
+    restarts = int(os.environ.get("FR_RESTARTS", "0"))
+    log(f"loop start: parallel={MAX_PARALLEL}, wallclock={WALLCLOCK_LIMIT}s"
+        f"{f', restart #{restarts}' if restarts else ''}")
+    # Nothing is running yet, so anything still fr:claimed is residue from a
+    # crash or a self-restart. Left alone it stays claimed forever and there is
+    # nobody to notice.
+    for i in gh.fetch(label="fr:claimed"):
+        gh.release(i.number)
+        record("reclaimed", issue=i.number, title=i.title)
+        log(f"reclaimed stale claim #{i.number}")
+
+    retro = threading.Thread(target=retro_thread, daemon=True)
+    retro.start()
+    empty = 0
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
         while True:
             if time.time() - _start > WALLCLOCK_LIMIT:
                 log("!! wallclock limit reached, stopping")
                 break
             with _claim_lock:
-                batch = [i for i in gh.claimable() if gh.claim(i.number)][:MAX_PARALLEL]
+                # Claim lazily, up to the batch size. Claiming everything and
+                # then slicing strands the remainder in fr:claimed with no
+                # worker and no human -- claimable() then reads empty and the
+                # run ends early believing the queue is drained.
+                batch: list[gh.Issue] = []
+                for cand in gh.claimable():
+                    if len(batch) >= MAX_PARALLEL:
+                        break
+                    if gh.claim(cand.number):
+                        batch.append(cand)
             if not batch:
                 remaining = gh.fetch(label="fr:ready")
-                if not remaining:
+                if remaining:
+                    empty = 0
+                    log(f"waiting: {len(remaining)} ready but dependencies unmet")
+                    time.sleep(30)
+                    continue
+                # GitHub's issue list is eventually consistent -- a queue seeded
+                # seconds ago reads back empty. Quitting on the first empty poll
+                # would end the run before it started.
+                empty += 1
+                if empty >= DRAIN_CONFIRMATIONS:
                     log("queue drained")
                     break
-                log(f"waiting: {len(remaining)} ready but dependencies unmet")
-                time.sleep(30)
+                log(f"queue reads empty ({empty}/{DRAIN_CONFIRMATIONS}); confirming")
+                time.sleep(20)
                 continue
+            empty = 0
             for f in [pool.submit(work, i) for i in batch]:
                 f.result()
-            cycle += 1
-            # Retrospect between cycles, while the evidence is fresh and there
-            # is still queue left for the fixes to affect.
-            if cycle % RETRO_EVERY == 0:
-                retrospective(cycle)
+            # Only at a batch boundary, with no agent mid-flight: swapping the
+            # code out from under a running worker would orphan its worktree.
+            if self_update_pending():
+                restart_into_new_code()
 
-    retrospective(cycle + 1)   # final pass over the whole run
+    # Stop the thread first, then retrospect synchronously: racing a final
+    # set() against the stop flag would silently skip the whole-run pass.
+    _retro_stop.set()
+    retro.join(timeout=AGENT_TIMEOUT)
+    retrospective("final")
     blocked = gh.fetch(label="fr:blocked")
     questioned = gh.fetch(label="fr:questioned")
     log(f"loop end: blocked={[i.number for i in blocked]} "

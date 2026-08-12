@@ -61,7 +61,7 @@ python3 orchestrator/loop.py retro     # retrospective on demand
 ```
 
 Knobs: `FR_PARALLEL` (3), `FR_ATTEMPTS` (3), `FR_WALLCLOCK` (8h),
-`FR_AGENT_TIMEOUT` (1h/attempt), `FR_RETRO_EVERY` (2 cycles).
+`FR_AGENT_TIMEOUT` (1h/attempt), `FR_MAX_REVISIONS` (2 re-scopes per issue).
 Models: `FR_MODEL_IMPL` (Sonnet), `FR_MODEL_REVIEW`/`FR_MODEL_CRITIC` (Opus).
 
 Codex runs on a separate quota. When it runs out mid-run the loop detects it,
@@ -75,13 +75,17 @@ to be started on your behalf. Logs land in `orchestrator/logs/<task-id>/`.
 ### How an issue is processed
 
 ```
-claim ─► critic ─┬─ REVISE ─► comment on the issue, label fr:questioned, move on
-                 └─ PROCEED ─► implementer ─► gate ─┬─ fail ─► retry (≤3, escalating model)
-                                                    └─ pass ─► 2 adversarial reviewers
-                                                        (claude + codex, independent
-                                                         contexts, diff only)
-                                                          ├─ BLOCK ─► fixer ─► re-gate ─► re-review
-                                                          └─ PASS  ─► rebase, re-gate, merge, close
+claim ─► critic ─┬─ REVISE ─► resolver ─┬─ REWRITE ─► re-scope, back to fr:ready
+                 │                      ├─ CLOSE   ─► killed, with evidence
+                 │                      └─ PROCEED ─┐ (critic overruled)
+                 └─ PROCEED ────────────────────────┴─► implementer
+                        │
+                        └─► gate ─┬─ fail ─► retry (≤3, escalating model)
+                                  └─ pass ─► 2 adversarial reviewers
+                                      (claude + codex, independent
+                                       contexts, diff only)
+                                        ├─ BLOCK ─► fixer ─► re-gate ─► re-review
+                                        └─ PASS  ─► rebase, re-gate, merge, close
 ```
 
 The **critic** runs before any code is written. The issues were filed by an
@@ -90,24 +94,40 @@ already done. An agent that faithfully implements a bad issue produces work that
 passes the gate and looks like progress — that is the failure mode this stage
 exists to prevent.
 
+The **resolver** exists because the critic's objection would otherwise be a dead
+end. Parking an issue as `fr:questioned` assumes a human will come back and
+re-scope it; nobody is coming. So a second agent researches the objection
+against `vendor/frankenphp/` and the tree, and must return a decision —
+re-scope, kill it with evidence, or overrule the critic. It may re-scope an
+issue twice; after that it has to decide outright, or critic and resolver will
+hand the same issue back and forth indefinitely.
+
 ### Self-improvement
 
-Every stage outcome is appended to `orchestrator/logs/events.jsonl`. Between
-cycles a **retrospective** reads that journal — not the agent transcripts, which
-are too large and unstructured to yield anything but impressions — and looks for
-patterns rather than incidents. One gate failure is a hard task; four with the
-same error is a broken harness. Three `critic_revise` events with the same
-reason means the *planner prompt* is wrong, not the three issues.
+Every stage outcome is appended to `orchestrator/logs/events.jsonl`. After every
+merge — the only event that produces new evidence — a **retrospective** reads
+that journal, not the agent transcripts, which are too large and unstructured to
+yield anything but impressions. It looks for patterns rather than incidents: one
+gate failure is a hard task; four with the same error is a broken harness. Three
+`critic_revise` events with the same reason means the *planner prompt* is wrong,
+not the three issues. It runs on its own thread, so it never stalls a worker.
 
-It then files its own fixes, under a boundary that is not negotiable:
+It then files its own fixes, and it is allowed to fix anything — including
+itself. Changes to prompts, docs, the gate and the bench take effect on the next
+issue, since those are re-read every invocation. A merged change to `loop.py` or
+`gh.py` cannot take effect in a process that already imported them, so the
+orchestrator **re-execs into the new code** at the next batch boundary, once no
+agent is mid-flight. Queue state lives in GitHub issues, so the successor picks
+up exactly where its predecessor stopped.
 
-- **Prompts, docs, gate, bench** → filed `fr:ready,fr:meta`, drained normally.
-  These are data the loop reads; changing them mid-run is safe.
-- **`loop.py` / `gh.py`** → filed `fr:meta` only, never auto-claimed. The loop
-  is executing that code; letting an agent rewrite its own control flow mid-run
-  risks corrupting the very run producing the evidence. A human promotes those.
-
-So the loop may improve its instructions while running, but not itself.
+What makes that survivable is `scripts/check_orchestrator.py`, wired into every
+gate profile: it parses both modules, runs `loop.py status`, and verifies every
+role the loop can dispatch has a prompt file. A syntax error or a missing prompt
+cannot reach `main`, because it would end the run with nobody there to restart
+it. The retrospective is told, in as many words, that it may never weaken that
+check nor propose removing the gate, the reviewers, or the critic — a loop that
+can delete its own checks eventually will, since that makes every subsequent
+issue trivially closeable.
 
 The adversarial review stage is lifted from
 [Bun's Zig→Rust rewrite](https://bun.com/blog/bun-in-rust), which used

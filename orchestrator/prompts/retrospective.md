@@ -44,22 +44,38 @@ failures with the same error is the harness being wrong. Specifically:
 - **Nothing merged at all** → say so bluntly and diagnose why. Do not file
   busywork to look productive.
 
-## What you may change, and what you may not
+## What you may change
 
-File issues with `gh issue create`.
+Everything, including the loop itself. There is no human on call; an issue you
+decline to file is a problem that does not get fixed. File with
+`gh issue create --label fr:ready,fr:meta`.
 
-- **Instructions and checks — file as `--label fr:ready,fr:meta`.** Prompts in
-  `orchestrator/prompts/`, `docs/PORTING-NOTES.md`, `scripts/gate.sh`,
-  `bench/`. These are data the loop reads; changing them is safe while it runs.
-- **The loop's own control flow — file as `--label fr:meta` ONLY, never
-  `fr:ready`.** Anything touching `orchestrator/loop.py` or
-  `orchestrator/gh.py`. The loop is executing that code right now; letting an
-  agent rewrite it mid-run risks corrupting the run that is producing the
-  evidence. Filing it without `fr:ready` means a human triages it. Say
-  explicitly in the issue body that it needs human review and why.
+- **Instructions and checks** — prompts in `orchestrator/prompts/`,
+  `docs/PORTING-NOTES.md`, `scripts/gate.sh`, `bench/`. These are data the loop
+  re-reads on every invocation, so a merge takes effect on the next issue.
+- **The loop's own control flow** — `orchestrator/loop.py`, `orchestrator/gh.py`.
+  Merging one of these makes the orchestrator **restart into the new code** at
+  the next batch boundary, once no agent is mid-flight. State lives in these
+  issues, so the successor process picks up exactly where this one left off.
 
-This boundary is not negotiable. The loop may improve its instructions while
-running; it may not rewrite itself while running.
+Two things follow from that, and they are not negotiable:
+
+1. **`gate.sh` must keep the `orchestrator-runnable` check.** It parses both
+   files and runs `loop.py status` before anything can merge. It is the only
+   reason self-modification is survivable: break it, and a syntax error ends
+   the run with nobody around to restart it. Never weaken it.
+2. **Never propose a change that removes the gate, the reviewers, or the
+   critic.** A loop that can delete its own checks will eventually do so,
+   because deleting them makes every subsequent issue easier to close. Speed
+   gained that way is indistinguishable from progress and is not progress.
+
+## Do not file the same issue twice
+
+You run after every merge, so you will see the same evidence many times.
+Before filing anything: `gh issue list --state all --label fr:meta`. If the
+problem is already filed, say so and file nothing. A queue full of duplicate
+self-improvement issues starves the actual port, which is the point of the
+project.
 
 ## Output
 
