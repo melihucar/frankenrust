@@ -43,6 +43,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -362,6 +363,26 @@ def make_worktree(tid: str) -> Path:
     return wt
 
 
+def retire_worktree(tid: str) -> None:
+    """Free the disk without losing the evidence. Safe to call twice.
+
+    Agent work is only committed at merge time, so an abandoned worktree holds
+    the only copy of a failed attempt -- and also its target/ dir, which for a
+    Rust workspace that bindgens PHP runs to gigabytes. Leaving those behind
+    fills the disk partway through an overnight run, after which every
+    remaining issue fails for a reason that has nothing to do with its code.
+    So: commit to the branch, which costs nothing and stays inspectable with
+    `git checkout issue/<n>`, then drop the working copy.
+    """
+    wt = WORKTREES / tid
+    if not wt.exists():
+        return
+    git(["add", "-A"], cwd=wt)
+    git(["commit", "-m", f"{tid}: abandoned attempt, never merged"], cwd=wt)
+    git(["worktree", "remove", "--force", str(wt)])
+    shutil.rmtree(wt, ignore_errors=True)
+
+
 def merge_worktree(tid: str, logdir: Path, gate: str) -> bool:
     """Serialised; rebase onto latest main and re-gate so parallel work composes."""
     branch, wt = f"issue/{tid}", WORKTREES / tid
@@ -459,15 +480,33 @@ def resolve_question(issue: gh.Issue, wt: Path, logdir: Path, critique: str) -> 
 
 
 def work(issue: gh.Issue) -> None:
+    """Process one issue. Never raises: the pool re-raises into cmd_run.
+
+    A crash here used to propagate through f.result(), out of the executor and
+    out of the run -- one unlucky issue ending the night and leaving itself in
+    fr:claimed, which nobody is awake to release.
+    """
     tid = f"{issue.number}"
     logdir = LOGS / tid
     log(f"== #{issue.number}: {issue.title}")
     try:
-        wt = make_worktree(tid)
+        make_worktree(tid)
     except RuntimeError as exc:
         gh.block(issue.number, f"Could not create a worktree: {exc}")
         return
+    try:
+        _work(issue, tid, WORKTREES / tid, logdir)
+    except Exception as exc:  # noqa: BLE001
+        log(f"    !! #{issue.number} crashed the worker: {exc}")
+        record("work_crash", issue=issue.number, title=issue.title,
+               reason=repr(exc), trace=traceback.format_exc()[-2000:])
+        gh.block(issue.number, "The loop crashed while processing this issue.\n\n"
+                               f"```\n{traceback.format_exc()[-20000:]}\n```")
+    finally:
+        retire_worktree(tid)
 
+
+def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
     # --- critic: is this issue worth implementing at all?
     used, _, critique = invoke(issue.agent, wt, prompt_for("critic", issue),
                                logdir, "critic", role="critic")
@@ -478,7 +517,6 @@ def work(issue: gh.Issue) -> None:
         gh.comment(issue.number,
                    f"**The critic challenged this issue.**\n\n{critique[-40000:]}")
         if not resolve_question(issue, wt, logdir, critique):
-            git(["worktree", "remove", "--force", str(wt)])
             return
         log(f"    -> #{issue.number} objection overruled; implementing")
     if "VERDICT: PROCEED" not in critique:
@@ -530,7 +568,6 @@ def work(issue: gh.Issue) -> None:
                      f"and two adversarial reviews.")
             record("merged", issue=issue.number, title=issue.title,
                    attempts=attempt, agent=agent, gate=issue.gate)
-            git(["worktree", "remove", "--force", str(wt)])
             _merge_signal.set()
             return
         failure = "Passed gate and review but could not merge (rebase conflict or "\
@@ -673,6 +710,15 @@ def cmd_run() -> int:
                 time.sleep(20)
                 continue
             empty = 0
+            # Disk pressure looks exactly like bad code from inside the gate:
+            # cargo fails, three attempts burn, the issue is blocked. Put it in
+            # the journal so the retrospective can name the real cause. The loop
+            # does not prune anything itself -- deleting a user's images or
+            # caches unattended is not a call it gets to make.
+            free_gb = shutil.disk_usage(ROOT).free / 1e9
+            if free_gb < 10:
+                log(f"!! {free_gb:.1f}GB free — builds may fail for lack of disk, not for lack of correctness")
+                record("low_disk", free_gb=round(free_gb, 1))
             for f in [pool.submit(work, i) for i in batch]:
                 f.result()
             # Only at a batch boundary, with no agent mid-flight: swapping the
