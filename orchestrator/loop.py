@@ -8,15 +8,26 @@ which agents are forbidden to weaken.
 
 Per issue:
 
-    claim ─► critic ─┬─ REVISE ─► comment, label fr:questioned, move on
-                     └─ PROCEED ─► implementer ─► gate ─┬─ fail ─► retry (<=3)
-                                                        └─ pass ─► 2 adversarial
-                                                             reviewers ─┬─ BLOCK ─► fixer
-                                                                        └─ PASS ─► merge, close
+    claim ─► critic ─┬─ REVISE ─► resolver ─┬─ REWRITE ─► re-scope, requeue
+                     │                      ├─ CLOSE   ─► killed, with evidence
+                     │                      └─ PROCEED ─┐
+                     └─ PROCEED ────────────────────────┴─► implementer
+                            └─► gate ─┬─ fail ─► retry (<=3)
+                                      └─ pass ─► 2 adversarial
+                                           reviewers ─┬─ BLOCK ─► fixer
+                                                      └─ PASS ─► merge, close
 
 The critic stage exists because the issues are written by agents, not by a
 human who read the code. An agent that faithfully implements a wrong issue
 produces work that passes the gate and looks like progress.
+
+The resolver exists because there is no human on call. Parking a contested
+issue as fr:questioned assumes someone will come back and re-scope it; nobody
+will, so the objection has to be adjudicated by another agent instead.
+
+After every merge a retrospective reads logs/events.jsonl and files its own
+fixes -- including to this file, which the loop then re-execs into at a batch
+boundary. scripts/check_orchestrator.py is what keeps that survivable.
 
     python3 orchestrator/loop.py seed      # planner agent files the initial issues
     python3 orchestrator/loop.py run       # drain the queue
