@@ -1,0 +1,7 @@
+Darwin Melihs-MacBook-M1-Pro.local 25.5.0 Darwin Kernel Version 25.5.0: Tue Jun  9 22:18:58 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T6000 arm64
+Apple M1 Pro
+10
+17179869184
+29.7.2
+server_cpus=4 loadgen_cpus=2 mem=2g
+duration=15s connections=64 reps=3 rate=1500

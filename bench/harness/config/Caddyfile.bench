@@ -1,0 +1,18 @@
+# Benchmark configuration for upstream FrankenPHP.
+#
+# auto_https off is a FAIRNESS requirement, not a convenience: the stock image
+# 308-redirects :80 to https and terminates TLS, so benchmarking it as-shipped
+# would compare Caddy-with-TLS against our plaintext HTTP/1.1 server. The thin
+# slice does not implement TLS, so upstream must serve plaintext too.
+#
+# We are deliberately measuring the PHP request pipeline, not the TLS stack.
+{
+	auto_https off
+	admin off
+	frankenphp
+}
+
+:80 {
+	root /app/public
+	php_server
+}

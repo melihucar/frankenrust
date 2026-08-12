@@ -1,0 +1,24 @@
+# Load generator, containerised so it can sit on the same docker network as the
+# server under test. On Docker Desktop for Mac, driving load from the host
+# crosses the VM's userspace network proxy, which adds more latency variance
+# than the difference we are trying to measure.
+#
+# oha is used rather than wrk because it records into an HdrHistogram and has
+# --latency-correction, which compensates for coordinated omission. Plain wrk is
+# closed-loop: when the server stalls it records one slow sample instead of the
+# hundred requests that should have queued, quietly deleting the tail latency
+# that a runtime port is most likely to change.
+FROM rust:1-slim AS build
+# oha pulls in tikv-jemalloc-sys, which builds jemalloc from C source and needs
+# make + a working cc. rust:1-slim ships neither.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install oha --locked --root /out
+
+FROM debian:stable-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/bin/oha /usr/local/bin/oha
+ENTRYPOINT []
+CMD ["oha", "--version"]

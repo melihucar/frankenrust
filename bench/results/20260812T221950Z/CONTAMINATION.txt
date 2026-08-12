@@ -1,0 +1,8 @@
+fizbot-x-api-api-1
+fizbot-x-api-postgres-1
+fizbot-x-api-horizon-1
+fizbot-x-api-redis-1
+rocketship-db
+rocketship-db-test
+rocketship-redis
+pinapos-console-flags-db

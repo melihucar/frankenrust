@@ -1,0 +1,158 @@
+---
+name: Tests
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+on:
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "docs/**"
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "docs/**"
+permissions:
+  contents: read
+env:
+  GOTOOLCHAIN: local
+  GOEXPERIMENT: cgocheck2
+  GOTESTSUM_FORMAT: pkgname-and-test-fails
+jobs:
+  tests-linux:
+    name: Tests (Linux, PHP ${{ matrix.php-versions }})
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php-versions: "8.2"
+          - php-versions: "8.3"
+          - php-versions: "8.4"
+          - php-versions: "8.5"
+    env:
+      GOMAXPROCS: 10
+      LIBRARY_PATH: ${{ github.workspace }}/watcher/target/lib
+      GOFLAGS: "-tags=nobadger,nomysql,nopgx"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go
+      - uses: ./.github/actions/setup-php
+        with:
+          php-version: ${{ matrix.php-versions }}
+      - name: Install e-dant/watcher
+        uses: ./.github/actions/watcher
+      - name: Reinstall libbrotli-dev
+        # TODO: remove this workaround when fixed upstream
+        run: sudo apt-get install --reinstall -y libbrotli-dev
+      - name: Set CGO flags
+        run: echo "CGO_CFLAGS=-I${PWD}/watcher/target/include -DFRANKENPHP_TEST $(php-config --includes)" >> "${GITHUB_ENV}"
+      - name: Build
+        run: go build
+      - name: Build testcli binary
+        working-directory: internal/testcli/
+        run: go build
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+      - name: Run library tests
+        run: gotestsum -- -race ./...
+      - name: Run Caddy module tests
+        working-directory: caddy/
+        run: gotestsum -- -race ./...
+      - name: Run Fuzzing Tests
+        working-directory: caddy/
+        run: go test -fuzz FuzzRequest -fuzztime 20s
+      - name: Build the server
+        working-directory: caddy/frankenphp/
+        run: go build
+      - name: Start the server
+        working-directory: testdata/
+        run: sudo ../caddy/frankenphp/frankenphp start
+      - name: Run integrations tests
+        run: ./reload_test.sh
+      - name: Lint Go code
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        if: matrix.php-versions == '8.5'
+        with:
+          version: latest
+      - name: Lint Caddy module Go code
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        if: matrix.php-versions == '8.5'
+        with:
+          version: latest
+          working-directory: caddy/
+      - name: Ensure go.mod is tidy
+        if: matrix.php-versions == '8.5'
+        run: go mod tidy -diff
+      - name: Ensure caddy/go.mod is tidy
+        if: matrix.php-versions == '8.5'
+        run: go mod tidy -diff
+        working-directory: caddy/
+  integration-tests:
+    name: Integration Tests (Linux, PHP ${{ matrix.php-versions }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php-versions: ["8.3", "8.4", "8.5"]
+    env:
+      XCADDY_GO_BUILD_FLAGS: "-tags=nobadger,nomysql,nopgx"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go
+      - uses: ./.github/actions/setup-php
+        with:
+          php-version: ${{ matrix.php-versions }}
+      - name: Install PHP development libraries
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev libsodium-dev libargon2-dev
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+      - name: Download PHP sources
+        run: |
+          PHP_VERSION=$(php -r "echo PHP_VERSION;")
+          wget -q "https://www.php.net/distributions/php-${PHP_VERSION}.tar.gz" || wget -q "https://phpmirror.static-php.dev/distributions/php-${PHP_VERSION}.tar.gz"
+          tar xzf "php-${PHP_VERSION}.tar.gz"
+          echo "GEN_STUB_SCRIPT=${PWD}/php-${PHP_VERSION}/build/gen_stub.php" >> "${GITHUB_ENV}"
+      - name: Set CGO flags
+        run: |
+          echo "CGO_CFLAGS=-DFRANKENPHP_TEST $(php-config --includes)" >> "${GITHUB_ENV}"
+          echo "CGO_LDFLAGS=$(php-config --ldflags) $(php-config --libs)" >> "${GITHUB_ENV}"
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+      - name: Run integration tests
+        working-directory: internal/extgen/
+        run: gotestsum -- -tags integration -timeout 30m
+  tests-mac:
+    name: Tests (macOS, PHP 8.5)
+    runs-on: macos-latest
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      GOFLAGS: "-tags=nowatcher,nobadger,nomysql,nopgx"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go
+      - uses: ./.github/actions/setup-php
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+      - name: Set CGO flags
+        run: |
+          {
+           echo "CGO_CFLAGS=-I/opt/homebrew/include/ -DFRANKENPHP_TEST $(php-config --includes)"
+           echo "CGO_LDFLAGS=-L/opt/homebrew/lib/ $(php-config --ldflags) $(php-config --libs)"
+          } >> "${GITHUB_ENV}"
+      - name: Build
+        run: go build -tags nowatcher
+      - name: Run library tests
+        run: gotestsum -- -tags nowatcher -race ./...
+      - name: Run Caddy module tests
+        working-directory: caddy/
+        run: gotestsum -- -race ./...

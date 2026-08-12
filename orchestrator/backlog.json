@@ -1,0 +1,113 @@
+{
+  "_comment": "Dependency-ordered backlog for the thin benchmarkable slice. Tasks with no unmet deps run in parallel, one git worktree each. Agent assignment is deliberate: codex for mechanical FFI grind, claude for design-heavy pieces, duel (alternating on failure) for the two hardest.",
+  "tasks": [
+    {
+      "id": "t01-php-zts-image",
+      "title": "Build a ZTS + embed PHP base image",
+      "agent": "codex",
+      "role": "implementer",
+      "gate": "bootstrap",
+      "deps": [],
+      "spec": "Create `docker/php-zts.Dockerfile` producing a linux/arm64 image with PHP 8.5 built from source as a SHARED EMBED library, plus the Rust toolchain, so later tasks can compile and link against it.\n\nThe configure flags are non-negotiable and come from upstream `vendor/frankenphp/docs/compile.md`:\n\n    ./configure --enable-embed --enable-zts --disable-zend-signals --enable-zend-max-execution-timers\n\nNotes:\n- `--enable-embed` builds `libphp.so`; without it there is nothing to link.\n- ZTS is mandatory: upstream silently degrades to a single thread when PHP is not thread-safe, which would make every threading result meaningless.\n- Start FROM the official `php:8.5-zts-trixie` image ONLY if you verify it ships the embed SAPI and its headers. It usually does not. If it does not, build php-src from source. Verify, do not assume.\n- Enable opcache and set a sane `memory_limit`; benchmarks against upstream are invalid if opcache differs between the two.\n\nAcceptance: the image builds; `php-config --php-sapis` lists `embed`; `php -v` reports ZTS; `php-config --includes` and the `.so` are present at a path recorded in `docker/README.md`. Write down the exact include and lib paths — three later tasks depend on them."
+    },
+    {
+      "id": "t02-workspace",
+      "title": "Cargo workspace skeleton",
+      "agent": "codex",
+      "role": "implementer",
+      "gate": "bootstrap",
+      "deps": [],
+      "spec": "Create the Cargo workspace with three crates and nothing else:\n\n- `crates/frankenrust-sys`  — raw FFI: bindgen over PHP's embed headers, and compilation of upstream's C shim via the `cc` crate. No safe abstractions here.\n- `crates/frankenrust-core` — safe layer: thread pool, request context, the `go_*` callbacks, worker mode.\n- `crates/frankenrust-server` — hyper HTTP/1.1 server and the binary.\n\nAdd `rust-toolchain.toml` pinning stable, and a `.gate/min-test-files` file containing `0` (later tasks raise it; the gate uses it to detect a suite being deleted).\n\nEach crate gets a `lib.rs` with a module-level doc comment stating that crate's responsibility and, critically, its threading contract — `-sys` and `-core` run on PHP's pthreads, `-server` runs on tokio, and the two must not be mixed. Read `docs/PORTING-NOTES.md` first; that boundary is the whole design.\n\nAcceptance: `cargo build --workspace` and `cargo clippy --workspace -- -D warnings` are clean. No functionality yet — do not stub the callbacks."
+    },
+    {
+      "id": "t03-conformance-golden",
+      "title": "Conformance harness + golden outputs from upstream",
+      "agent": "claude",
+      "role": "implementer",
+      "gate": "bootstrap",
+      "deps": [],
+      "spec": "Build the differential test harness. This is the most important task in the backlog: it is the oracle that decides whether the port is correct, and every later task is gated on it.\n\nThe insight to exploit: upstream's PHP fixtures in `vendor/frankenphp/testdata/` are implementation-agnostic. The same script, served by any correct server, must produce the same HTTP response. That makes them a golden corpus we get for free — the same property that made Bun's TypeScript test suite able to validate a Rust rewrite.\n\nBuild `tests/conformance/`:\n1. A manifest of fixtures from `vendor/frankenphp/testdata/*.php` (73 files). Start with the ones that are pure request/response: `hello.php`, `echo.php`, `headers.php`, `request-headers.php`, `response-headers.php`, `cookies.php`, `input.php`, `read-input.php`, `server-variable.php`, `super-globals.php`, `flush.php`, `finish-request.php`, `exception.php`. Explicitly mark as out-of-scope (do not delete) the ones needing features the thin slice lacks: mercure, preload, file watching, opcache_reset, sessions, fibers.\n2. `tests/conformance/capture.sh` — runs each fixture against the OFFICIAL FrankenPHP container (`dunglas/frankenphp` with `bench/harness/config/Caddyfile.bench`) and records status, headers, and body into `tests/conformance/golden/<fixture>.txt`. Normalise only what is genuinely nondeterministic: `Date`, `Server`, `X-Powered-By`, absolute paths, PIDs. Do NOT normalise anything else — over-normalising is how a conformance suite silently stops testing.\n3. `tests/conformance/run.sh` — replays the same requests against OUR server (`http://127.0.0.1:8080` by default, `$FRANKENRUST_URL` to override) and diffs against the golden files. Must exit non-zero on any mismatch and print a readable diff. **If our server binary does not exist yet, it must SKIP with exit 0** so early tasks are not blocked — but it must print loudly that it skipped, and it must FAIL rather than skip once `crates/frankenrust-server` produces a binary.\n4. Handle the dual-mode property: `vendor/frankenphp/testdata/_executor.php` runs the identical script body in both regular and worker mode. Capture goldens for both modes so worker mode is held to the same output as regular mode.\n\nCommit the generated golden files. In your final message, state exactly how many fixtures are covered, how many are deferred, and why each was deferred."
+    },
+    {
+      "id": "t04-sys-bindings",
+      "title": "bindgen + compile upstream's C shim",
+      "agent": "duel",
+      "role": "implementer",
+      "gate": "bootstrap",
+      "deps": ["t01-php-zts-image", "t02-workspace"],
+      "spec": "In `crates/frankenrust-sys`, make upstream's C actually compile and link into a Rust binary.\n\nWe do NOT port `frankenphp.c`. We compile it. It is 1,961 lines of already-language-neutral C that happens to call symbols named `go_*`; rewriting it in unsafe Rust would buy zero performance and cost enormous correctness. This mirrors how rav1d kept dav1d's hand-written SIMD kernels in place and ported only the surrounding code.\n\nWork:\n1. `build.rs` — run bindgen over `php.h`, `main/SAPI.h`, `sapi/embed/php_embed.h` using include paths from `php-config --includes`. Compile `vendor/frankenphp/frankenphp.c` and `types.c` with the `cc` crate. Link `libphp`.\n2. `frankenphp.c` includes `_cgo_export.h`, which is cgo-generated and will not exist. Generate our own `_cgo_export.h` declaring the same 25 symbols with C-compatible signatures matching upstream's cgo ABI. Derive the signatures from the Go declarations — get the struct-returning ones right (`go_frankenphp_worker_handle_request_start` returns a two-field struct).\n3. Provide temporary `extern \"C\"` Rust stubs for all 25 so it links. Each stub `unimplemented!()`s with its own name. Do not implement behaviour here — later tasks own that.\n\nKnown hazards, verified against real projects — do not rediscover them the hard way:\n- **Nobody successfully runs bindgen over raw `php.h`.** Every working project (ext-php-rs, pphp, ripht-php-sapi) compiles a hand-written C shim that re-exports macros and `static inline` functions as real linkable symbols, then runs bindgen against *that*. Upstream's `types.c` is exactly such a shim — reuse it rather than reinventing.\n- Mark the Zend core types `.opaque_type()`: `_zval_struct`, `_zend_string`, `_zend_array`, `_zend_object`, `_zend_class_entry`. `zval` is a tagged union whose byte layout is chosen by preprocessor endianness branching; bindgen emits something syntactically valid and semantically useless.\n- `zend_string` ends in `char val[1]` — the pre-C99 struct hack, NOT a flexible array member, so bindgen's `--flexarray-dst` does not apply. Build slices manually with `slice::from_raw_parts` using `len`.\n- `sapi_module_struct` itself is easy (≈30 fields, plain function pointers) EXCEPT `sapi_error`, which is variadic. Do not try to define a variadic `extern \"C\"` fn in Rust. Upstream already solves this by putting PHP's own `php_error` in that slot — keep that.\n- `static inline` functions are dropped by bindgen by default; hand-write C wrappers rather than fighting `--wrap-static-fns`.\n\nRead `ext-php-rs`'s `build.rs` and `allowed_bindings.rs` first (github.com/extphprs/ext-php-rs). They are worked solutions to these exact problems. Reference them; do not take the crate as a dependency for the SAPI.\n\nAcceptance: `cargo build` links a binary against libphp inside the t01 image. A test that calls into C and observes a stub panic by name proves the callback wiring is real."
+    },
+    {
+      "id": "t05-thread-lifecycle",
+      "title": "Main thread, PHP thread pool, state machine",
+      "agent": "duel",
+      "role": "implementer",
+      "gate": "bootstrap",
+      "deps": ["t04-sys-bindings"],
+      "spec": "Port upstream's thread orchestration: `phpmainthread.go`, `phpthread.go`, `threadregular.go`, `threadinactive.go` and `internal/state/state.go`.\n\nImplement in `crates/frankenrust-core`:\n- `go_frankenphp_main_thread_is_ready`, `go_frankenphp_shutdown_main_thread`, `go_get_custom_php_ini`\n- `go_frankenphp_before_script_execution` — the heart of it. Returns the next script path for this thread, or NULL to make the C loop exit. Returning NULL is the shutdown signal.\n- `go_frankenphp_after_script_execution`, `go_frankenphp_on_thread_shutdown`\n- The state machine, mirroring `internal/state/state.go` state names EXACTLY (Reserved, Booting, BootRequested, ShuttingDown, Done, Inactive, Ready, TransitionRequested, TransitionInProgress, TransitionComplete, Rebooting, ForceRebooting, RebootReady, YieldingForReboot). Same names so a reviewer can diff our logic against upstream's line by line. Note `vendor/frankenphp/docs/internals.md` is stale here and names two states that no longer exist — trust `state.go`, not the docs.\n\nThread count default matches upstream: `num_cpus * 2`.\n\nCritical constraint: a thread's identity is its `thread_index`, and everything the callbacks touch must be indexable by it without a data race. Do not hand C a pointer into a `Vec` that can reallocate.\n\nOut of scope: autoscaling (`scaling.go`), force-kill, `max_requests` reboot. Leave clearly-named unimplemented paths.\n\nAcceptance: a test boots the main thread and N PHP threads, runs a trivial script on each, and shuts down cleanly with no leaked threads. Raise `.gate/min-test-files`."
+    },
+    {
+      "id": "t06-sapi-output",
+      "title": "Output callbacks: ub_write, send_headers, flush",
+      "agent": "codex",
+      "role": "implementer",
+      "gate": "bootstrap",
+      "deps": ["t05-thread-lifecycle"],
+      "spec": "Implement `go_ub_write`, `go_write_headers`, `go_sapi_flush` in `crates/frankenrust-core`, porting `frankenphp.go:430/572/624`.\n\nThese run ON THE PHP PTHREAD, not on tokio. They write into the request context owned by that thread's current request; the tokio side reads it out. No `.await`, no tokio handles.\n\nDetails that matter:\n- `go_ub_write` returns the number of bytes written; PHP checks it. A short write is not a no-op.\n- `go_sapi_flush` must detect an aborted client connection and tell PHP, or a disconnected client leaves the script running to completion.\n- Header values from PHP are arbitrary bytes, not UTF-8. Do not `to_str().unwrap()`.\n\nAcceptance: conformance fixtures `hello.php`, `echo.php`, `flush.php`, `response-headers.php` pass against the goldens from t03."
+    },
+    {
+      "id": "t07-sapi-input",
+      "title": "Input callbacks: read_post, read_cookies, request headers",
+      "agent": "codex",
+      "role": "implementer",
+      "gate": "bootstrap",
+      "deps": ["t05-thread-lifecycle"],
+      "spec": "Implement `go_read_post`, `go_read_cookies`, `go_apache_request_headers`, `go_is_context_done`, porting `frankenphp.go:662/703/490/804`.\n\n`go_read_post` is called repeatedly with a buffer and must behave like a streaming read: fill up to `count_bytes`, return how many were actually written, return 0 at EOF. Getting this subtly wrong produces truncated POST bodies that only show up on large uploads — exactly the class of bug the conformance suite will not catch unless you add a large-body case, so add one.\n\n`go_apache_request_headers` backs `getallheaders()`; match upstream's header name casing and folding behaviour precisely.\n\nAcceptance: `input.php`, `read-input.php`, `cookies.php`, `request-headers.php` pass. Add a >1MB POST body test."
+    },
+    {
+      "id": "t08-server-vars",
+      "title": "$_SERVER population and request info",
+      "agent": "claude",
+      "role": "implementer",
+      "gate": "bootstrap",
+      "deps": ["t05-thread-lifecycle"],
+      "spec": "Port `cgi.go` — `go_register_server_variables` (:174) and `go_update_request_info` (:284).\n\nThis is the fiddliest correctness surface in the whole port and the one most likely to silently diverge. It computes the CGI variables: `SCRIPT_NAME`, `SCRIPT_FILENAME`, `PATH_INFO`, `PATH_TRANSLATED`, `QUERY_STRING`, `REQUEST_URI`, `DOCUMENT_ROOT`, `REMOTE_ADDR`, `CONTENT_TYPE`, `CONTENT_LENGTH`, `HTTP_*`, and the split between path info and script name.\n\nUpstream ships a byte-exact golden file for this: `vendor/frankenphp/testdata/server-all-vars-ordered.txt`, used by `caddy/caddy_test.go:TestAllDefinedServerVars`. Use it as your acceptance criterion — matching it byte for byte is the bar.\n\nUpstream also fuzzes this (`go test -fuzz FuzzRequest`) with unicode, null bytes, and percent-encoded paths, asserting `PATH_INFO`/`PATH_TRANSLATED`/`CONTENT_TYPE` fidelity. Port that fuzz target; path splitting is exactly where a hand port goes wrong.\n\nPerformance note: upstream registers these in one bulk call through a single struct rather than per-key, specifically to avoid per-key cgo crossings. We have no cgo tax, but keep the bulk shape — it is also fewer allocations.\n\nAcceptance: `server-variable.php`, `super-globals.php` pass, and `server-all-vars-ordered.txt` matches byte for byte."
+    },
+    {
+      "id": "t09-http-server",
+      "title": "hyper server and the async↔pthread bridge",
+      "agent": "claude",
+      "role": "implementer",
+      "gate": "bootstrap",
+      "deps": ["t06-sapi-output", "t07-sapi-input", "t08-server-vars"],
+      "spec": "Build `crates/frankenrust-server`: a hyper HTTP/1.1 server on tokio that dispatches requests to the PHP thread pool and returns responses.\n\nThis is the one genuinely new piece of architecture. Go blurred the async/blocking boundary; Rust will not. Read the boundary diagram in `docs/PORTING-NOTES.md` before starting.\n\nShape:\n- tokio accepts the connection, parses the request, builds a `RequestCtx`.\n- The ctx is sent over a `crossbeam_channel` to an idle PHP thread; the handler awaits a `oneshot::Receiver`.\n- The PHP pthread picks it up inside `go_frankenphp_before_script_execution`, runs the script, and fires the oneshot when done.\n\nHard rule: **do not use `tokio::task::spawn_blocking` for PHP work.** Its threads are pooled and recycled by tokio, while PHP threads are created by C, live across many requests, and own TSRM storage that must never migrate between threads. The lifecycles are incompatible; this will appear to work under light load and corrupt state under real load.\n\nAlso handle: client disconnect propagating to `go_is_context_done`; backpressure when every PHP thread is busy (queue, do not spawn); graceful shutdown draining in-flight requests.\n\nCLI: `--listen`, `--root`, `--threads`, `--worker <script>`.\n\nAcceptance: the binary serves the conformance suite end to end, and `tests/conformance/run.sh` now FAILS on mismatch rather than skipping. Add a test that hammers it with concurrent requests and asserts no cross-request state bleed."
+    },
+    {
+      "id": "t10-worker-mode",
+      "title": "Worker mode",
+      "agent": "duel",
+      "role": "implementer",
+      "gate": "default",
+      "deps": ["t09-http-server"],
+      "spec": "Implement worker mode: `go_frankenphp_worker_handle_request_start`, `go_frankenphp_finish_worker_request`, `go_frankenphp_finish_php_request`, porting `threadworker.go:272/297/331` and `worker.go:218`.\n\nWorker mode is where FrankenPHP's actual performance story lives — the app boots once and stays resident instead of bootstrapping per request. A benchmark without it is not measuring the thing FrankenPHP is known for.\n\nMechanism, from `frankenphp.c:830` (`PHP_FUNCTION(frankenphp_handle_request)`): the userland PHP script calls `frankenphp_handle_request($callback)` in a loop. That C function calls `go_frankenphp_worker_handle_request_start`, which BLOCKS until a request arrives (upstream does a `select` over the thread's own channel, the shared worker channel, and a drain channel — `crossbeam_channel::select!` maps directly). It then invokes the PHP closure, and returns true to keep looping or false to stop.\n\nSubtleties that will bite you:\n- The first `frankenphp_handle_request()` call discards a synthetic bootstrap request used only to set up `$_SERVER`. This is why superglobals differ before and after the first call — see `vendor/frankenphp/docs/worker.md`.\n- A worker that exits after having served at least one request restarts immediately with no backoff. A worker that fails during startup gets exponential backoff capped at 1s, aborting after 6 consecutive failures.\n\nAcceptance: `worker.php` and the `worker-*.php` fixtures pass. Critically, prove the dual-mode property from t03: fixtures run through `_executor.php` must produce IDENTICAL output in regular and worker mode."
+    },
+    {
+      "id": "t11-env-logging",
+      "title": "Env sandboxing and logging callbacks",
+      "agent": "codex",
+      "role": "implementer",
+      "gate": "default",
+      "deps": ["t05-thread-lifecycle"],
+      "spec": "Implement `go_init_os_env`, `go_putenv` (porting `env.go:13/26`), `go_log` and `go_log_attrs` (`frankenphp.go:741/769`).\n\nUpstream maintains three layered env tables in C — `sandboxed_env`, `prepared_env`, `main_thread_env` — so that one thread calling `putenv()` cannot corrupt another's environment. Read the C in `vendor/frankenphp/frankenphp.c` and the fixtures in `vendor/frankenphp/testdata/env/` (`env.php`, `putenv.php`, `prepared-env-getenv.php`, `prepared-env-survives-putenv.php`), which target exactly this layering.\n\nStub `go_mercure_publish` — out of scope, but make the stub clearly named and log once rather than silently succeeding.\n\nAcceptance: the `testdata/env/` fixtures pass."
+    },
+    {
+      "id": "t12-bench-image",
+      "title": "Benchmark image for FrankenRust",
+      "agent": "codex",
+      "role": "implementer",
+      "gate": "default",
+      "deps": ["t10-worker-mode", "t11-env-logging"],
+      "spec": "Produce `docker/frankenrust.Dockerfile` building `frankenrust:bench` — a linux/arm64 image that serves `/app/public` on port 80, so `bench/harness/run.sh` can drive it identically to upstream.\n\nFairness requirements, and these decide whether the whole benchmark means anything:\n- Same PHP version and the same opcache settings as the upstream image. Verify by comparing `php -i` output from both containers and commit the diff to `bench/results/php-config-diff.txt`.\n- Release profile with `lto = true`, `codegen-units = 1`, `panic = \"abort\"`.\n- Same thread count as upstream's default (`num_cpus * 2`).\n- Support both regular and worker mode via the same env vars the harness uses.\n\nThen extend `bench/harness/run.sh` to cover worker mode as a separate dimension for both servers.\n\nAcceptance: `bench/harness/run.sh --smoke` passes with BOTH servers, and `bench/results/php-config-diff.txt` shows no meaningful divergence."
+    }
+  ]
+}

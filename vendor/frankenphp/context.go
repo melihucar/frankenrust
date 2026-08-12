@@ -1,0 +1,207 @@
+package frankenphp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// frankenPHPContext provides contextual information about the Request to handle.
+type frankenPHPContext struct {
+	mercureContext
+
+	documentRoot    string
+	splitPath       []string
+	env             PreparedEnv
+	logger          *slog.Logger
+	request         *http.Request
+	originalRequest *http.Request
+	worker          *worker
+
+	// idle timeout per body read; zero disables it
+	requestBodyTimeout time.Duration
+
+	docURI         string
+	pathInfo       string
+	scriptName     string
+	scriptFilename string
+	requestURI     string
+
+	// Whether the request is already closed by us
+	isDone bool
+	// The client's connection state as of the moment isDone was set. Captured
+	// once in closeContext, before close(fc.done): that unblocks the request
+	// dispatcher, which lets the handler return, which is itself what cancels
+	// request.Context() (see the net/http docs - this happens whether or not
+	// the client is actually still connected). Checking clientHasClosed()
+	// again after isDone would therefore read true for virtually any write
+	// following a normal fastcgi_finish_request(), not just a real abort.
+	clientHadClosed bool
+
+	responseWriter     http.ResponseWriter
+	responseController *http.ResponseController
+	handlerParameters  any
+	handlerReturn      any
+
+	done      chan any
+	startedAt time.Time
+}
+
+type contextHolder struct {
+	ctx               context.Context
+	frankenPHPContext *frankenPHPContext
+}
+
+// fromContext extracts the frankenPHPContext from a context.
+func fromContext(ctx context.Context) (fctx *frankenPHPContext, ok bool) {
+	fctx, ok = ctx.Value(contextKey).(*frankenPHPContext)
+	return
+}
+
+func newFrankenPHPContext() *frankenPHPContext {
+	return &frankenPHPContext{
+		done:      make(chan any),
+		startedAt: time.Now(),
+	}
+}
+
+// NewRequestWithContext creates a new FrankenPHP request context.
+//
+// FrankenPHP does not strip request headers whose name contains an underscore.
+// Because CGI maps dashes to underscores ("Foo-Bar" becomes the HTTP_FOO_BAR
+// variable), a client-supplied "Foo_Bar" header is indistinguishable from the
+// legitimate "Foo-Bar" in $_SERVER and can spoof it. This affects any such
+// header an application or upstream proxy trusts (forwarded-for, auth, etc.).
+// Drop headers containing an underscore before calling this function, unless
+// you explicitly need (and whitelist) them. The Caddy-based server and reverse
+// proxies such as nginx (underscores_in_headers off) already do this.
+func NewRequestWithContext(r *http.Request, opts ...RequestOption) (*http.Request, error) {
+	fc := newFrankenPHPContext()
+	fc.request = r
+
+	for _, o := range opts {
+		if err := o(fc); err != nil {
+			return nil, err
+		}
+	}
+
+	if fc.logger == nil {
+		fc.logger = globalLogger
+	}
+
+	if fc.documentRoot == "" {
+		if EmbeddedAppPath != "" {
+			fc.documentRoot = EmbeddedAppPath
+		} else {
+			var err error
+			if fc.documentRoot, err = os.Getwd(); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	splitCgiPath(fc)
+
+	fc.requestURI = r.URL.RequestURI()
+
+	c := context.WithValue(r.Context(), contextKey, fc)
+
+	return r.WithContext(c), nil
+}
+
+// newDummyContext creates a fake context from a request path
+func newDummyContext(requestPath string, opts ...RequestOption) (*frankenPHPContext, error) {
+	r, err := http.NewRequestWithContext(globalCtx, http.MethodGet, requestPath, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	fr, err := NewRequestWithContext(r, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	fc, _ := fromContext(fr.Context())
+
+	return fc, nil
+}
+
+// closeContext sends the response to the client
+func (fc *frankenPHPContext) closeContext() {
+	if fc.isDone {
+		return
+	}
+
+	// Snapshot before close(fc.done): that call is what eventually lets the
+	// handler return and cancels request.Context(), so clientHasClosed()
+	// must be read before it, not after.
+	fc.clientHadClosed = fc.clientHasClosed()
+	close(fc.done)
+	fc.isDone = true
+}
+
+// validate checks if the request should be outright rejected
+func (fc *frankenPHPContext) validate() error {
+	if strings.Contains(fc.request.URL.Path, "\x00") {
+		fc.reject(ErrInvalidRequestPath)
+
+		return ErrInvalidRequestPath
+	}
+
+	contentLengthStr := fc.request.Header.Get("Content-Length")
+	if contentLengthStr != "" {
+		if contentLength, err := strconv.Atoi(contentLengthStr); err != nil || contentLength < 0 {
+			e := fmt.Errorf("%w: %q", ErrInvalidContentLengthHeader, contentLengthStr)
+
+			fc.reject(e)
+
+			return e
+		}
+	}
+
+	return nil
+}
+
+func (fc *frankenPHPContext) clientHasClosed() bool {
+	if fc.request == nil {
+		return false
+	}
+
+	select {
+	case <-fc.request.Context().Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// reject sends a response with the given status code and error
+func (fc *frankenPHPContext) reject(err error) {
+	if fc.isDone {
+		return
+	}
+
+	re := &ErrRejected{}
+	if !errors.As(err, re) {
+		// Should never happen
+		panic("only instance of ErrRejected can be passed to reject")
+	}
+
+	rw := fc.responseWriter
+	if rw != nil {
+		rw.WriteHeader(re.status)
+		_, _ = rw.Write([]byte(err.Error()))
+
+		if f, ok := rw.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+
+	fc.closeContext()
+}
