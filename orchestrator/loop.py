@@ -52,6 +52,7 @@ MAX_ATTEMPTS = int(os.environ.get("FR_ATTEMPTS", "3"))
 AGENT_TIMEOUT = int(os.environ.get("FR_AGENT_TIMEOUT", str(60 * 60)))
 GATE_TIMEOUT = int(os.environ.get("FR_GATE_TIMEOUT", str(30 * 60)))
 WALLCLOCK_LIMIT = int(os.environ.get("FR_WALLCLOCK", str(8 * 60 * 60)))
+HEARTBEAT = int(os.environ.get("FR_HEARTBEAT", "60"))
 RETRO_EVERY = int(os.environ.get("FR_RETRO_EVERY", "2"))   # cycles per retrospective
 # -----------------------------------------------------------------------------
 
@@ -187,11 +188,52 @@ def agent_cmd(agent: str, model: str | None) -> list[str]:
                 "-c", "sandbox_workspace_write.network_access=true",
                 "-c", 'approval_policy="never"', "--skip-git-repo-check", "-"]
     if agent == "claude":
-        cmd = ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "text"]
+        # stream-json, not text. `text` buffers everything to the end and then
+        # prints a bare "Execution error" on failure -- the log tells you the
+        # run died but not why, which is useless at 3am into an 8h run. NDJSON
+        # lands incrementally (so `tail -f` works and the log grows as proof of
+        # life) and carries the real error in its final result event.
+        cmd = ["claude", "-p", "--dangerously-skip-permissions",
+               "--output-format", "stream-json", "--verbose"]
         if model:
             cmd += ["--model", model]
         return cmd
     raise ValueError(f"unknown agent {agent!r}")
+
+
+def _final_text(logpath: Path, agent: str) -> tuple[str, str]:
+    """(final message, error reason) from an agent log.
+
+    Only the *final* message may feed verdict parsing. The full stream contains
+    reasoning and tool calls, and a reviewer musing "this is not a VERDICT:
+    BLOCK situation" would otherwise block a clean diff. codex writes plain
+    text, so it passes through.
+    """
+    if not logpath.exists():
+        return "", "no log"
+    raw = logpath.read_text(errors="replace")
+    if agent != "claude":
+        return raw, ""
+    final, err = "", ""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") != "result":
+            continue
+        final = ev.get("result") or final
+        if ev.get("is_error") or ev.get("subtype") not in (None, "success"):
+            err = ev.get("subtype") or "error"
+            if ev.get("api_error_status"):
+                err += f" ({ev['api_error_status']})"
+    if not final and not err:
+        # No result event at all: the process died mid-stream.
+        err = "no result event (killed or crashed mid-stream)"
+    return final, err
 
 
 def _hit_limit(logpath: Path) -> bool:
@@ -221,13 +263,33 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
             proc = subprocess.Popen(agent_cmd(use, model), cwd=str(wt), stdin=stdin_fh,
                                     stdout=out_fh, stderr=subprocess.STDOUT,
                                     env={**os.environ, "FRANKENRUST_AGENT": "1"})
-            try:
-                rc = proc.wait(timeout=AGENT_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                log(f"    !! {use} timed out after {AGENT_TIMEOUT}s")
-                record("agent_timeout", agent=use, tag=tag, seconds=AGENT_TIMEOUT)
-                return use, 124, ""
+            # Heartbeat rather than a bare wait(). Agents emit nothing until
+            # they exit -- `--output-format text` buffers, and codex is quiet
+            # too -- so an hour-long task and a hung one look identical from
+            # the outside. Proof of life is worth one log line a minute.
+            started = time.time()
+            rc = None
+            while rc is None:
+                try:
+                    rc = proc.wait(timeout=HEARTBEAT)
+                except subprocess.TimeoutExpired:
+                    waited = time.time() - started
+                    if waited >= AGENT_TIMEOUT:
+                        proc.kill()
+                        log(f"    !! {use} timed out after {AGENT_TIMEOUT}s")
+                        record("agent_timeout", agent=use, tag=tag,
+                               seconds=AGENT_TIMEOUT)
+                        return use, 124, ""
+                    kb = logpath.stat().st_size // 1024 if logpath.exists() else 0
+                    log(f"    .. {tag} running {int(waited // 60)}m"
+                        f" (limit {AGENT_TIMEOUT // 60}m, {kb}KB)")
+        text, err = _final_text(logpath, use)
+        if err or rc != 0:
+            # Say what went wrong at the point it goes wrong. A silent failure
+            # here surfaces later as an empty verdict and gets misread as the
+            # agent declining the work.
+            log(f"    !! {use} {tag} failed: rc={rc} {err or '(no error detail)'}")
+            record("agent_error", agent=use, tag=tag, rc=rc, reason=err)
         # Require BOTH a failure and a quota pattern: "429"/"rate limit" appear
         # legitimately in the output of an agent writing an HTTP server.
         if use == "codex" and rc != 0 and _hit_limit(logpath):
@@ -236,7 +298,6 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
             use, model = resolve("codex", role, escalate)
             continue
         break
-    text = logpath.read_text(errors="replace") if logpath.exists() else ""
     return use, rc, text
 
 

@@ -2,3 +2,5 @@
 /orchestrator/logs/
 /orchestrator/queue/
 /target/
+__pycache__/
+*.pyc
