@@ -65,8 +65,18 @@ class Issue:
 
     @property
     def deps(self) -> list[int]:
-        m = DEP_RE.search(self.body or "")
-        return [int(n) for n in ISSUE_RE.findall(m.group(1))] if m else []
+        """Union of every `Depends on:` line, not the first one.
+
+        Taking the first match means an issue whose prose says "depends on the
+        state port" above its structured line parses as having no dependencies
+        at all -- so it gets claimed before the crate it needs exists, fails
+        the gate three times for a reason the implementer cannot fix, and ends
+        up blocked. Unioning is also right for a body listing deps as bullets,
+        and prose that mentions no issue number contributes nothing.
+        """
+        found = {int(n) for m in DEP_RE.finditer(self.body or "")
+                 for n in ISSUE_RE.findall(m.group(1))}
+        return sorted(found)
 
     @property
     def gate(self) -> str:
