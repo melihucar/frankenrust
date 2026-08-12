@@ -19,7 +19,20 @@ jq -r 'select(.event=="critic_revise") | .excerpt' orchestrator/logs/events.json
 ```
 
 Events: `merged`, `blocked`, `gate_fail`, `review_block`, `critic_revise`,
-`rebase_conflict`, `merge_regate_fail`, `agent_fallback`, `agent_timeout`.
+`resolved`, `resolve_failed`, `rebase_conflict`, `merge_regate_fail`,
+`agent_fallback`, `agent_timeout`, `agent_error`, `work_crash`, `reclaimed`,
+`low_disk`, `retrospective`.
+
+Three of those describe the loop failing rather than an agent failing, and they
+are the most important things in the file: `work_crash` is an unhandled
+exception in a worker, `agent_error` is an agent that died without a verdict,
+and `low_disk` means builds were failing for want of disk rather than for want
+of correctness. Do not diagnose the issues in a batch where those appear
+without accounting for them first.
+
+Bound what you print. `.tail` and `.excerpt` hold kilobytes each, so dumping
+them unfiltered floods your context and buys nothing — count first, then read
+only the distinct ones (`| .tail[0:400]`, or pipe through `sort | uniq -c`).
 
 Also useful: `gh issue list --label fr:questioned --state all`, the blocked
 issues and their comments, and `git log --oneline` for what actually landed.
