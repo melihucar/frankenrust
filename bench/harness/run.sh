@@ -33,7 +33,6 @@ LOADGEN_IMAGE="frankenbench/loadgen:oha"
 REPS="${REPS:-5}"
 DURATION="${DURATION:-30s}"
 CONNECTIONS="${CONNECTIONS:-64}"
-FIXED_RATE="${FIXED_RATE:-2000}"     # for the latency run; must be < saturation
 WARMUP="${WARMUP:-10s}"
 
 APPS=(noop hello json compute)
@@ -100,11 +99,38 @@ start_server() {
 stop_server() { docker rm -f "bench-$1" >/dev/null 2>&1; }
 
 # --- measurement -------------------------------------------------------------
+# Derive the latency run's fixed rate from THIS server+app's measured throughput.
+#
+# A fixed rate above saturation is not a latency measurement, it is a queueing
+# measurement: the generator keeps offering load the server cannot retire, the
+# backlog grows without bound, and every percentile just reports how long the
+# run lasted. The first version of this harness hardcoded 1500 req/s, and the
+# CPU-bound app -- which saturates near 566 rps -- duly reported a p50 of 4.6
+# SECONDS. That number described the queue, not the server.
+#
+# 50% of measured max keeps the server below the knee, which is the regime where
+# p99 reflects the request path. Throughput therefore MUST run before latency.
+LATENCY_LOAD_FACTOR="${LATENCY_LOAD_FACTOR:-0.5}"
+latency_rate() {
+  python3 - "$OUT" "$1" "$2" "$LATENCY_LOAD_FACTOR" <<'PY'
+import glob, json, statistics, sys
+out, server, app, factor = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+vals = []
+for f in glob.glob(f"{out}/{server}.{app}.throughput.*.json"):
+    try:
+        vals.append(json.load(open(f))["summary"]["requestsPerSec"])
+    except Exception:
+        pass
+# No throughput data (ordering bug) -> fall back rather than crash the whole run.
+print(max(1, int(statistics.median(vals) * factor)) if vals else 500)
+PY
+}
+
 # $1 server  $2 app  $3 mode(throughput|latency)  $4 rep -> writes json
 measure() {
   local server="$1" app="$2" mode="$3" rep="$4"
   local url="http://bench-$server/" extra=()
-  [ "$mode" = "latency" ] && extra=(-q "$FIXED_RATE" --latency-correction)
+  [ "$mode" = "latency" ] && extra=(-q "$(latency_rate "$server" "$app")" --latency-correction)
   docker run --rm --network "$NET" --cpus "$LOADGEN_CPUS" "$LOADGEN_IMAGE" \
     oha -z "$DURATION" -c "$CONNECTIONS" --no-tui --output-format json "${extra[@]}" "$url" \
     > "$OUT/$server.$app.$mode.$rep.json" 2>"$OUT/$server.$app.$mode.$rep.err"
@@ -132,7 +158,7 @@ preflight() {
   docker version --format '{{.Server.Version}}' >> "$OUT/environment.txt" 2>/dev/null
   {
     echo "server_cpus=$SERVER_CPUS loadgen_cpus=$LOADGEN_CPUS mem=$SERVER_MEM"
-    echo "duration=$DURATION connections=$CONNECTIONS reps=$REPS rate=$FIXED_RATE"
+    echo "duration=$DURATION connections=$CONNECTIONS reps=$REPS latency_load_factor=$LATENCY_LOAD_FACTOR"
   } >> "$OUT/environment.txt"
 }
 
