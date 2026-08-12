@@ -47,35 +47,67 @@ took two years of funded work to get under 6%.
 
 ## Running the loop
 
-The loop runs coding agents in parallel git worktrees against
-`orchestrator/backlog.json`. Work is merged only if it passes `scripts/gate.sh`,
-which agents are explicitly forbidden to weaken.
+GitHub Issues are the queue. Labels are the state machine, dependencies are
+declared in the issue body (`Depends on: #3`), and agents can write back to the
+queue — filing what they discover, or refusing an issue they think is wrong.
+Work merges only if it passes `scripts/gate.sh`, which agents are forbidden to
+weaken.
 
 ```sh
-python3 orchestrator/loop.py run       # drain the backlog
-python3 orchestrator/loop.py status    # what is done / running / blocked
-python3 orchestrator/loop.py reset <task-id>   # unblock and retry
+python3 orchestrator/loop.py seed      # planner agent files the initial issues
+python3 orchestrator/loop.py run       # drain the queue
+python3 orchestrator/loop.py status    # ready / claimed / blocked / questioned
+python3 orchestrator/loop.py retro     # retrospective on demand
 ```
 
-Knobs: `FR_PARALLEL` (default 3), `FR_ATTEMPTS` (3), `FR_WALLCLOCK` (14h),
-`FR_AGENT_TIMEOUT` (1h per attempt).
+Knobs: `FR_PARALLEL` (3), `FR_ATTEMPTS` (3), `FR_WALLCLOCK` (8h),
+`FR_AGENT_TIMEOUT` (1h/attempt), `FR_RETRO_EVERY` (2 cycles).
+Models: `FR_MODEL_IMPL` (Sonnet), `FR_MODEL_REVIEW`/`FR_MODEL_CRITIC` (Opus).
+
+Codex runs on a separate quota. When it runs out mid-run the loop detects it,
+falls back to Claude for everything remaining, and keeps going.
 
 **You have to start it yourself.** The agents run with permission prompts
 disabled — that is what "unattended" requires — and authorizing a multi-hour
 agent fleet with that much latitude is a decision for you to make, not something
 to be started on your behalf. Logs land in `orchestrator/logs/<task-id>/`.
 
-### How a task is processed
+### How an issue is processed
 
 ```
-worktree ──► implementer agent ──► gate ──┬─ fail ─► retry with the failure output (≤3)
-                                          │
-                                          └─ pass ─► 2 adversarial reviewers (claude + codex,
-                                                     independent contexts, only see the diff)
-                                                        │
-                                                        ├─ BLOCK ─► fixer agent ─► re-gate ─► re-review
-                                                        └─ PASS  ─► rebase, re-gate, merge to main
+claim ─► critic ─┬─ REVISE ─► comment on the issue, label fr:questioned, move on
+                 └─ PROCEED ─► implementer ─► gate ─┬─ fail ─► retry (≤3, escalating model)
+                                                    └─ pass ─► 2 adversarial reviewers
+                                                        (claude + codex, independent
+                                                         contexts, diff only)
+                                                          ├─ BLOCK ─► fixer ─► re-gate ─► re-review
+                                                          └─ PASS  ─► rebase, re-gate, merge, close
 ```
+
+The **critic** runs before any code is written. The issues were filed by an
+agent, not by someone who read the codebase, so they may be wrong, oversized, or
+already done. An agent that faithfully implements a bad issue produces work that
+passes the gate and looks like progress — that is the failure mode this stage
+exists to prevent.
+
+### Self-improvement
+
+Every stage outcome is appended to `orchestrator/logs/events.jsonl`. Between
+cycles a **retrospective** reads that journal — not the agent transcripts, which
+are too large and unstructured to yield anything but impressions — and looks for
+patterns rather than incidents. One gate failure is a hard task; four with the
+same error is a broken harness. Three `critic_revise` events with the same
+reason means the *planner prompt* is wrong, not the three issues.
+
+It then files its own fixes, under a boundary that is not negotiable:
+
+- **Prompts, docs, gate, bench** → filed `fr:ready,fr:meta`, drained normally.
+  These are data the loop reads; changing them mid-run is safe.
+- **`loop.py` / `gh.py`** → filed `fr:meta` only, never auto-claimed. The loop
+  is executing that code; letting an agent rewrite its own control flow mid-run
+  risks corrupting the very run producing the evidence. A human promotes those.
+
+So the loop may improve its instructions while running, but not itself.
 
 The adversarial review stage is lifted from
 [Bun's Zig→Rust rewrite](https://bun.com/blog/bun-in-rust), which used

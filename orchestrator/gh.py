@@ -29,6 +29,11 @@ LABELS = {
     "fr:blocked": ("b60205", "Failed repeatedly; needs a human"),
     "fr:questioned": ("5319e7", "An agent challenged this spec; needs re-scoping"),
     "fr:followup": ("c5def5", "Filed by an agent mid-task"),
+    # Filed by the retrospective against the loop itself. Carries fr:ready only
+    # when it targets prompts/docs/gate (data the loop reads). Issues touching
+    # loop.py or gh.py get fr:meta alone, so a human must promote them -- the
+    # loop must not rewrite its own control flow while executing it.
+    "fr:meta": ("d4c5f9", "Improvement to the loop itself"),
 }
 
 DEP_RE = re.compile(r"depends on:?\s*(.+)", re.I)

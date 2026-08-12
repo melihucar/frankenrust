@@ -25,6 +25,7 @@ produces work that passes the gate and looks like progress.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import shutil
@@ -51,6 +52,7 @@ MAX_ATTEMPTS = int(os.environ.get("FR_ATTEMPTS", "3"))
 AGENT_TIMEOUT = int(os.environ.get("FR_AGENT_TIMEOUT", str(60 * 60)))
 GATE_TIMEOUT = int(os.environ.get("FR_GATE_TIMEOUT", str(30 * 60)))
 WALLCLOCK_LIMIT = int(os.environ.get("FR_WALLCLOCK", str(8 * 60 * 60)))
+RETRO_EVERY = int(os.environ.get("FR_RETRO_EVERY", "2"))   # cycles per retrospective
 # -----------------------------------------------------------------------------
 
 # Implementation is bulk mechanical translation against a spec that already
@@ -92,6 +94,24 @@ def log(msg: str) -> None:
     LOGS.mkdir(parents=True, exist_ok=True)
     with (LOGS / "loop.log").open("a") as fh:
         fh.write(line + "\n")
+
+
+_journal_lock = threading.Lock()
+JOURNAL = LOGS / "events.jsonl"
+
+
+def record(event: str, **fields) -> None:
+    """Append a structured event.
+
+    The retrospective reads THIS, not the agent transcripts. Transcripts are
+    enormous and unstructured; asking a model to find systemic patterns in them
+    produces impressions rather than findings. One JSON line per stage outcome
+    makes "the critic rejected 4 issues for the same reason" a countable fact.
+    """
+    rec = {"ts": now(), "event": event, **fields}
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with _journal_lock, JOURNAL.open("a") as fh:
+        fh.write(json.dumps(rec) + "\n")
 
 
 def codex_ok() -> bool:
@@ -206,10 +226,12 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
             except subprocess.TimeoutExpired:
                 proc.kill()
                 log(f"    !! {use} timed out after {AGENT_TIMEOUT}s")
+                record("agent_timeout", agent=use, tag=tag, seconds=AGENT_TIMEOUT)
                 return use, 124, ""
         # Require BOTH a failure and a quota pattern: "429"/"rate limit" appear
         # legitimately in the output of an agent writing an HTTP server.
         if use == "codex" and rc != 0 and _hit_limit(logpath):
+            record("agent_fallback", agent="codex", to="claude", tag=tag, rc=rc)
             disable_codex(f"exit {rc} with a quota pattern")
             use, model = resolve("codex", role, escalate)
             continue
@@ -251,10 +273,12 @@ def merge_worktree(tid: str, logdir: Path, gate: str) -> bool:
         if rc != 0:
             git(["rebase", "--abort"], cwd=wt)
             log(f"    !! {tid} rebase conflict onto main")
+            record("rebase_conflict", issue=tid)
             return False
         rc, _ = run(["bash", str(GATE), gate], wt, GATE_TIMEOUT, logdir / "gate.rebase.log")
         if rc != 0:
             log(f"    !! {tid} gate failed after rebase onto main")
+            record("merge_regate_fail", issue=tid)
             return False
         rc, out = git(["merge", "--ff-only", branch])
         if rc != 0:
@@ -309,6 +333,8 @@ def work(issue: gh.Issue) -> None:
                                logdir, "critic", role="critic")
     if "VERDICT: REVISE" in critique:
         log(f"    ?? #{issue.number} questioned by the critic")
+        record("critic_revise", issue=issue.number, title=issue.title,
+               excerpt=critique[-1500:])
         gh.question(issue.number, critique[-40000:])
         git(["worktree", "remove", "--force", str(wt)])
         return
@@ -332,6 +358,8 @@ def work(issue: gh.Issue) -> None:
                        logdir / f"gate.{attempt}.log")
         if rc != 0:
             log(f"    xx gate failed (#{issue.number} attempt {attempt})")
+            record("gate_fail", issue=issue.number, attempt=attempt, agent=agent,
+                   gate=issue.gate, tail=tail[-1500:])
             failure = tail
             continue
 
@@ -339,6 +367,8 @@ def work(issue: gh.Issue) -> None:
         blocking = review_stage(issue, wt, logdir, str(attempt))
         if blocking:
             log(f"    xx review BLOCKED #{issue.number}")
+            record("review_block", issue=issue.number, attempt=attempt,
+                   excerpt=blocking[-1500:])
             invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"), logdir,
                    f"fix.{attempt}", role="fixer")
             rc, tail = run(["bash", str(GATE), issue.gate], wt, GATE_TIMEOUT,
@@ -355,11 +385,15 @@ def work(issue: gh.Issue) -> None:
             gh.close(issue.number,
                      f"Merged as `{sha}` after {attempt} attempt(s), gate `{issue.gate}`, "
                      f"and two adversarial reviews.")
+            record("merged", issue=issue.number, title=issue.title,
+                   attempts=attempt, agent=agent, gate=issue.gate)
             git(["worktree", "remove", "--force", str(wt)])
             return
         failure = "Passed gate and review but could not merge (rebase conflict or "\
                   "gate regression against latest main). Re-sync and redo."
 
+    record("blocked", issue=issue.number, title=issue.title,
+           attempts=MAX_ATTEMPTS, tail=(failure or "")[-1500:])
     gh.block(issue.number, f"Failed {MAX_ATTEMPTS} attempts. Last failure:\n\n```\n{failure}\n```")
 
 
@@ -377,9 +411,28 @@ def cmd_seed() -> int:
     return 0 if issues else 1
 
 
+def retrospective(cycle: int) -> None:
+    """Diagnose the loop, not the issues, and file fixes for itself."""
+    if not JOURNAL.exists():
+        return
+    log(f"== retrospective (cycle {cycle})")
+    p = "\n".join([(PROMPTS / "shared.md").read_text(),
+                    (PROMPTS / "retrospective.md").read_text(),
+                    f"\n# This is cycle {cycle}. Write to "
+                    f"orchestrator/logs/retro-{cycle}.md\n"])
+    invoke("claude", ROOT, p, LOGS / "retro", f"cycle{cycle}", role="critic")
+    record("retrospective", cycle=cycle)
+
+
+def cmd_retro() -> int:
+    retrospective(int(os.environ.get("FR_CYCLE", "0")))
+    return 0
+
+
 def cmd_run() -> int:
     gh.ensure_labels()
     log(f"loop start: parallel={MAX_PARALLEL}, wallclock={WALLCLOCK_LIMIT}s")
+    cycle = 0
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
         while True:
             if time.time() - _start > WALLCLOCK_LIMIT:
@@ -397,7 +450,13 @@ def cmd_run() -> int:
                 continue
             for f in [pool.submit(work, i) for i in batch]:
                 f.result()
+            cycle += 1
+            # Retrospect between cycles, while the evidence is fresh and there
+            # is still queue left for the fixes to affect.
+            if cycle % RETRO_EVERY == 0:
+                retrospective(cycle)
 
+    retrospective(cycle + 1)   # final pass over the whole run
     blocked = gh.fetch(label="fr:blocked")
     questioned = gh.fetch(label="fr:questioned")
     log(f"loop end: blocked={[i.number for i in blocked]} "
@@ -418,7 +477,8 @@ def cmd_status() -> int:
 
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
-    return {"run": cmd_run, "seed": cmd_seed, "status": cmd_status}.get(
+    return {"run": cmd_run, "seed": cmd_seed, "status": cmd_status,
+            "retro": cmd_retro}.get(
         cmd, lambda: (print(__doc__), 2)[1])()
 
 
