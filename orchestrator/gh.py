@@ -10,7 +10,13 @@ Label state machine:
 
     fr:ready ──claim──► fr:claimed ──┬─ merged ─► issue closed
         ▲                            ├─ failed ─► fr:blocked
-        └────── released ────────────┴─ spec is wrong ─► fr:questioned
+        │                            └─ spec is wrong ─► resolver
+        └──── requeue (re-scoped) ─────────────┴─ or closed with evidence
+
+fr:questioned is a last resort, not a resting place: nobody is coming to
+re-scope it. The resolver adjudicates the objection and puts the issue back in
+play or kills it, and `requeue` stamps `Revisions: N` so that exchange cannot
+run forever.
 
 Dependencies live in the issue body as `Depends on: #12, #13`. An issue is
 claimable only once every issue it depends on is closed.
@@ -29,10 +35,11 @@ LABELS = {
     "fr:blocked": ("b60205", "Failed repeatedly; needs a human"),
     "fr:questioned": ("5319e7", "An agent challenged this spec; needs re-scoping"),
     "fr:followup": ("c5def5", "Filed by an agent mid-task"),
-    # Filed by the retrospective against the loop itself. Carries fr:ready only
-    # when it targets prompts/docs/gate (data the loop reads). Issues touching
-    # loop.py or gh.py get fr:meta alone, so a human must promote them -- the
-    # loop must not rewrite its own control flow while executing it.
+    # Filed by the retrospective against the loop itself, and claimable like any
+    # other issue -- there is no human to promote it. Changes to prompts, docs
+    # and the gate take effect on the next invocation because the loop re-reads
+    # them; a merge touching loop.py or gh.py makes the loop re-exec into the
+    # new code at the next batch boundary (see loop.py: restart_into_new_code).
     "fr:meta": ("d4c5f9", "Improvement to the loop itself"),
 }
 
