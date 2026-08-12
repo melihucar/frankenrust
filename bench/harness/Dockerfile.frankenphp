@@ -1,0 +1,8 @@
+# FrankenPHP with the fixture and Caddyfile baked in (see Dockerfile.app for
+# why bind mounts are disqualifying here).
+ARG BASE=dunglas/frankenphp:latest
+FROM ${BASE}
+ARG APP
+ARG CADDYFILE
+COPY ${APP}/ /app/public/
+COPY ${CADDYFILE} /etc/frankenphp/Caddyfile

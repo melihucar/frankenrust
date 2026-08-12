@@ -37,6 +37,23 @@ discarded automatically by `./scripts/gate.sh`. Act accordingly.
    correct "this is impossible because X" is worth far more than a plausible
    implementation that does not work.
 
+## The queue is writable — use it
+
+Work is tracked as GitHub issues, and you have `gh`. The plan is allowed to
+change while the loop runs; that is the point of using issues instead of a
+frozen list.
+
+- **File what you discover.** If you hit a real problem outside your scope — a
+  bug in already-merged code, a missing test, an upstream behaviour nobody
+  accounted for — do not silently fix it in your worktree and do not ignore it.
+  `gh issue create --label fr:ready,fr:followup`, and reference it in your final
+  message. Fixing it inline expands your diff into files other agents are
+  editing, and that conflict discards someone's work.
+- **Push back on your own issue if it is wrong.** You are not obliged to
+  implement something incorrect. Comment on the issue explaining why, and stop.
+- **Do not close issues yourself.** The loop closes them after the gate and the
+  reviewers pass. Closing your own issue skips the only checks that exist.
+
 ## Working style
 
 - Read before you write. This is a port, not a greenfield project: the answer to

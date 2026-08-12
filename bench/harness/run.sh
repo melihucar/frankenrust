@@ -36,7 +36,7 @@ CONNECTIONS="${CONNECTIONS:-64}"
 WARMUP="${WARMUP:-10s}"
 
 APPS=(noop hello json compute)
-SERVERS=(frankenphp frankenrust)
+SERVERS=(frankenphp frankenrust pasir)
 SMOKE=0
 
 while [ $# -gt 0 ]; do
@@ -65,25 +65,46 @@ ensure_loadgen() {
 }
 
 # --- server lifecycle --------------------------------------------------------
-start_server() {
-  local server="$1" app="$2"
-  docker rm -f "bench-$server" >/dev/null 2>&1
+# Bake the fixture into the image and echo the tag.
+#
+# Previously the apps were bind-mounted from macOS. Docker Desktop serves those
+# over VirtioFS, and any server that stat()s the document root per request pays
+# a large tax that a server which does not stat never sees. Measured on the same
+# FrankenPHP build and fixture: 3,248 rps bind-mounted vs 21,317 rps baked --
+# a 6.6x artifact, larger than any effect this project is trying to detect.
+ROUTING="${ROUTING:-default}"        # default (php_server/try_files) | matched
+bake() {
+  local server="$1" app="$2" tag="benchimg-$server-$app-$ROUTING"
+  docker image inspect "$tag" >/dev/null 2>&1 && { echo "$tag"; return 0; }
   case "$server" in
     frankenphp)
-      docker run -d --name "bench-$server" --network "$NET" \
-        --platform linux/arm64 --cpus "$SERVER_CPUS" --memory "$SERVER_MEM" \
-        -v "$PWD/bench/apps/$app:/app/public:ro" \
-        -v "$PWD/$HARNESS/config/Caddyfile.bench:/etc/frankenphp/Caddyfile:ro" \
-        dunglas/frankenphp:latest >/dev/null ;;
-    frankenrust)
-      docker image inspect frankenrust:bench >/dev/null 2>&1 \
-        || { say "SKIP frankenrust: image not built yet"; return 1; }
-      docker run -d --name "bench-$server" --network "$NET" \
-        --platform linux/arm64 --cpus "$SERVER_CPUS" --memory "$SERVER_MEM" \
-        -v "$PWD/bench/apps/$app:/app/public:ro" \
-        frankenrust:bench >/dev/null ;;
-    *) die "unknown server $server" ;;
+      local cf="$HARNESS/config/Caddyfile.bench"
+      [ "$ROUTING" = "matched" ] && cf="$HARNESS/config/Caddyfile.matched"
+      docker build --platform linux/arm64 -t "$tag" \
+        --build-arg BASE=dunglas/frankenphp:latest \
+        --build-arg APP="bench/apps/$app" --build-arg CADDYFILE="$cf" \
+        -f "$HARNESS/Dockerfile.frankenphp" . >/dev/null 2>&1 || return 1 ;;
+    pasir|frankenrust)
+      docker image inspect "$server:bench" >/dev/null 2>&1 || return 1
+      docker build --platform linux/arm64 -t "$tag" \
+        --build-arg BASE="$server:bench" --build-arg APP="bench/apps/$app" \
+        -f "$HARNESS/Dockerfile.app" . >/dev/null 2>&1 || return 1 ;;
+    *) return 1 ;;
   esac
+  echo "$tag"
+}
+
+start_server() {
+  local server="$1" app="$2" tag
+  docker rm -f "bench-$server" >/dev/null 2>&1
+  tag=$(bake "$server" "$app") || { say "SKIP $server: image not available"; return 1; }
+  # FR_THREADS equalises the PHP concurrency budget across servers. Without it
+  # FrankenPHP runs a fixed 8 interpreters while a spawn_blocking-based server
+  # can have 64+ in flight at -c 64, which measures pool sizing, not runtime.
+  docker run -d --name "bench-$server" --network "$NET" \
+    --platform linux/arm64 --cpus "$SERVER_CPUS" --memory "$SERVER_MEM" \
+    -e FR_THREADS="${FR_THREADS:-8}" \
+    "$tag" >/dev/null || return 1
   for _ in $(seq 1 60); do
     if docker run --rm --network "$NET" "$LOADGEN_IMAGE" \
          oha -n 1 --no-tui "http://bench-$server/" >/dev/null 2>&1; then

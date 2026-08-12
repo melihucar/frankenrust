@@ -1,0 +1,21 @@
+# Matched-semantics config: routes every request straight to index.php with NO
+# filesystem probing, which is what Pasir (and our thin slice) do.
+#
+# The default `php_server` directive expands to `try_files`, stat()ing the
+# document root on every request to decide between a static file and PHP.
+# That is a genuine feature, but it is a ROUTING POLICY, not a runtime
+# property -- comparing a server that does it against one that does not
+# measures the policy, not Go vs Rust. Run both configs and report both.
+{
+	auto_https off
+	admin off
+	frankenphp {
+		num_threads {$FR_THREADS:8}
+	}
+}
+
+:80 {
+	root /app/public
+	rewrite * /index.php
+	php
+}
