@@ -21,7 +21,7 @@ jq -r 'select(.event=="critic_revise") | .excerpt' orchestrator/logs/events.json
 Events: `merged`, `blocked`, `gate_fail`, `review_block`, `critic_revise`,
 `resolved`, `resolve_failed`, `rebase_conflict`, `merge_regate_fail`,
 `agent_fallback`, `agent_timeout`, `agent_error`, `work_crash`, `reclaimed`,
-`low_disk`, `retrospective`.
+`low_disk`, `retrospective`, `retro_error`, `self_restart`, `journal_reset`.
 
 Three of those describe the loop failing rather than an agent failing, and they
 are the most important things in the file: `work_crash` is an unhandled
