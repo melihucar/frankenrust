@@ -59,13 +59,18 @@ if [ ! -f Cargo.toml ]; then
     FAILED+=("build")
   fi
 else
-  step "build" cargo build --workspace --all-targets
+  # Routed through scripts/dev.sh: the host has no PHP embed SAPI and no Rust
+  # toolchain (see docker/frankenrust-dev.Dockerfile), so a bare `cargo build`
+  # here cannot link -lphp. If Docker is unavailable or the image fails to
+  # build, dev.sh exits nonzero and this step FAILS — it must never be
+  # allowed to silently skip.
+  step "build" scripts/dev.sh cargo build --workspace --all-targets
 fi
 
 if [ "$PROFILE" != "bootstrap" ]; then
-  step "fmt"     cargo fmt --all -- --check
-  step "clippy"  cargo clippy --workspace --all-targets -- -D warnings
-  step "test"    cargo test --workspace
+  step "fmt"     scripts/dev.sh cargo fmt --all -- --check
+  step "clippy"  scripts/dev.sh cargo clippy --workspace --all-targets -- -D warnings
+  step "test"    scripts/dev.sh cargo test --workspace
   step "conformance" bash tests/conformance/run.sh
 fi
 
