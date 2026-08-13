@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 use frankenrust_sys::{frankenphp_server_vars, sapi_request_info, zend_string, zval};
 
-use crate::context::{Headers, RequestContext, Scheme};
+use crate::context::{RequestContext, Scheme};
 
 // ---------------------------------------------------------------------------
 // Path helpers (cgi.go:191-392)
@@ -26,11 +26,49 @@ pub fn ensure_leading_slash(path: &str) -> String {
     }
 }
 
+/// `ErrInvalidSplitPath` (`requestoptions.go:21`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidSplitPath;
+
+impl std::fmt::Display for InvalidSplitPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("split path contains non-ASCII characters")
+    }
+}
+
+impl std::error::Error for InvalidSplitPath {}
+
+/// Port of `WithRequestSplitPath` (`requestoptions.go:86-113`): reject any
+/// entry containing a byte >= 0x80, and ASCII-lower-case the rest.
+///
+/// This runs at *configuration* time, not per request, and it is what makes
+/// [`split_pos`]'s one-sided fold correct: `split_pos` folds only the bytes
+/// of the path it is searching, and compares them against the split entries
+/// verbatim. An un-normalised entry is fail-*closed* rather than a bypass --
+/// ".PHP" or an entry with a non-ASCII byte simply never matches anything --
+/// but silently never matching is not the configured behaviour, so like
+/// upstream we normalise what we can and refuse what we cannot.
+pub fn normalize_split_path(split_path: Vec<String>) -> Result<Vec<String>, InvalidSplitPath> {
+    split_path
+        .into_iter()
+        .map(|split| {
+            if !split.is_ascii() {
+                return Err(InvalidSplitPath);
+            }
+            Ok(split.to_ascii_lowercase())
+        })
+        .collect()
+}
+
 /// Port of `splitPos` (`cgi.go:238-279`): a hand-rolled, ASCII-only,
 /// case-insensitive substring search. Bytes >= 0x80 never match, by design
 /// (see upstream's comment and GHSA-3g8v-8r37-cgjm / GHSA-v4h7-cj44-8fc8) --
 /// do not "fix" this to be Unicode-aware, that is exactly the vulnerability
 /// class it exists to avoid.
+///
+/// `split_path`'s entries are assumed ASCII and already lower-cased, which is
+/// what [`normalize_split_path`] guarantees (upstream leans on
+/// `WithRequestSplitPath` for the same guarantee).
 pub fn split_pos(path: &str, split_path: &[String]) -> isize {
     if split_path.is_empty() {
         return 0;
@@ -178,10 +216,19 @@ fn clean_path(path: &str) -> String {
         {
             r += 2;
             if out.len() > dotdot {
-                out.pop();
-                while out.len() > dotdot && out[out.len() - 1] != b'/' {
-                    out.pop();
+                // Go walks a write cursor `out.w` back over the segment and
+                // stops on the separator *at* `out.w` -- i.e. the byte one
+                // past the content it keeps, which is therefore dropped along
+                // with the segment. Popping and testing the last *remaining*
+                // byte instead stops one byte early and leaves the separator
+                // behind ("/var/www/.." -> "/var/" rather than "/var"), so
+                // the cursor is modelled explicitly here: `w` indexes bytes
+                // that are still in `out` until the final `truncate`.
+                let mut w = out.len() - 1;
+                while w > dotdot && out[w] != b'/' {
+                    w -= 1;
                 }
+                out.truncate(w);
             } else if !rooted {
                 if !out.is_empty() {
                     out.push(b'/');
@@ -534,10 +581,13 @@ pub fn compute_server_vars(ctx: &RequestContext) -> Option<ComputedServerVars> {
         };
     }
 
+    // `request.Header.Get("Content-Length")` (cgi.go:93): the raw header
+    // text of the *first* Content-Length, not a join of all of them.
     let content_length = request
         .headers
-        .get_joined("Content-Length")
-        .unwrap_or_default();
+        .get_first("Content-Length")
+        .unwrap_or_default()
+        .to_vec();
     let php_self = format!("{}{}", ctx.script_name, ctx.path_info);
     let total_num_vars = 28 + request.headers.name_count();
 
@@ -625,6 +675,90 @@ impl ComputedServerVars {
     }
 }
 
+/// Everything `go_register_server_variables` hands to PHP, copied out of the
+/// [`RequestContext`] so that the per-thread slot lock is released *before*
+/// any of it reaches C. See [`crate::context::ContextSlots`]'s "one rule for
+/// callers": a `zend_bailout()` out of any of the register calls is a
+/// `longjmp` that runs no Rust destructors, so a slot guard alive across
+/// them would be leaked and that thread's slot locked forever.
+///
+/// Releasing the slot lock narrows the blast radius but does not make the
+/// control transfer fully sound: [`register_server_vars`] still runs with
+/// *this* payload owned by a live Rust frame while it calls into
+/// `frankenphp_register_server_vars` / `_known_variable` / `_variable_safe`.
+/// Those C functions grow and populate `$_SERVER`'s `HashTable` through the
+/// Zend request allocator, which on `memory_limit` exhaustion does not
+/// return an error -- `zend_error_noreturn(E_ERROR, ...)` ends in
+/// `zend_bailout()`, a `longjmp` back to the `zend_first_try` in
+/// `frankenphp_php_thread` (`frankenphp.c:1504`), skipping every frame in
+/// between -- Rust ones included -- without running its destructors. Rust
+/// treats a `longjmp` crossing any of its frames as undefined behavior
+/// regardless of what that frame owns, so this is a residual risk, not
+/// (yet) a closed one: fully closing it needs a C-side
+/// `zend_try`/`zend_catch` trampoline installed *inside* the C frame that
+/// makes the risky call, so no Rust frame is ever on the stack between the
+/// `setjmp` and a potential `longjmp` target. That trampoline is new C
+/// source, and this issue's `build.rs` edits are scoped to additive
+/// `.allowlist_function` lines only (no other edits, so #12's/#13's own
+/// additions to the same list keep conflicting trivially) -- and the
+/// vendored `frankenphp.c` that defines these functions is not ours to
+/// modify either. Tracked as a cross-cutting `frankenrust-sys` followup:
+/// <https://github.com/melihucar/frankenrust/issues/75>.
+///
+/// What stays true in the meantime: this struct and [`ComputedServerVars`]
+/// own nothing but `Vec<u8>`/`String` buffers with trivial destructors
+/// (plain deallocation -- no lock, no file handle, no other resource with a
+/// side effect), so the worst case of a bailout here is a bounded, one-shot
+/// leak of this call's payload -- never a dangling pointer or a stuck lock
+/// -- and it happens on the exact path C already marks
+/// `thread_is_healthy = false` and abandons the request
+/// (`frankenphp.c:1567-1568`). Upstream's own Go implementation carries the
+/// structurally identical exposure: `go_register_server_variables` -- the
+/// cgo-exported function this whole call chain ports -- calls
+/// `C.frankenphp_register_server_vars` from a live Go stack frame nested
+/// under the very same `zend_first_try`, so this is not a regression
+/// relative to the oracle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerVarsPayload {
+    pub known: ComputedServerVars,
+    /// Canonical header name -> its values joined with `", "` (`cgi.go:153`,
+    /// `:161`). The join is done here, under the slot lock, so that
+    /// [`add_headers_to_server`] does nothing but look up an interned key and
+    /// call C.
+    pub headers: Vec<(String, Vec<u8>)>,
+}
+
+/// Copies out everything the `$_SERVER` population needs. `None` when there
+/// is no request, matching upstream's `if fc.request != nil` guard
+/// (`cgi.go:179`), which gates *both* the known variables and the headers.
+pub fn collect_server_vars(ctx: &RequestContext) -> Option<ServerVarsPayload> {
+    let known = compute_server_vars(ctx)?;
+    let headers = ctx
+        .request
+        .as_ref()?
+        .headers
+        .iter()
+        .map(|(name, values)| (name.to_string(), join_header_values(values)))
+        .collect();
+
+    Some(ServerVarsPayload { known, headers })
+}
+
+/// The whole C-calling half of `go_register_server_variables`
+/// (`cgi.go:176-188`), over an already-collected payload.
+///
+/// # Safety
+/// Same contract as [`register_known_server_vars`]. In addition, the caller
+/// must hold **no** [`crate::context::ContextSlots`] guard -- these calls can
+/// `zend_bailout()` past every Rust destructor on the stack.
+pub unsafe fn register_server_vars(payload: &ServerVarsPayload, track_vars_array: *mut zval) {
+    // SAFETY: forwarded verbatim from this function's own contract.
+    unsafe {
+        register_known_server_vars(&payload.known, track_vars_array);
+        add_headers_to_server(&payload.headers, track_vars_array);
+    }
+}
+
 /// Calls `frankenphp_register_server_vars` once, per `cgi.go:104`.
 ///
 /// # Safety
@@ -640,21 +774,27 @@ pub unsafe fn register_known_server_vars(vars: &ComputedServerVars, track_vars_a
     // call; frankenphp_register_server_vars copies every field into a new
     // zval before returning (frankenphp.c:1220-1268), so it does not need
     // to outlive this call either.
+    //
+    // Residual risk: this call can `zend_bailout()` out from under this
+    // Rust frame on `memory_limit` exhaustion -- see [`ServerVarsPayload`]'s
+    // doc comment for the full argument for why that cannot be closed from
+    // this module alone (issue #75).
     unsafe {
         frankenrust_sys::frankenphp_register_server_vars(track_vars_array, ffi_vars);
     }
 }
 
-/// Port of `addHeadersToServer` (`cgi.go:150-164`).
+/// Port of `addHeadersToServer` (`cgi.go:150-164`), over the already-joined
+/// pairs [`collect_server_vars`] copied out of the context.
 ///
 /// # Safety
-/// Same contract as [`register_known_server_vars`].
-pub unsafe fn add_headers_to_server(headers: &Headers, track_vars_array: *mut zval) {
+/// Same contract as [`register_server_vars`]. Same residual bailout risk as
+/// [`register_known_server_vars`] too, once per header -- see
+/// [`ServerVarsPayload`]'s doc comment (issue #75).
+pub unsafe fn add_headers_to_server(headers: &[(String, Vec<u8>)], track_vars_array: *mut zval) {
     let interned = interned_strings();
-    for (name, values) in headers.iter() {
-        let joined = join_header_values(values);
-
-        if let Some(key) = interned.common_headers.get(name) {
+    for (name, joined) in headers {
+        if let Some(key) = interned.common_headers.get(name.as_str()) {
             // SAFETY: `key.0` is a live, permanently-interned zend_string*
             // (never freed, `IS_STR_INTERNED`); `joined` is valid for the
             // duration of this call and frankenphp_register_known_variable
@@ -735,8 +875,18 @@ pub fn update_request_info(ctx: &mut RequestContext, info: &mut sapi_request_inf
     let method = request.method.clone();
     let raw_query = request.raw_query.clone();
     let content_length = request.content_length;
-    let content_type = request.headers.get_joined("Content-Type");
-    let authorization = request.headers.get_joined("Authorization");
+    // `request.Header.Get(...)` at cgi.go:306 and :316 -- the first value of
+    // each, never a join. A joined Content-Type matches no registered POST
+    // reader, and a joined Authorization is un-decodable garbage for
+    // `php_handle_auth_data` (frankenphp.c:358).
+    let content_type = request
+        .headers
+        .get_first("Content-Type")
+        .map(<[u8]>::to_vec);
+    let authorization = request
+        .headers
+        .get_first("Authorization")
+        .map(<[u8]>::to_vec);
     let proto_num = (request.proto_major as i32) * 1000 + request.proto_minor as i32;
     let path_translated = if ctx.path_info.is_empty() {
         None
@@ -786,6 +936,7 @@ mod tests {
     fn test_context(request: Option<Request>) -> RequestContext {
         let (tx, _rx) = mpsc::channel();
         RequestContext::new("/var/www".to_string(), None, request, tx)
+            .expect("the default split path is valid")
     }
 
     // --- TestEnsureLeadingSlash (cgi_test.go:10-34) -------------------------
@@ -988,6 +1139,116 @@ mod tests {
         assert_eq!(sanitized_path_join("", "/etc/passwd"), "etc/passwd");
     }
 
+    #[test]
+    fn sanitized_path_join_resolves_dotdot_in_the_document_root() {
+        // Regression test for a one-byte mis-port of filepath.Clean's `..`
+        // backtrack: it stopped on the last byte still present rather than on
+        // the separator one past it, leaving the separator behind. The outer
+        // Clean collapses the resulting "//" almost everywhere, which is why
+        // only a `..` inside the *root* shows it.
+        assert_eq!(
+            sanitized_path_join("/var/www/..", "/index.php"),
+            "/var/index.php"
+        );
+        assert_eq!(
+            sanitized_path_join("/var/www/../www", "/a.php"),
+            "/var/www/a.php"
+        );
+    }
+
+    #[test]
+    fn clean_path_matches_go_filepath_clean() {
+        // Rows lifted from Go's path/filepath TestClean, restricted to the
+        // Unix separator (the only one build.rs supports).
+        let cases = [
+            ("", "."),
+            ("abc", "abc"),
+            ("abc/def", "abc/def"),
+            ("a/b/c", "a/b/c"),
+            (".", "."),
+            ("..", ".."),
+            ("../..", "../.."),
+            ("../../abc", "../../abc"),
+            ("/abc", "/abc"),
+            ("/", "/"),
+            ("abc/", "abc"),
+            ("abc/def/", "abc/def"),
+            ("a/b/c/", "a/b/c"),
+            ("./", "."),
+            ("../", ".."),
+            ("../../", "../.."),
+            ("/abc/", "/abc"),
+            ("abc//def//ghi", "abc/def/ghi"),
+            ("//abc", "/abc"),
+            ("///abc", "/abc"),
+            ("//abc//", "/abc"),
+            ("abc//", "abc"),
+            ("abc/./def", "abc/def"),
+            ("/./abc/def", "/abc/def"),
+            ("abc/.", "abc"),
+            ("abc/def/ghi/../jkl", "abc/def/jkl"),
+            ("abc/def/../ghi/../jkl", "abc/jkl"),
+            ("abc/def/..", "abc"),
+            ("abc/def/../..", "."),
+            ("/abc/def/../..", "/"),
+            ("abc/def/../../..", ".."),
+            ("/abc/def/../../..", "/"),
+            ("abc/def/../../../ghi/jkl/../../../mno", "../../mno"),
+            // The rows the off-by-one got wrong: a `..` that lands the write
+            // cursor on a separator inside the result.
+            ("/var/www/..", "/var"),
+            ("/a/b/..", "/a"),
+            ("a/b/..", "a"),
+            ("/a/b/../c", "/a/c"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(clean_path(input), expected, "clean_path({input:?})");
+        }
+    }
+
+    // --- WithRequestSplitPath (requestoptions.go:86-113) ---------------------
+
+    #[test]
+    fn normalize_split_path_matches_upstream_table() {
+        // Ported from requestoptions_test.go:20-52.
+        assert_eq!(
+            normalize_split_path(vec![".php".to_string()]).unwrap(),
+            vec![".php".to_string()]
+        );
+        assert_eq!(
+            normalize_split_path(vec![".PHP".to_string()]).unwrap(),
+            vec![".php".to_string()]
+        );
+        assert_eq!(
+            normalize_split_path(vec![".PhP".to_string(), ".PHTML".to_string()]).unwrap(),
+            vec![".php".to_string(), ".phtml".to_string()]
+        );
+        assert_eq!(
+            normalize_split_path(Vec::new()).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            normalize_split_path(vec![".php".to_string(), ".Ⱥphp".to_string()]),
+            Err(InvalidSplitPath)
+        );
+        assert_eq!(
+            normalize_split_path(vec![".phpⱥ".to_string()]),
+            Err(InvalidSplitPath)
+        );
+    }
+
+    #[test]
+    fn split_pos_matches_a_normalised_uppercase_split_path() {
+        // The reason normalisation is load-bearing: split_pos folds the bytes
+        // of the *path* only, so it compares against the split entry
+        // verbatim and ".PHP" would never match anything.
+        let raw = vec![".PHP".to_string()];
+        assert_eq!(split_pos("/index.php", &raw), -1);
+
+        let normalised = normalize_split_path(raw).unwrap();
+        assert_eq!(split_pos("/index.php", &normalised), 10);
+    }
+
     // --- Headers -> HTTP_* (issue #11 acceptance) -----------------------------
 
     #[test]
@@ -1103,9 +1364,41 @@ mod tests {
     }
 
     #[test]
+    fn server_vars_content_length_is_the_first_header_not_a_join() {
+        // request.Header.Get (cgi.go:93) returns v[0].
+        let mut request = Request::new("GET", "/index.php", "")
+            .with_header("Content-Length", b"5".to_vec())
+            .with_header("Content-Length", b"9".to_vec());
+        request.host = "example.com".to_string();
+        let ctx = test_context(Some(request));
+
+        assert_eq!(compute_server_vars(&ctx).unwrap().content_length, b"5");
+    }
+
+    #[test]
     fn compute_server_vars_is_none_without_a_request() {
         let ctx = test_context(None);
         assert!(compute_server_vars(&ctx).is_none());
+        assert!(collect_server_vars(&ctx).is_none());
+    }
+
+    #[test]
+    fn collect_server_vars_joins_multi_valued_headers() {
+        // The ", " join addHeadersToServer needs (cgi.go:153, :161) happens
+        // at collection time now, so that the FFI step runs with no context
+        // slot lock held.
+        let mut request = Request::new("GET", "/index.php", "")
+            .with_header("X-Foo", b"a".to_vec())
+            .with_header("X-Foo", b"b".to_vec());
+        request.host = "example.com".to_string();
+        let ctx = test_context(Some(request));
+
+        let payload = collect_server_vars(&ctx).unwrap();
+        assert_eq!(
+            payload.headers,
+            vec![("X-Foo".to_string(), b"a, b".to_vec())]
+        );
+        assert_eq!(payload.known.http_host, b"example.com");
     }
 
     // --- sapi_request_info population (issue #11 acceptance) -----------------
@@ -1152,6 +1445,42 @@ mod tests {
         // ctx.arena, which `ctx` (and so the arena) still owns here.
         let read_back = unsafe { std::ffi::CStr::from_ptr(info.content_type) };
         assert_eq!(read_back.to_bytes(), b"text/plain");
+    }
+
+    #[test]
+    fn update_request_info_uses_the_first_content_type_when_duplicated() {
+        // Regression test: joining two Content-Type headers produces
+        // "text/plain, application/json", which matches no registered POST
+        // reader, so the body silently falls through to the default handler.
+        let request = Request::new("POST", "/index.php", "")
+            .with_header("Content-Type", b"text/plain".to_vec())
+            .with_header("Content-Type", b"application/json".to_vec());
+        let mut ctx = test_context(Some(request));
+        let mut info = default_request_info();
+
+        update_request_info(&mut ctx, &mut info);
+        // SAFETY: the pointer was just filled by update_request_info from
+        // ctx.arena, which `ctx` (and so the arena) still owns here.
+        let read_back = unsafe { std::ffi::CStr::from_ptr(info.content_type) };
+        assert_eq!(read_back.to_bytes(), b"text/plain");
+    }
+
+    #[test]
+    fn update_request_info_returns_the_first_authorization_when_duplicated() {
+        // Regression test: a joined Authorization reaches php_handle_auth_data
+        // (frankenphp.c:358) as un-decodable garbage instead of the first
+        // credential.
+        let request = Request::new("GET", "/index.php", "")
+            .with_header("Authorization", b"Basic dXNlcjpwYXNz".to_vec())
+            .with_header("Authorization", b"Basic b3RoZXI6b3RoZXI=".to_vec());
+        let mut ctx = test_context(Some(request));
+        let mut info = default_request_info();
+
+        let auth = update_request_info(&mut ctx, &mut info);
+        assert!(!auth.is_null());
+        // SAFETY: as above -- arena-owned, and `ctx` is still alive.
+        let read_back = unsafe { std::ffi::CStr::from_ptr(auth) };
+        assert_eq!(read_back.to_bytes(), b"Basic dXNlcjpwYXNz");
     }
 
     #[test]

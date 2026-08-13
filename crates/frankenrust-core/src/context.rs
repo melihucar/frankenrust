@@ -71,14 +71,42 @@ impl Headers {
     /// All values for `name`, joined with `", "` (`cgi.go:153`, `:161`) --
     /// byte-level concatenation, not UTF-8-validating. `None` if the header
     /// was never inserted; `Some(vec![])` if it was inserted with an empty
-    /// value (matches Go's `Header.Get`, which cannot distinguish the two
-    /// either).
+    /// value.
+    ///
+    /// This is the accessor for the `HTTP_*` mangling **only**. Everywhere
+    /// upstream writes `request.Header.Get(...)` the right accessor is
+    /// [`Headers::get_first`] -- see its doc comment.
     pub fn get_joined(&self, name: &str) -> Option<Vec<u8>> {
         let canon = canonical_header_name(name);
         self.entries
             .iter()
             .find(|(n, _)| *n == canon)
             .map(|(_, values)| join_bytes(values, b", "))
+    }
+
+    /// The **first** value for `name` -- Go's `Header.Get`, which is
+    /// `textproto.MIMEHeader.Get` returning `v[0]` and never a join.
+    ///
+    /// This is what upstream uses at every one of its `Header.Get` call
+    /// sites: `Content-Length` for `$_SERVER` (`cgi.go:93`) and for
+    /// `validate()` (`context.go:157`), `Content-Type` (`cgi.go:306`) and
+    /// `Authorization` (`cgi.go:316`). Only `addHeadersToServer`'s `HTTP_*`
+    /// mangling joins duplicates. Reaching for [`Headers::get_joined`] here
+    /// instead is a parser differential on fully client-controlled input:
+    /// two `Content-Type` headers would become one value matching no
+    /// registered POST reader, and two `Authorization` headers would reach
+    /// `php_handle_auth_data` as un-decodable garbage.
+    ///
+    /// `None` if the header was never inserted; `Some(&[])` if it was
+    /// inserted with an empty value (Go's `Get` cannot distinguish the two,
+    /// so callers that need Go's exact behaviour treat both as absent).
+    pub fn get_first(&self, name: &str) -> Option<&[u8]> {
+        let canon = canonical_header_name(name);
+        self.entries
+            .iter()
+            .find(|(n, _)| *n == canon)
+            .and_then(|(_, values)| values.first())
+            .map(Vec::as_slice)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[Vec<u8>])> {
@@ -95,7 +123,42 @@ impl Headers {
     }
 }
 
+/// Port of `net/textproto`'s `validHeaderFieldByte`: the RFC 9110 §5.6.2
+/// token bytes, all of which are ASCII.
+fn is_header_field_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Port of `textproto.CanonicalMIMEHeaderKey`.
+///
+/// Go bails out and returns the name **unchanged** as soon as it meets a byte
+/// that is not a valid header field (token) byte, and otherwise only ever
+/// flips ASCII letters -- so the canonical form of a well-formed name is pure
+/// ASCII. Reproducing that bail-out is what keeps this byte-exact: without
+/// it, a name carrying a byte >= 0x80 would be re-encoded by `byte as char`
+/// into two UTF-8 bytes and silently corrupted.
 fn canonical_header_name(name: &str) -> String {
+    if !name.bytes().all(is_header_field_byte) {
+        return name.to_string();
+    }
+
     let mut out = String::with_capacity(name.len());
     let mut upper_next = true;
     for byte in name.bytes() {
@@ -104,11 +167,9 @@ fn canonical_header_name(name: &str) -> String {
         } else {
             byte.to_ascii_lowercase()
         };
-        // Header field names are ASCII tokens; a byte outside a-z/A-Z is
-        // passed through unchanged by to_ascii_*case, and casting it to
-        // `char` reproduces it exactly (values 0x00-0x7F round-trip through
-        // `char` losslessly; higher bytes should never occur in a
-        // conformant header name, and if one does this stays non-panicking).
+        // Every byte here passed `is_header_field_byte`, so it is ASCII and
+        // `cased as char` reproduces it exactly (0x00-0x7F round-trips
+        // through `char` losslessly).
         out.push(cased as char);
         upper_next = byte == b'-';
     }
@@ -136,10 +197,34 @@ fn join_bytes(values: &[Vec<u8>], sep: &[u8]) -> Vec<u8> {
 #[derive(Debug, Clone)]
 pub struct Request {
     pub method: String,
-    /// The decoded request path (Go's `request.URL.Path`).
+    /// The **decoded** request path (Go's `request.URL.Path`). This is what
+    /// `splitCgiPath` works on (`cgi.go:191`), and only that -- `REQUEST_URI`
+    /// is built from [`Request::escaped_path`] instead, because upstream
+    /// takes it from `r.URL.RequestURI()` (`context.go:111`), which is
+    /// *escaped*. One field cannot serve both: `/index.php%2Fextra` must
+    /// split as the decoded `/index.php/extra` while `$_SERVER['REQUEST_URI']`
+    /// shows the escaped form.
     pub path: String,
+    /// Go's `request.URL.RawPath`: the escaped path exactly as it arrived on
+    /// the request line, left **empty** when `path` is already its own
+    /// escaping (which is the overwhelmingly common case, and the condition
+    /// under which `net/url` itself leaves `RawPath` empty).
+    ///
+    /// Whatever fills a `Request` from the wire owes the same invariant
+    /// `net/url` maintains when it sets `RawPath`: set this only when it is a
+    /// valid escaping of `path`. See [`Request::escaped_path`].
+    pub raw_path: String,
     /// The raw, undecoded query string (Go's `request.URL.RawQuery`).
     pub raw_query: String,
+    /// Go's `request.URL.ForceQuery`: set when the request target had a
+    /// bare trailing `?` with nothing after it (e.g. `GET /index.php?
+    /// HTTP/1.1`), which `net/url` parses as `RawQuery == ""` with
+    /// `ForceQuery == true` rather than as "no query at all". Distinct from
+    /// an absent query, and load-bearing for [`Request::request_uri`]: Go's
+    /// `URL.RequestURI()` appends `"?"` when `ForceQuery || RawQuery != ""`,
+    /// so a request line ending in a bare `?` must round-trip back out with
+    /// one.
+    pub force_query: bool,
     pub headers: Headers,
     /// Go's `request.RemoteAddr` -- may be malformed; `split_remote_addr`
     /// (in `cgi.rs`) must not panic on it.
@@ -176,7 +261,9 @@ impl Request {
         Self {
             method: method.into(),
             path: path.into(),
+            raw_path: String::new(),
             raw_query: raw_query.into(),
+            force_query: false,
             headers: Headers::default(),
             remote_addr: String::new(),
             host: String::new(),
@@ -194,6 +281,106 @@ impl Request {
         self.headers.insert(name, value);
         self
     }
+
+    pub fn with_raw_path(mut self, raw_path: impl Into<String>) -> Self {
+        self.raw_path = raw_path.into();
+        self
+    }
+
+    /// See [`Request::force_query`]. Whatever fills a `Request` from the
+    /// wire is responsible for setting this when the request line's target
+    /// had a bare trailing `?` and an otherwise-empty query.
+    pub fn with_force_query(mut self, force_query: bool) -> Self {
+        self.force_query = force_query;
+        self
+    }
+
+    /// Port of `URL.EscapedPath()` (Go's `net/url`), which is what
+    /// `URL.RequestURI()` -- and so upstream's `fc.requestURI`
+    /// (`context.go:111`) -- is built from.
+    ///
+    /// Deviation, deliberate: Go re-checks `validEncoded(RawPath) &&
+    /// unescape(RawPath) == Path` before trusting `RawPath`, and falls back
+    /// to escaping `Path` when that fails. It needs that check because
+    /// `RawPath` is a public field a caller can scribble on; `net/url` itself
+    /// only ever assigns `RawPath` when it *is* a valid escaping of `Path`.
+    /// [`Request::raw_path`] documents the same obligation for our transport,
+    /// so we trust it rather than re-implementing `net/url`'s unescaper to
+    /// re-derive a fact its producer already knows.
+    pub fn escaped_path(&self) -> String {
+        if !self.raw_path.is_empty() {
+            return self.raw_path.clone();
+        }
+        if self.path == "*" {
+            // Go: don't escape (golang/go#11202) -- `OPTIONS *`.
+            return "*".to_string();
+        }
+        escape_path(&self.path)
+    }
+
+    /// Port of `URL.RequestURI()` (Go's `net/url`): the escaped path, with
+    /// `"?" + RawQuery` appended whenever `ForceQuery || RawQuery != ""`, and
+    /// `"/"` standing in for an empty path. `Opaque` cannot occur on a
+    /// server-received request (it is only ever set for non-hierarchical
+    /// URIs like `mailto:`, which `net/http`'s request-line parsing never
+    /// produces), so that part of upstream is not ported -- but `ForceQuery`
+    /// can: a request line ending in a bare `?` (`GET /index.php?
+    /// HTTP/1.1`) parses with `RawQuery == ""` and `ForceQuery == true`, and
+    /// must round-trip back out with the `?`. See [`Request::force_query`].
+    pub fn request_uri(&self) -> String {
+        let mut uri = self.escaped_path();
+        if uri.is_empty() {
+            uri.push('/');
+        }
+        if self.force_query || !self.raw_query.is_empty() {
+            uri.push('?');
+            uri.push_str(&self.raw_query);
+        }
+        uri
+    }
+}
+
+/// Port of Go's `shouldEscape(c, encodePath)` (`net/url`). The comment
+/// upstream of the reserved-character list is Go's own: RFC 3986 allows
+/// `: @ & = + $` in a path and saves `/ ; ,` for assigning meaning to
+/// individual segments, but `net/url` only manipulates the path as a whole,
+/// so it permits those three as well -- leaving only `?` to escape out of
+/// that set.
+fn should_escape_path_byte(c: u8) -> bool {
+    if c.is_ascii_alphanumeric() {
+        return false;
+    }
+    match c {
+        // RFC 3986 §2.3 unreserved marks.
+        b'-' | b'_' | b'.' | b'~' => false,
+        // RFC 3986 §2.2 reserved, as filtered for `encodePath`.
+        b'$' | b'&' | b'+' | b',' | b'/' | b':' | b';' | b'=' | b'@' => false,
+        // Everything else, `?` included, must be escaped.
+        _ => true,
+    }
+}
+
+/// Port of Go's `escape(s, encodePath)` (`net/url`): `%XX` with upper-case
+/// hex, and (unlike `encodeQueryComponent`) space escaped as `%20`, not `+`.
+fn escape_path(path: &str) -> String {
+    if !path.bytes().any(should_escape_path_byte) {
+        return path.to_string();
+    }
+
+    const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if should_escape_path_byte(byte) {
+            out.push('%');
+            out.push(UPPER_HEX[(byte >> 4) as usize] as char);
+            out.push(UPPER_HEX[(byte & 0x0f) as usize] as char);
+        } else {
+            // Every unescaped byte is ASCII (`should_escape_path_byte`
+            // returns true for anything >= 0x80), so this cast is lossless.
+            out.push(byte as char);
+        }
+    }
+    out
 }
 
 /// The decision half of `fc.validate()` / `fc.reject()`
@@ -226,9 +413,12 @@ pub fn validate_request(request: &Request) -> Result<(), RejectedRequest> {
         });
     }
 
-    if let Some(content_length) = request.headers.get_joined("Content-Length") {
+    // `Header.Get` (context.go:157), i.e. the first value -- not a join of
+    // all of them: two `Content-Length: 5` headers must validate exactly as
+    // one does upstream, rather than be rejected as the non-numeric "5, 5".
+    if let Some(content_length) = request.headers.get_first("Content-Length") {
         if !content_length.is_empty() {
-            let parsed = std::str::from_utf8(&content_length)
+            let parsed = std::str::from_utf8(content_length)
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok());
             match parsed {
@@ -238,7 +428,7 @@ pub fn validate_request(request: &Request) -> Result<(), RejectedRequest> {
                         status: 400,
                         message: format!(
                             "invalid Content-Length header: {:?}",
-                            String::from_utf8_lossy(&content_length)
+                            String::from_utf8_lossy(content_length)
                         ),
                     });
                 }
@@ -332,30 +522,39 @@ impl RequestContext {
     /// Runs `splitCgiPath` (`cgi.go:191-226`) once, at construction --
     /// exactly the point upstream's `NewRequestWithContext` calls it
     /// (`context.go:109`), not per request.
+    ///
+    /// Fails, like upstream's `NewRequestWithContext` chain does, when the
+    /// configured split path is not valid: `split_pos`'s one-sided ASCII fold
+    /// is only correct against entries that are themselves ASCII and
+    /// lower-case, and it is `WithRequestSplitPath` (`requestoptions.go:86`)
+    /// that establishes that -- see [`crate::cgi::normalize_split_path`].
     pub fn new(
         document_root: String,
         split_path: Option<Vec<String>>,
         request: Option<Request>,
         completion_signal: mpsc::Sender<()>,
-    ) -> Self {
-        let split_path = split_path.unwrap_or_else(|| vec![".php".to_string()]);
+    ) -> Result<Self, crate::cgi::InvalidSplitPath> {
+        let split_path = match split_path {
+            // `splitCgiPath`'s own default (cgi.go:195-197), already
+            // normalised, so it cannot fail.
+            None => vec![".php".to_string()],
+            Some(configured) => crate::cgi::normalize_split_path(configured)?,
+        };
 
         let (doc_uri, path_info, script_name, script_filename) = match &request {
             Some(r) => crate::cgi::split_cgi_path(&r.path, &split_path, &document_root),
             None => (String::new(), String::new(), String::new(), String::new()),
         };
 
-        // Go's `fc.requestURI = r.URL.RequestURI()` (context.go:111): the
-        // encoded path plus, if present, "?" and the raw query. We do not
-        // have `net/url`'s re-escaping machinery; `r.path` is taken as
-        // already being the request-line path our caller received.
+        // `fc.requestURI = r.URL.RequestURI()` (context.go:111) -- the
+        // *escaped* path plus the raw query, not the decoded `r.path` that
+        // `split_cgi_path` above consumed. See `Request::request_uri`.
         let request_uri = match &request {
-            Some(r) if r.raw_query.is_empty() => r.path.clone(),
-            Some(r) => format!("{}?{}", r.path, r.raw_query),
+            Some(r) => r.request_uri(),
             None => String::new(),
         };
 
-        Self {
+        Ok(Self {
             document_root,
             split_path,
             request,
@@ -368,7 +567,7 @@ impl RequestContext {
             client_had_closed: false,
             completion_signal,
             arena: RequestArena::default(),
-        }
+        })
     }
 
     pub fn validate(&self) -> Result<(), RejectedRequest> {
@@ -417,6 +616,33 @@ impl RequestContext {
 /// guards its slot for the hot path (set/get/clear on every request), so
 /// unrelated PHP threads never contend with each other the way a single
 /// global lock over the whole table would make them.
+///
+/// # The one rule for callers
+///
+/// **Never call into PHP from inside a [`ContextSlots::with_context`] /
+/// [`ContextSlots::with_context_mut`] closure.** Copy out what you need,
+/// return, and call C afterwards.
+///
+/// Any Zend routine can `zend_error_noreturn(E_ERROR, ...)` -- memory-limit
+/// exhaustion being the ordinary case in worker mode, where the resident
+/// worker script counts against the same limit -- and that ends in
+/// `zend_bailout()`, a `longjmp` to a `zend_catch` that sits *above* our
+/// frames on every path into these callbacks (`php_request_startup` wraps
+/// `php_hash_environment()` in its own `zend_try`; worker mode's `$_SERVER`
+/// re-import sits inside `frankenphp.c:565`'s). A `longjmp` runs no Rust
+/// destructors, so a guard alive across such a call is leaked and the slot
+/// is locked *forever* -- and the very next thing C does on that path
+/// (`frankenphp.c:1592` -> `go_frankenphp_after_script_execution`) is clear
+/// this slot, so the PHP thread would deadlock inside its own crash-recovery
+/// path and the request would never be answered. A leaked read guard
+/// additionally pins the table's reader count, so `ensure_len` blocks
+/// forever the first time a new `thread_index` appears.
+///
+/// Upstream has the same shape for a different reason: `contextMu` guards
+/// only the store (`threadregular.go:119-122`, `:131-134`) and the hot-path
+/// reader `frankenPHPContext()` (`threadregular.go:77-79`) takes no lock at
+/// all. `docs/PORTING-NOTES.md:126` states the rule in one line: "avoid
+/// holding across an FFI call into PHP".
 pub struct ContextSlots {
     slots: RwLock<Vec<Mutex<Option<RequestContext>>>>,
 }
@@ -455,6 +681,9 @@ impl ContextSlots {
         *slots[thread_index].lock().unwrap() = None;
     }
 
+    /// Runs `f` with `thread_index`'s context, holding that slot's lock for
+    /// the duration. `f` must not call into PHP -- see this type's "one rule
+    /// for callers".
     pub fn with_context<R>(
         &self,
         thread_index: usize,
@@ -466,6 +695,9 @@ impl ContextSlots {
         f(guard.as_ref())
     }
 
+    /// Mutable counterpart of [`ContextSlots::with_context`], needed by
+    /// anything that pushes into the context's arena. The same rule applies:
+    /// `f` must not call into PHP.
     pub fn with_context_mut<R>(
         &self,
         thread_index: usize,
@@ -495,6 +727,7 @@ mod tests {
     fn test_context(request: Option<Request>) -> RequestContext {
         let (tx, _rx) = mpsc::channel();
         RequestContext::new("/var/www".to_string(), None, request, tx)
+            .expect("the default split path is valid")
     }
 
     #[test]
@@ -525,6 +758,147 @@ mod tests {
     }
 
     #[test]
+    fn headers_get_first_returns_first_value_not_a_join() {
+        // Regression test for the review finding that `Header.Get`'s call
+        // sites (Content-Type, Authorization, Content-Length) were reading
+        // the ", "-joined accessor. Go's MIMEHeader.Get returns v[0].
+        let mut headers = Headers::default();
+        headers.insert("Content-Type", b"text/plain".to_vec());
+        headers.insert("Content-Type", b"application/json".to_vec());
+
+        assert_eq!(headers.get_first("Content-Type").unwrap(), b"text/plain");
+        assert_eq!(
+            headers.get_joined("Content-Type").unwrap(),
+            b"text/plain, application/json",
+            "the joining accessor stays available -- addHeadersToServer needs it"
+        );
+        assert_eq!(headers.get_first("Missing"), None);
+    }
+
+    #[test]
+    fn canonical_header_name_leaves_non_token_names_unchanged() {
+        // textproto.CanonicalMIMEHeaderKey bails out on the first byte that
+        // is not a valid header field byte and returns the name verbatim.
+        // Without that bail-out a byte >= 0x80 would be re-encoded as two
+        // UTF-8 bytes by `byte as char` and silently corrupted.
+        assert_eq!(canonical_header_name("accept-encoding"), "Accept-Encoding");
+        assert_eq!(canonical_header_name("X-Foo_Bar"), "X-Foo_bar");
+
+        for name in ["Foo Bar", "Foo\u{ff}Bar", "Foo:Bar", "Föo"] {
+            assert_eq!(
+                canonical_header_name(name),
+                name,
+                "non-token name {name:?} must be returned unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn request_uri_is_the_escaped_path_not_the_decoded_one() {
+        // fc.requestURI = r.URL.RequestURI() (context.go:111), which is built
+        // from EscapedPath(); splitCgiPath meanwhile works on the decoded
+        // URL.Path. One field cannot be both, so `raw_path` carries the
+        // escaped form when it differs.
+        let request =
+            Request::new("GET", "/index.php/extra", "x=1").with_raw_path("/index.php%2Fextra");
+        assert_eq!(request.request_uri(), "/index.php%2Fextra?x=1");
+
+        let ctx = test_context(Some(request));
+        assert_eq!(ctx.request_uri, "/index.php%2Fextra?x=1");
+        assert_eq!(
+            ctx.script_name, "/index.php",
+            "path splitting still runs on the decoded path"
+        );
+        assert_eq!(ctx.path_info, "/extra");
+    }
+
+    #[test]
+    fn request_uri_escapes_the_decoded_path_when_no_raw_path_is_set() {
+        // Go's EscapedPath() falls back to escape(Path, encodePath) when
+        // RawPath is empty: space -> %20 (not '+'), '?' escaped, ':' '@' '='
+        // '&' '+' '$' ',' ';' '/' and the unreserved marks left alone.
+        assert_eq!(
+            Request::new("GET", "/index.php", "").request_uri(),
+            "/index.php"
+        );
+        assert_eq!(Request::new("GET", "/a b", "").request_uri(), "/a%20b");
+        assert_eq!(Request::new("GET", "/a?b", "").request_uri(), "/a%3Fb");
+        assert_eq!(
+            Request::new("GET", "/a~b-c_d.e", "").request_uri(),
+            "/a~b-c_d.e"
+        );
+        assert_eq!(
+            Request::new("GET", "/a:b@c=d&e+f$g,h;i", "").request_uri(),
+            "/a:b@c=d&e+f$g,h;i"
+        );
+        assert_eq!(
+            Request::new("GET", "/caf\u{e9}", "").request_uri(),
+            "/caf%C3%A9",
+            "non-ASCII is escaped byte-wise, as Go's escape() does"
+        );
+        assert_eq!(
+            Request::new("GET", "", "").request_uri(),
+            "/",
+            "RequestURI() substitutes \"/\" for an empty path"
+        );
+        assert_eq!(
+            Request::new("OPTIONS", "*", "").request_uri(),
+            "*",
+            "golang/go#11202: `OPTIONS *` is not escaped"
+        );
+    }
+
+    #[test]
+    fn request_uri_keeps_a_forced_empty_query() {
+        // GET /index.php? HTTP/1.1 parses (net/url) as RawQuery == "" with
+        // ForceQuery == true, not as "no query at all" -- URL.RequestURI()
+        // appends "?" for either `ForceQuery || RawQuery != ""`, so the two
+        // cases must not collapse to the same output.
+        let forced = Request::new("GET", "/index.php", "").with_force_query(true);
+        assert_eq!(forced.request_uri(), "/index.php?");
+
+        let absent = Request::new("GET", "/index.php", "");
+        assert_eq!(
+            absent.request_uri(),
+            "/index.php",
+            "an absent query must not gain a trailing '?'"
+        );
+
+        let real_query = Request::new("GET", "/index.php", "x=1").with_force_query(true);
+        assert_eq!(
+            real_query.request_uri(),
+            "/index.php?x=1",
+            "force_query is redundant but harmless when a real query is present"
+        );
+    }
+
+    #[test]
+    fn new_normalises_an_uppercase_split_path_and_rejects_a_non_ascii_one() {
+        // WithRequestSplitPath (requestoptions.go:86-113) lower-cases ASCII
+        // entries and rejects non-ASCII ones; split_pos folds only the bytes
+        // of the *path*, so an un-normalised entry silently never matches.
+        let (tx, _rx) = mpsc::channel();
+        let ctx = RequestContext::new(
+            "/var/www".to_string(),
+            Some(vec![".PHP".to_string()]),
+            Some(Request::new("GET", "/index.php/foo", "")),
+            tx,
+        )
+        .expect(".PHP is ASCII, so it normalises rather than failing");
+        assert_eq!(ctx.script_name, "/index.php");
+        assert_eq!(ctx.path_info, "/foo");
+
+        let (tx, _rx) = mpsc::channel();
+        let rejected = RequestContext::new(
+            "/var/www".to_string(),
+            Some(vec![".php".to_string(), ".Ⱥphp".to_string()]),
+            Some(Request::new("GET", "/index.php", "")),
+            tx,
+        );
+        assert_eq!(rejected.err(), Some(crate::cgi::InvalidSplitPath));
+    }
+
+    #[test]
     fn validate_rejects_nul_byte_in_path() {
         let request = Request::new("GET", "/foo\0bar", "");
         let err = validate_request(&request).unwrap_err();
@@ -543,6 +917,17 @@ mod tests {
         let request = Request::new("POST", "/", "").with_header("Content-Length", b"-1".to_vec());
         let err = validate_request(&request).unwrap_err();
         assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn validate_accepts_duplicate_content_length_headers() {
+        // Go reads Header.Get("Content-Length") -> "5"; joining the two into
+        // "5, 5" would fail to parse and turn a request upstream accepts into
+        // a 400.
+        let request = Request::new("POST", "/", "")
+            .with_header("Content-Length", b"5".to_vec())
+            .with_header("Content-Length", b"5".to_vec());
+        assert!(validate_request(&request).is_ok());
     }
 
     #[test]
