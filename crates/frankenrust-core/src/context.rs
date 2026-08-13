@@ -388,27 +388,26 @@ impl std::error::Error for RejectedRequest {}
 ///
 /// # Where this is not byte-exact, and why that is the floor
 ///
-/// Differential-tested against `fmt.Sprintf("%q", string(b))` on go1.26 over
-/// 60,512 byte strings: **0 mismatches across the 42,597 of them built only
-/// from ASCII runes and invalid UTF-8 bytes** -- which is the entire space a
-/// `Content-Length` header inhabits, and the space this function exists for.
-/// Every one of the 685 mismatches needs a *valid non-ASCII* rune, and they
-/// come from the printability oracle for exactly those:
+/// Go's `strconv.IsPrint` is "Unicode categories L, M, N, P, S, plus ASCII
+/// space"; the oracle [`quote_rune`] uses for it is `str::escape_debug` in
+/// non-leading position, which is the same predicate (see there). Compared
+/// scalar by scalar against `strconv.IsPrint` on go1.26, the two agree on
+/// 1,101,446 of the 1,112,064 Unicode scalar values -- plus `"`, `'` and `\`,
+/// which the oracle escapes and Go does not, but which are ASCII and so are
+/// decided by [`quote_rune`] before the oracle is consulted.
 ///
-/// - Go's `strconv.IsPrint` is "Unicode categories L, M, N, P, S, plus ASCII
-///   space". The closest oracle reachable without shipping a Unicode table of
-///   our own is `char::escape_debug`, which agrees except that it also
-///   escapes grapheme-extended characters -- so a combining mark renders as
-///   `\u0301` where Go prints the mark itself (319 cases).
-/// - The two tables are generated from different Unicode versions: go1.26
-///   ships 15.0.0, so it escapes any scalar assigned after it (CJK Ext I and
-///   J, for instance) as unassigned-hence-unprintable, while a newer rustc
-///   prints it (366 cases). That one is not fixable by us in any stable
-///   sense; it moves whenever either toolchain updates.
-///
-/// Both are confined to a diagnostic string for a request that is already a
-/// 400, and neither can lose information the way the lossy conversion this
-/// replaced did: the bytes are still recoverable from the message.
+/// Every one of the 10,615 disagreements is category Cn in go1.26's tables:
+/// the two toolchains generate from different Unicode versions, so go1.26
+/// (15.0.0) escapes a scalar assigned after it (CJK Ext I and J, for instance)
+/// as unassigned-hence-unprintable, while a newer rustc prints it. That is not
+/// fixable by us in any stable sense -- it moves whenever either toolchain
+/// updates. End to end that leaves `go_quote` byte-identical to
+/// `strconv.Quote` over a 2,424,384-string corpus (every single byte, every
+/// scalar alone and embedded, 200k random byte soups) on **every input that
+/// does not contain a post-15.0.0 scalar**, and the residue is confined to a
+/// diagnostic string for a request that is already a 400. It cannot lose
+/// information the way the lossy conversion this replaced did, either: the
+/// bytes are still recoverable from the message.
 fn go_quote(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() + 2);
     out.push('"');
@@ -455,9 +454,27 @@ fn quote_rune(out: &mut String, c: char) {
         // exactly 0x20..=0x7e.
         (' '..='~').contains(&c)
     } else {
-        // See go_quote's doc comment for how far this tracks Go's IsPrint.
-        let mut escaped = c.escape_debug();
-        escaped.next() == Some(c) && escaped.next().is_none()
+        // Go's `strconv.IsPrint` is categories L, M, N, P, S plus ASCII space.
+        // Rust's own printability predicate -- the one behind escape_debug --
+        // is the complement of Cc/Cf/Cs/Co/Cn/Zl/Zp/Zs-minus-ASCII-space,
+        // which is the same set; `char::escape_debug` diverges from Go only
+        // because it *additionally* escapes grapheme-extended scalars, and
+        // category M is grapheme-extended in bulk. So a combining acute came
+        // out as a backslash-u-0301 escape where Go emits the mark itself.
+        //
+        // `str::escape_debug` documents that "only extended grapheme
+        // codepoints that begin the string will be escaped", so putting `c` in
+        // non-leading position turns that extra rule off and leaves exactly
+        // Go's predicate. `'a'` is the lead-in: printable, non-escaped, ASCII,
+        // one byte. See go_quote's doc comment for the measured agreement.
+        let mut buf = [0u8; 5];
+        buf[0] = b'a';
+        c.encode_utf8(&mut buf[1..]);
+        let probe = std::str::from_utf8(&buf[..1 + c.len_utf8()])
+            .expect("'a' followed by one encoded char is valid UTF-8");
+
+        let mut escaped = probe.escape_debug();
+        escaped.next() == Some('a') && escaped.next() == Some(c) && escaped.next().is_none()
     };
     if printable {
         out.push(c);
@@ -1204,11 +1221,35 @@ mod tests {
             // Cc), \U with eight above it (U+E0001, Cf).
             ("\u{80}".as_bytes(), r#""\u0080""#),
             ("\u{e0001}".as_bytes(), r#""\U000e0001""#),
-            // The documented divergence, pinned rather than hidden: Go counts
-            // category M printable and emits a combining mark literally, while
-            // char::escape_debug escapes grapheme-extended characters. See
-            // go_quote's doc comment for the measured extent of this.
-            ("\u{301}".as_bytes(), r#""\u0301""#),
+            // Grapheme-extended, but printable to Go: U+0301 combining acute
+            // (Mn), U+09BE Bengali vowel sign aa (Mc, Other_Grapheme_Extend),
+            // U+FF9E halfwidth katakana voiced sound mark (Lm,
+            // Other_Grapheme_Extend) and U+20E3 combining enclosing keycap
+            // (Me). `char::escape_debug` escapes all four as \uXXXX; Go emits
+            // all four as themselves, and so must we. Regression test for the
+            // printability oracle in quote_rune -- U+0301 is the case the
+            // reviewer of this change found, and the other three are the rest
+            // of the family it belongs to.
+            ("\u{301}".as_bytes(), "\"\u{301}\""),
+            ("\u{9be}".as_bytes(), "\"\u{9be}\""),
+            ("\u{ff9e}".as_bytes(), "\"\u{ff9e}\""),
+            ("\u{20e3}".as_bytes(), "\"\u{20e3}\""),
+            // ...and a combining mark reached through the byte path, since
+            // that is how a header value actually arrives: the two UTF-8 bytes
+            // cc 81 stay one U+0301 attached to the `e`, and nothing about the
+            // pair is escaped.
+            (b"e\xcc\x81".as_slice(), "\"e\u{301}\""),
+            // Still non-printable despite living next door: U+200C (Cf) is
+            // Other_Grapheme_Extend too, and Go escapes it. Guards against
+            // "fixing" the above by calling every grapheme-extended scalar
+            // printable.
+            ("\u{200c}".as_bytes(), r#""\u200c""#),
+            ("\u{a0}".as_bytes(), r#""\u00a0""#),
+            ("\u{2028}".as_bytes(), r#""\u2028""#),
+            // `'` is printable to Go's %q on a string -- unlike Rust's
+            // escape_debug, which backslashes it. quote_rune must decide it on
+            // the ASCII branch, before the oracle is consulted.
+            (b"it's".as_slice(), r#""it's""#),
         ] {
             assert_eq!(go_quote(raw), want, "go_quote({raw:?})");
         }
