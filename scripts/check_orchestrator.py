@@ -101,13 +101,24 @@ def check_dep_parsing() -> int:
 def check_reviewer_restore() -> int:
     """A reviewer's scratch work must not survive into what gets merged.
 
-    review_stage() gives reviewers full tool access in the worktree with no
-    instruction to clean up after themselves -- building a repro there is good
-    review work. Without a restore, whatever they leave behind rides
-    worktree_diff's and merge_worktree's `git add -A` straight onto main. This
-    pins loop.snapshot_worktree/restore_worktree against exactly that: an
-    untracked file added, a tracked file edited, and an ignored build artifact
-    (which must survive -- this is a restore, not `git clean -xfd`).
+    review_stage() gives reviewers full tool access in the worktree and tells
+    them to build repros -- good review work. Without a restore, whatever they
+    leave behind rides worktree_diff's and merge_worktree's `git add -A`
+    straight onto main. This pins loop.snapshot_worktree/restore_worktree
+    against the ways that has been shown to happen.
+
+    The last three reviewer artifacts below are the ones an index-driven
+    restore alone gets wrong, each exiting 0 while leaking:
+
+      * a repro crate with its own .gitignore (`cargo new --vcs git` writes
+        one): `add -A` skips the build output it covers, then the restore
+        deletes the rule and un-ignores it,
+      * the same shape via a rule appended to the root .gitignore,
+      * a nested git repo, which stages as a gitlink and which `read-tree`
+        refuses to rmdir.
+
+    The implementer's own ignored build cache must still survive -- this is a
+    restore, not `git clean -xfd`.
     """
     sys.path.insert(0, str(ROOT / "orchestrator"))
     import loop
@@ -115,45 +126,97 @@ def check_reviewer_restore() -> int:
     def sh(wt: Path, *args: str) -> None:
         subprocess.run(["git", *args], cwd=wt, check=True, capture_output=True, text=True)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        wt = Path(tmp)
+    def init(wt: Path) -> None:
         sh(wt, "init", "-q", "-b", "main")
         sh(wt, "config", "user.email", "check_orchestrator@example.com")
         sh(wt, "config", "user.name", "check_orchestrator")
-        (wt / "a.txt").write_text("original\n")
-        (wt / ".gitignore").write_text("/target/\n")
-        sh(wt, "add", "-A")
-        sh(wt, "commit", "-q", "-m", "base")
 
-        # the implementer's work under review: an edit and a new tracked file
-        (wt / "a.txt").write_text("original\nimplementer edit\n")
-        (wt / "b.txt").write_text("from the implementer\n")
-        before = loop.worktree_diff(wt)
+    def write(p: Path, text: str) -> None:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
 
-        snapshot = loop.snapshot_worktree(wt)
-        if not snapshot:
-            return fail("snapshot_worktree could not write-tree the worktree")
+    # loop.record appends to the real orchestrator/logs/events.jsonl, which the
+    # retrospective reads as evidence about the run. Capture instead, both to
+    # keep test runs out of it and to assert on what did or did not get logged.
+    events: list[tuple[str, dict]] = []
+    real_record, real_log = loop.record, loop.log
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            init(wt)
+            write(wt / "a.txt", "original\n")
+            write(wt / ".gitignore", "/target/\n")
+            sh(wt, "add", "-A")
+            sh(wt, "commit", "-q", "-m", "base")
 
-        # a reviewer: scratch file, edit to a tracked file, a populated (and
-        # already-ignored) target/ left behind by a build
-        (wt / "scratch.txt").write_text("throwaway repro\n")
-        (wt / "b.txt").write_text("reviewer overwrote this\n")
-        (wt / "target").mkdir()
-        (wt / "target" / "build.out").write_text("build artifact\n")
+            # the implementer's work under review: an edit, a new tracked file,
+            # and the build cache their gate run populated
+            write(wt / "a.txt", "original\nimplementer edit\n")
+            write(wt / "b.txt", "from the implementer\n")
+            write(wt / "target" / "build.out", "build artifact\n")
+            before = loop.worktree_diff(wt)
 
-        loop.restore_worktree(wt, snapshot)
-        after = loop.worktree_diff(wt)
+            snapshot = loop.snapshot_worktree(wt)
+            if not snapshot:
+                return fail("snapshot_worktree could not write-tree the worktree")
 
-        bad = 0
-        if after != before:
-            bad += fail("restore_worktree did not reproduce the pre-review diff")
-        if (wt / "scratch.txt").exists():
-            bad += fail("restore_worktree left a reviewer's untracked file in place")
-        if (wt / "b.txt").read_text() != "from the implementer\n":
-            bad += fail("restore_worktree did not revert a reviewer's edit to a tracked file")
-        if not (wt / "target" / "build.out").exists():
-            bad += fail("restore_worktree deleted an ignored build artifact -- it must not")
-        return bad
+            # a reviewer investigating the diff
+            write(wt / "scratch.txt", "throwaway repro\n")
+            write(wt / "b.txt", "reviewer overwrote this\n")
+            write(wt / "target" / "reviewer.out", "reviewer's own build output\n")
+            write(wt / ".review-repro" / "a" / ".gitignore", "/target\n")
+            write(wt / ".review-repro" / "a" / "Cargo.toml", "[package]\n")
+            write(wt / ".review-repro" / "a" / "src" / "main.rs", "fn main() {}\n")
+            write(wt / ".review-repro" / "a" / "target" / "repro.o", "\0\0\0\n")
+            write(wt / ".gitignore", "/target/\n/reviewer-scratch/\n")
+            write(wt / "reviewer-scratch" / "main.rs", "fn main() {}\n")
+            nested = wt / "nested-clone"
+            nested.mkdir()
+            init(nested)
+            write(nested / "f.txt", "upstream, cloned to diff against\n")
+            sh(nested, "add", "-A")
+            sh(nested, "commit", "-q", "-m", "scratch")
+
+            loop.restore_worktree(wt, snapshot)
+            after = loop.worktree_diff(wt)
+
+            bad = 0
+            # The predicate that matters: what the next stage -- the fixer's
+            # review, or merge_worktree -- sees is what was reviewed.
+            if after != before:
+                bad += fail("restore_worktree did not reproduce the pre-review diff")
+            if (wt / "scratch.txt").exists():
+                bad += fail("restore_worktree left a reviewer's untracked file in place")
+            if (wt / "b.txt").read_text() != "from the implementer\n":
+                bad += fail("restore_worktree did not revert a reviewer's edit to a tracked file")
+            if (wt / ".review-repro").exists():
+                bad += fail("restore_worktree left a repro crate whose own .gitignore "
+                            "hid its build output from `git add -A`")
+            if (wt / "reviewer-scratch").exists():
+                bad += fail("restore_worktree left a directory a reviewer-added ignore "
+                            "rule hid, and reverting .gitignore un-ignores it")
+            if nested.exists():
+                bad += fail("restore_worktree left a nested git repo, which merges as a "
+                            "gitlink pointing at a commit no clone can resolve")
+            if not (wt / "target" / "build.out").exists():
+                bad += fail("restore_worktree deleted an ignored build artifact -- it must not")
+            if [e for e, _ in events]:
+                bad += fail(f"restore_worktree reported trouble on a clean restore: {events}")
+
+            # ...and when it cannot restore, it must say so rather than hand
+            # the residue on in silence. Every command in the leaking cases
+            # above exits 0, so the postcondition -- not rc -- is what has to
+            # hold; an unreachable tree is just the cheapest way to force it.
+            events.clear()
+            loop.restore_worktree(wt, "0" * 40)
+            if "restore_incomplete" not in [e for e, _ in events]:
+                bad += fail("restore_worktree reported success on a restore that did not "
+                            f"happen; recorded {[e for e, _ in events]}")
+            return bad
+    finally:
+        loop.record, loop.log = real_record, real_log
 
 
 if __name__ == "__main__":

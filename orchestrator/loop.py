@@ -461,16 +461,45 @@ def snapshot_worktree(wt: Path) -> str:
 def restore_worktree(wt: Path, tree: str) -> None:
     """Undo everything since the matching snapshot_worktree call.
 
-    Stage first so any untracked file a reviewer added enters the index --
-    `read-tree` only reconciles paths that are tracked, so without this an
-    added-but-never-`git add`ed file would be invisible to it and survive.
-    `read-tree --reset -u` then resets the index to `tree` and rewrites the
-    working tree to match: modified tracked files revert to the snapshot's
-    content, and paths that are in the (freshly staged) index but not in
-    `tree` are removed. Paths `add -A` skips because .gitignore covers them --
-    `target/`, chiefly -- are never staged in the first place, so a populated
-    build cache a reviewer leaves behind survives untouched. This is a
-    restore, not `git clean -xfd`.
+    Three steps, because none of them is sufficient alone.
+
+    `add -A` stages whatever the reviewers left, so untracked additions enter
+    the index -- `read-tree` only reconciles paths the index knows about, so
+    without this an added-but-never-`git add`ed file is invisible to it.
+
+    `read-tree --reset -u` resets the index to `tree` and rewrites the working
+    tree to match: modified tracked files revert to the snapshot's content, and
+    paths in the (freshly staged) index but not in `tree` are deleted.
+
+    `git clean -ffd` collects what read-tree provably cannot. Both of these
+    exit 0 today, so neither is caught by checking rc:
+
+      * A reviewer's repro crate carries its own .gitignore -- `cargo new
+        --vcs git` writes one containing `/target`. `add -A` skips the build
+        output that rule covers, so read-tree never learns of it; read-tree
+        then deletes the nested .gitignore, un-ignoring exactly what it was
+        hiding, and the next `add -A` stages it for merge. Restoring the tree
+        is what opens the leak: without the restore the ignore rule survives
+        and holds the artifacts back. Same shape when a reviewer appends a
+        rule to the root .gitignore and writes under it.
+      * A nested repo (`git init`, `git clone` of upstream to diff against) is
+        staged as a 160000 gitlink, not as its contents. read-tree drops the
+        gitlink from the index, but git will not delete a repository's working
+        directory: it warns "unable to rmdir ...: Directory not empty" and
+        exits 0. The directory survives, the next `add -A` re-adds the
+        gitlink, and main gains a submodule pointer to a commit that ceases to
+        exist the moment retire_worktree deletes the worktree.
+
+    `-ff` is what removes that nested repo; `-d`, untracked directories. No
+    `-x`, deliberately: ignored paths are still ignored once the snapshot's
+    .gitignore is back, so the root `target/` a reviewer's build populated
+    survives -- and being ignored it cannot reach a merge anyway. Nor does
+    clean touch anything the *implementer* left: after read-tree the index is
+    the snapshot, so implementer paths are tracked, including a nested repo of
+    their own, which stays as the gitlink the snapshot recorded.
+
+    Then verify instead of trusting three exit codes, because the whole point
+    of the restore is that a leak here is otherwise silent.
     """
     if not tree:
         return
@@ -479,6 +508,15 @@ def restore_worktree(wt: Path, tree: str) -> None:
     if rc != 0:
         log(f"    !! restore_worktree failed in {wt}: {out}")
         record("restore_failed", worktree=str(wt), reason=out[-500:])
+    git(["clean", "-ffd"], cwd=wt)
+
+    git(["add", "-A"], cwd=wt)
+    rc, actual = git(["write-tree"], cwd=wt)
+    if rc != 0 or actual.strip() != tree:
+        _, left = git(["diff", "--cached", "--name-status", tree], cwd=wt)
+        log(f"    !! restore_worktree did not fully restore {wt}; "
+            f"reviewer residue is headed for the merge:\n{left[-1000:]}")
+        record("restore_incomplete", worktree=str(wt), paths=left[-1000:])
 
 
 def review_stage(issue: gh.Issue, wt: Path, logdir: Path, tag: str) -> str | None:
