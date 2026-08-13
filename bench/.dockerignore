@@ -1,0 +1,5 @@
+# bake()'s builds use this directory (bench/) as their context. bench/results/
+# is committed and grows one directory per run; without excluding it, every
+# benchmark run changes the build context and busts BuildKit's context cache
+# for the next one, even when nothing that actually feeds an image changed.
+results/
