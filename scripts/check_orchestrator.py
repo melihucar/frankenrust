@@ -430,6 +430,98 @@ def check_filing_contract_is_stated() -> int:
            " (the field names appear in prose, but prose is not a template)"))
 
 
+def check_verdict_parsing() -> int:
+    """An agent's verdict is its last message, never its transcript.
+
+    `codex exec` opens its log with a verbatim echo of the prompt it was given,
+    and prompts/reviewer.md necessarily contains the line "`VERDICT: BLOCK` --
+    you found at least one defect". _final_text() used to return codex's whole
+    transcript ("codex writes plain text, so it passes through"), so
+    `"VERDICT: BLOCK" in text` was true of every codex review ever run,
+    whatever codex concluded. #8 passed the gate on all three attempts and drew
+    PASS from all six reviews, and was parked as fr:blocked anyway; #11 and #20
+    died the same way. The same echo made every codex critic read as VERDICT:
+    REVISE. Nothing could merge while codex was reachable -- the seven issues
+    that did land all merged in windows where codex was quota-walled and both
+    reviewers were claude.
+
+    The cases below are transcripts built around the real prompt files, so the
+    echo is the actual adversarial input rather than a guess at it. The check
+    is vacuous unless those prompts really do quote the tokens, so that is
+    asserted first.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    prompts = ROOT / "orchestrator" / "prompts"
+    reviewer = (prompts / "reviewer.md").read_text()
+    critic = (prompts / "critic.md").read_text()
+    bad = 0
+    for name, text, token in (("reviewer.md", reviewer, "VERDICT: BLOCK"),
+                              ("critic.md", critic, "VERDICT: REVISE")):
+        if token not in text:
+            bad += fail(f"{name} no longer quotes {token!r}; this check is now "
+                        "vacuous -- point it at whatever token replaced it")
+
+    def transcript(echo: str, final: str) -> str:
+        """What `codex exec` writes to stdout: echo, work, then the verdict twice."""
+        return (f"user\n{echo}\ncodex\n{final}\ntokens used\n44,435\n{final}\n")
+
+    def parsed(tmp: Path, echo: str, final: str, wrote_file: bool = True) -> str:
+        log = tmp / "codex.review2.1.log"
+        log.write_text(transcript(echo, final) if final else f"user\n{echo}\n"
+                       "ERROR: You've hit your usage limit.\n")
+        last = tmp / "codex.review2.1.final.txt"
+        last.unlink(missing_ok=True)     # as invoke() does, so no case inherits
+        if wrote_file and final:
+            last.write_text(final + "\n")
+        text, err = loop._final_text(log, "codex", last)
+        return text if text else f"<no text: {err}>"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        cases = [
+            # (name, echoed prompt, final message, -o written, must contain, must not)
+            ("a PASS whose prompt echo quotes BLOCK", reviewer,
+             "Checked every path. Nothing blocking.\n\nVERDICT: PASS",
+             True, "VERDICT: PASS", "VERDICT: BLOCK"),
+            ("the same with no -o file, read off the transcript", reviewer,
+             "Checked every path. Nothing blocking.\n\nVERDICT: PASS",
+             False, "VERDICT: PASS", "VERDICT: BLOCK"),
+            # The fix must not simply stop seeing BLOCK anywhere.
+            ("a real BLOCK still blocks", reviewer,
+             "### leaks a subscriber\nFile: a.rs:1\n\nVERDICT: BLOCK",
+             True, "VERDICT: BLOCK", None),
+            ("a real BLOCK off the transcript", reviewer,
+             "### leaks a subscriber\nFile: a.rs:1\n\nVERDICT: BLOCK",
+             False, "VERDICT: BLOCK", None),
+            ("a critic PROCEED whose echo quotes REVISE", critic,
+             "The spec matches the oracle.\n\nVERDICT: PROCEED",
+             True, "VERDICT: PROCEED", "VERDICT: REVISE"),
+        ]
+        for name, echo, final, wrote, want, unwanted in cases:
+            got = parsed(d, echo, final, wrote)
+            if want not in got:
+                bad += fail(f"verdict parsing lost {want!r} on {name}: {got[:120]!r}")
+            if unwanted and unwanted in got:
+                bad += fail(f"verdict parsing read {unwanted!r} out of {name} -- "
+                            "the prompt echo is being read as the agent's verdict")
+
+        # A run that died before answering is an error, not a finding. Returning
+        # the transcript here is what turned a quota wall into a BLOCK.
+        got = parsed(d, reviewer, "", wrote_file=False)
+        if "VERDICT" in got:
+            bad += fail(f"a codex run that produced no final message parsed as a "
+                        f"verdict: {got[:120]!r}")
+
+    # And the wiring that makes the file exist in the first place.
+    cmd = loop.agent_cmd("codex", None, Path("/tmp/fr-last.txt"))
+    if "-o" not in cmd or "/tmp/fr-last.txt" not in cmd:
+        bad += fail("agent_cmd no longer asks codex for its last message (-o); "
+                    "verdicts fall back to transcript scraping")
+    return bad
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
@@ -437,4 +529,5 @@ if __name__ == "__main__":
     sys.exit(1 if check_runs() + check_prompts() + check_dep_parsing()
              + check_gate_targets_the_worktree() + check_no_absorbing_states()
              + check_blocked_has_a_recovery_path() + check_waiting_is_annotation_only()
-             + check_filing_contract_is_stated() + check_reviewer_restore() else 0)
+             + check_filing_contract_is_stated() + check_reviewer_restore()
+             + check_verdict_parsing() else 0)

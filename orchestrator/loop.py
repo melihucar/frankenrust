@@ -238,15 +238,22 @@ def git(args: list[str], cwd: Path = ROOT) -> tuple[int, str]:
 
 
 # --- agents ------------------------------------------------------------------
-def agent_cmd(agent: str, model: str | None) -> list[str]:
+def agent_cmd(agent: str, model: str | None,
+              last_message: Path | None = None) -> list[str]:
     """Sandboxed as tightly as the work allows: these run for hours unwatched."""
     if agent == "codex":
+        # -o is codex's answer to claude's `result` event: the final message,
+        # alone, in a file. Without it the only record of what codex decided is
+        # its transcript -- which opens with a verbatim echo of the prompt, and
+        # our prompts necessarily quote the verdict tokens they ask for. See
+        # _final_text().
+        out = ["-o", str(last_message)] if last_message else []
         if os.environ.get("FR_YOLO") == "1":
             return ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox",
-                    "--skip-git-repo-check", "-"]
+                    "--skip-git-repo-check", *out, "-"]
         return ["codex", "exec", "-s", "workspace-write",
                 "-c", "sandbox_workspace_write.network_access=true",
-                "-c", 'approval_policy="never"', "--skip-git-repo-check", "-"]
+                "-c", 'approval_policy="never"', "--skip-git-repo-check", *out, "-"]
     if agent == "claude":
         # stream-json, not text. `text` buffers everything to the end and then
         # prints a bare "Execution error" on failure -- the log tells you the
@@ -261,19 +268,53 @@ def agent_cmd(agent: str, model: str | None) -> list[str]:
     raise ValueError(f"unknown agent {agent!r}")
 
 
-def _final_text(logpath: Path, agent: str) -> tuple[str, str]:
+def _final_text(logpath: Path, agent: str,
+                last_message: Path | None = None) -> tuple[str, str]:
     """(final message, error reason) from an agent log.
 
     Only the *final* message may feed verdict parsing. The full stream contains
     reasoning and tool calls, and a reviewer musing "this is not a VERDICT:
-    BLOCK situation" would otherwise block a clean diff. codex writes plain
-    text, so it passes through.
+    BLOCK situation" would otherwise block a clean diff.
+
+    That rule used to be enforced for claude only -- "codex writes plain text,
+    so it passes through" -- and passing the transcript through is what killed
+    #8, #11 and #20. `codex exec` opens its log with a verbatim echo of the
+    prompt, and prompts/reviewer.md necessarily contains the line "`VERDICT:
+    BLOCK` -- you found at least one defect". So `"VERDICT: BLOCK" in text` was
+    true of every codex review ever run, whatever codex actually concluded:
+    #8 passed the gate and drew PASS from all six reviews across three attempts
+    and was still parked as fr:blocked. The same echo made every codex critic
+    return VERDICT: REVISE (12 recorded, at ~25 minutes of resolver each).
+    Nothing merged while codex was reachable; the seven that did all landed in
+    windows where it was quota-walled and both reviewers were claude.
+
+    So codex now gets read the same way claude does: `-o` writes the last
+    message to `last_message`, and only that file is parsed. The transcript
+    fallback covers a codex too old for `-o` by taking what follows the final
+    "tokens used" marker, which is `codex exec`'s own restatement of the last
+    message. If neither is readable we return no text and an error: output we
+    cannot read is not evidence of a defect, and treating it as one is the bug
+    being fixed here.
     """
+    if agent != "claude":
+        if last_message and last_message.exists():
+            final = last_message.read_text(errors="replace").strip()
+            if final:
+                return final, ""
+        if logpath.exists():
+            lines = logpath.read_text(errors="replace").splitlines()
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].strip() != "tokens used":
+                    continue
+                # +2 skips the marker and the token count under it.
+                final = "\n".join(lines[i + 2:]).strip()
+                if final:
+                    return final, ""
+                break
+        return "", "no final message from codex"
     if not logpath.exists():
         return "", "no log"
     raw = logpath.read_text(errors="replace")
-    if agent != "claude":
-        return raw, ""
     final, err = "", ""
     for line in raw.splitlines():
         line = line.strip()
@@ -334,13 +375,19 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
     pf = logdir / f"prompt.{tag}.md"
     use, model = resolve(agent, role, escalate)
     rc, logpath = 1, logdir / f"{use}.{tag}.log"
+    lastmsg = logdir / f"{use}.{tag}.final.txt"
     for _ in range(2):
         logpath = logdir / f"{use}.{tag}.log"
+        # Named per agent so the codex run and a claude retry of the same tag
+        # cannot read each other's verdict, and unlinked first so a crashed run
+        # inherits nothing from the attempt before it.
+        lastmsg = logdir / f"{use}.{tag}.final.txt"
+        lastmsg.unlink(missing_ok=True)
         log(f"    -> {use}{f'({model})' if model else ''} {tag} ({wt.name})")
         with pf.open("rb") as stdin_fh, logpath.open("ab") as out_fh:
-            proc = subprocess.Popen(agent_cmd(use, model), cwd=str(wt), stdin=stdin_fh,
-                                    stdout=out_fh, stderr=subprocess.STDOUT,
-                                    env=agent_env())
+            proc = subprocess.Popen(agent_cmd(use, model, lastmsg), cwd=str(wt),
+                                    stdin=stdin_fh, stdout=out_fh,
+                                    stderr=subprocess.STDOUT, env=agent_env())
             # Heartbeat rather than a bare wait(). Agents emit nothing until
             # they exit -- `--output-format text` buffers, and codex is quiet
             # too -- so an hour-long task and a hung one look identical from
@@ -361,7 +408,7 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
                     kb = logpath.stat().st_size // 1024 if logpath.exists() else 0
                     log(f"    .. {tag} running {int(waited // 60)}m"
                         f" (limit {AGENT_TIMEOUT // 60}m, {kb}KB)")
-        text, err = _final_text(logpath, use)
+        text, err = _final_text(logpath, use, lastmsg)
         if err or rc != 0:
             # Say what went wrong at the point it goes wrong. A silent failure
             # here surfaces later as an empty verdict and gets misread as the
