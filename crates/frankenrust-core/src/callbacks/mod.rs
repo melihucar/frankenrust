@@ -25,17 +25,28 @@ pub mod servervars;
 pub mod thread;
 pub mod worker;
 
-/// Panics naming `symbol`, which -- because every function in this module
-/// has C linkage -- unwinds straight into Rust's FFI-unwind guard and
-/// aborts the process instead of continuing across an `extern "C"` boundary
-/// with a real Rust panic in flight (unwinding across a plain `extern "C"`
-/// fn is UB; the guard turns it into a defined abort). That is exactly the
-/// behaviour issue #7 asks the stubs to have: fail loudly, by name, the
-/// first time C actually calls one, rather than pretend to succeed.
+/// Writes `symbol` to stderr and aborts the process. This is the body every
+/// callback in this module has for issue #7: fail loudly, by name, the first
+/// time C actually calls one, rather than pretend to succeed.
+///
+/// `abort()` rather than `panic!`/`unimplemented!`: the callers are all plain
+/// `extern "C"` fns, across which unwinding is undefined behaviour, so a panic
+/// would only reach the compiler's abort-on-unwind shim -- and it would run the
+/// panic hook first, on a stack PHP owns and whose signal mask
+/// (`frankenphp.c:225-231` blocks SIGUSR1/SIGUSR2/SIGALRM process-wide) is not
+/// ours. Aborting directly is the same outcome with none of that machinery, and
+/// it is what issue #7 asks these stubs to do.
+///
+/// Returning a fabricated value instead is not an option worth having: every
+/// one of these is a SAPI hook or a userland function's implementation, so a
+/// plausible-looking zero would be read by PHP as a real answer (an empty
+/// request body, a successful write, a thread that may proceed).
 pub(crate) fn abort_stub(symbol: &str) -> ! {
-    unimplemented!(
-        "{symbol} is an issue #7 abort-stub with no real implementation yet -- \
-         see docs/PORTING-NOTES.md and issue #7's pre-declared module layout for \
-         which later issue replaces it"
+    eprintln!(
+        "frankenrust: FATAL: {symbol} was called, but it is still issue #7's \
+         abort-stub -- no implementation exists yet. See docs/PORTING-NOTES.md \
+         and issue #7's pre-declared module layout for which later issue \
+         (#10/#11/#12/#14) replaces it."
     );
+    std::process::abort();
 }

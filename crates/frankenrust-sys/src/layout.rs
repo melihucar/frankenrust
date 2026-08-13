@@ -43,20 +43,58 @@ const _: () = assert!(
      -- did the header change, or did build.rs's probe_has_kill_signal desync from it?"
 );
 
+// ...and the fields at their declared offsets, not merely the right total.
+// This struct crosses to `go_frankenphp_store_force_kill_slot` BY VALUE
+// (frankenphp.c:299), and #10 will dereference both pointers to interrupt a
+// runaway script: reading `timed_out` where `vm_interrupt` lives sets the
+// wrong `zend_atomic_bool` and the force-kill silently never fires.
+const _: () = {
+    use std::mem::offset_of;
+
+    assert!(
+        offset_of!(force_kill_slot, vm_interrupt) == 0,
+        "force_kill_slot.vm_interrupt is no longer the first field (frankenphp.h:61-69)"
+    );
+    assert!(
+        offset_of!(force_kill_slot, timed_out) == size_of::<usize>(),
+        "force_kill_slot.timed_out is no longer the second field (frankenphp.h:61-69)"
+    );
+};
+
+#[cfg(frankenphp_has_kill_signal)]
+const _: () = assert!(
+    std::mem::offset_of!(force_kill_slot, tid) == 2 * size_of::<usize>(),
+    "force_kill_slot.tid is no longer the third field (frankenphp.h:64-65) -- pthread_t is \
+     word-sized on every platform build.rs accepts, so anything else means the header changed"
+);
+
 // frankenphp.h:82-119, transcribed 1:1 in declaration order. NOTE: this
 // struct has 36 fields (1 total_num_vars + 16 char*/size_t pairs + 3
 // zend_string*), not the 40 issue #7's acceptance criteria states -- see
 // the issue #7 handoff notes. Every field is still asserted here, so the
 // discrepancy in that count does not weaken this check.
 //
-// `offset_of!` fails to compile outright if bindgen ever drops or renames a
-// field (a hard build error, not a silently-passing test); the monotonic
-// order check below additionally catches a field silently transposed with
-// an adjacent one of the same type, which `offset_of!` alone would not
-// (swapping two `char *` fields keeps every individual `offset_of!` call
-// valid).
+// Every field of this struct is word-sized on any target build.rs accepts --
+// `size_t`, `char *` and `zend_string *` alike -- and C lays them out with no
+// padding, so field *i* of the declaration sits at exactly
+// `i * size_of::<usize>()`. Asserting that exact offset (rather than merely
+// that the offsets increase) is what makes this check say what issue #7 asks
+// it to say: the fields are where frankenphp.h puts them.
+//
+// It catches all three ways this can go wrong, each of which silently
+// corrupts $_SERVER rather than failing:
+//   * a dropped or renamed field -- `offset_of!` stops compiling outright;
+//   * a transposed pair of same-typed fields (two `char *`s swapped keeps
+//     every individual `offset_of!` call valid, so only the value catches it);
+//   * a field whose type changed size, or padding appearing between them,
+//     which shifts every later field by a constant nothing else would notice.
+// The total-size assertion at the end additionally catches a field *appended*
+// to the struct, which no per-field offset check can see.
 const _: () = {
     use std::mem::offset_of;
+
+    // Field n of a no-padding, all-word-sized struct sits at n * W.
+    const W: usize = size_of::<usize>();
 
     let offsets = [
         offset_of!(frankenphp_server_vars, total_num_vars),
@@ -97,14 +135,20 @@ const _: () = {
         offset_of!(frankenphp_server_vars, https),
     ];
 
-    let mut i = 1;
+    let mut i = 0;
     while i < offsets.len() {
         assert!(
-            offsets[i - 1] < offsets[i],
-            "frankenphp_server_vars fields are out of declaration order relative to \
-             frankenphp.h:82-119 -- a field was transposed, which would silently corrupt \
-             $_SERVER"
+            offsets[i] == i * W,
+            "frankenphp_server_vars does not match frankenphp.h:82-119 -- a field was \
+             transposed, retyped, or padded away from its declared offset, which would \
+             silently corrupt $_SERVER"
         );
         i += 1;
     }
+
+    assert!(
+        size_of::<frankenphp_server_vars>() == offsets.len() * W,
+        "frankenphp_server_vars has grown or shrunk relative to frankenphp.h:82-119 -- a \
+         field was added or removed and the offsets listed above never noticed"
+    );
 };
