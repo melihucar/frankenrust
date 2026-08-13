@@ -32,11 +32,24 @@ what calls into it isolates the variable the benchmark exists to measure.
 
 Concretely, "port FrankenPHP" becomes: **reimplement the callback functions C
 calls into, in Rust instead of Go, plus the request plumbing behind them, plus
-an HTTP server to feed it** (`docs/PORTING-NOTES.md:41-43`). The exact symbol
-list — 26 functions, their upstream Go call sites, and the `frankenphp.c` line
-that calls each one — is the porting checklist and lives in
-`docs/PORTING-NOTES.md:81-112`; it is not repeated here because it is a
-checklist, not a design decision. (One of the 26, `go_mercure_publish`
+an HTTP server to feed it** (`docs/PORTING-NOTES.md:41-43`). That symbol list —
+26 functions — is the porting checklist. It is not repeated here because it is a
+checklist, not a design decision, but note that it exists in **two forms, in two
+places, and they carry different columns**:
+
+- `docs/PORTING-NOTES.md:81-112` lists each symbol against its **Go definition
+  site** and a one-line description of what it does — the header is
+  `| Symbol | Upstream Go | What it does |` (`docs/PORTING-NOTES.md:87`), so
+  `frankenphp.go:430` there means "where `go_ub_write` is written in Go", not
+  where C calls it. Use this to find the upstream implementation to port.
+- Issue #7's body carries the other half: each symbol's **C signature and the
+  `frankenphp.c` line that calls it** (e.g. `go_ub_write` at `1141`,
+  `go_frankenphp_after_script_execution` at `1562, 1591`). Use this when you
+  need the caller — in particular when writing a `// SAFETY:` comment that names
+  which C site invokes a callback and on which thread. Do not read a Go line
+  number out of `PORTING-NOTES.md` and write it down as a C call site.
+
+(One of the 26, `go_mercure_publish`
 (`docs/PORTING-NOTES.md:112`), is explicitly a stub, never a real
 reimplementation — see "What is deliberately out of scope" below — which is
 why `docs/PORTING-NOTES.md:41` and `README.md:165` count 25: this document
@@ -196,9 +209,10 @@ the ASCII sequence diagram and the channel choice, is in
   early on `fc.isDone` (`vendor/frankenphp/context.go:137-139`) — and then
   clears the thread's context pointer under `contextMu`
   (`vendor/frankenphp/threadregular.go:72-75`, `:129-135`), driven from C by
-  `go_frankenphp_after_script_execution` after `php_execute_script`
+  `go_frankenphp_after_script_execution` (`frankenphp.c:1562`, or `:1591` on the
+  bailout path), which C reaches after `php_execute_script`
   (`frankenphp.c:1531`) and `frankenphp_free_request_context()`
-  (`frankenphp.c:1562`, or `:1591` on the bailout path). For a worker thread
+  (`frankenphp.c:1561`, or `:1590` on the bailout path). For a worker thread
   neither event lands there: the worker script is executed once and stays alive
   across many requests, calling `frankenphp_handle_request()`
   (`frankenphp.c:830`) in a `do ... while` loop — see any of upstream's worker
@@ -268,8 +282,13 @@ and they meet in the middle at `(Ready or Inactive) → TransitionRequested →
 TransitionInProgress → TransitionComplete` — `RequestSafeStateChange` only
 starts the sequence from one of those two stable states, retrying once the
 thread reaches one otherwise (`vendor/frankenphp/internal/state/state.go:199-222`).
-The handler pointer is only written inside that window, so no thread can
-observe a handler swap mid-script.
+Every handler *swap* is written inside that window, so no thread can observe one
+mid-script. The one write that does not go through the window is the initial
+assignment: `boot()` sets the handler to an `inactiveThread` under `handlerMu`
+(`phpthread.go:68-71`) *before* it calls `frankenphp_new_php_thread`
+(`phpthread.go:74`), so there is no PHP thread in existence yet to observe it.
+That ordering is itself the invariant — a thread never starts without a handler,
+and after it starts the handler only changes through the transition.
 
 Note what upstream does **not** do here: it does not put the handler and the
 state machine behind one lock. `phpThread` carries a `handlerMu` of its own
@@ -312,13 +331,50 @@ not an invariant (`docs/PORTING-NOTES.md:159-166`).
    (`frankenphp.c:367-372`), i.e. not freed by C at all — ownership stays on
    the Go/Rust side for the request's lifetime. This is the scheme that needs
    an arena on our side: something that outlives one call but is reclaimed
-   deterministically, not by relying on a GC-adjacent pinner. Note *when*
-   upstream reclaims it: `thread.Unpin()` runs inside
-   `go_frankenphp_after_script_execution` (`phpthread.go:248-258`), which C calls
-   only after `frankenphp_free_request_context()` (`frankenphp.c:1561-1562`).
-   That is script end, not response end — see the async ↔ pthread boundary
-   above: a script that called `frankenphp_finish_request()` has already sent
-   its response and is still reading this memory.
+   deterministically, not by relying on a GC-adjacent pinner. Note that
+   `Unpin` is a *bulk* release — the `Pinner` is embedded in `phpThread`
+   (`phpthread.go:20`), so `thread.Unpin()` drops everything that thread pinned,
+   not one value. That is arena semantics already, which is why the question
+   below is "where is the single reclaim point" rather than "who drops what".
+
+   **The reclaim point differs by handler, exactly as teardown does, and getting
+   this wrong is a leak rather than a crash — so no test will catch it.**
+
+   - *Regular threads*: `thread.Unpin()` runs at the end of
+     `go_frankenphp_after_script_execution` (`phpthread.go:248-258`, the call at
+     `:257`), which C reaches at `frankenphp.c:1562` — after
+     `frankenphp_free_request_context()` at `:1561` (bailout path: `:1590`,
+     `:1591`). That is script end, not response end — see the async ↔ pthread
+     boundary above: a script that called `frankenphp_finish_request()` has
+     already sent its response and is still reading this memory.
+   - *Worker threads*: `after_script_execution` is **not** a per-request event.
+     A worker's `afterScriptExecution` is `tearDownWorkerScript`
+     (`threadworker.go:78-80`), which runs only when the long-lived worker script
+     finally exits. The pins, however, are re-created on *every* request:
+     `frankenphp_worker_request_startup` calls `frankenphp_update_request_context()`
+     (`frankenphp.c:563`), which calls `go_update_request_info`
+     (`frankenphp.c:354-355`), which pins `query_string`, `content_type`,
+     `path_translated`, `request_uri`, the `Authorization` header it returns, and
+     `request_method` when it is not one of the cached constants
+     (`cgi.go:298-323`). Upstream therefore reclaims at the **top of the next
+     request** instead: `waitForWorkerRequest` opens with
+     `handler.thread.Unpin()` under the comment "unpin any memory left over from
+     previous requests" (`threadworker.go:199-201`), reached from
+     `go_frankenphp_worker_handle_request_start` (`threadworker.go:273-275`).
+
+   Two consequences for whoever designs the arena (#11). First, reclaiming only
+   in `go_frankenphp_after_script_execution` is a regular-mode rule; applied
+   uniformly it passes every regular-mode test and then grows a worker
+   monotonically: the only thing that ends a worker script on a healthy thread is
+   the `max_requests` reboot, and `max_requests` defaults to 0, which upstream
+   documents as unlimited for both handler kinds (`options.go:170`) and guards on
+   with `maxRequestsPerThread > 0` (`threadworker.go:219-220`). So in the default
+   configuration the reclaim point never fires — and worker mode is precisely the
+   mode the benchmark exists to measure. Second,
+   the worker rule means a request's arena deliberately outlives that request:
+   it is still allocated after the response is sent and is only released when the
+   *next* request begins. So the arena may not be tied to response completion
+   either.
 3. **libc-`malloc`'d by the callback, `free`'d by C.** `go_read_cookies`
    (called at `frankenphp.c:1195-1196`) returns a pointer C stores into
    `SG(request_info).cookie_data` and later releases with libc `free()`
