@@ -148,13 +148,36 @@ def closed_numbers() -> set[int]:
 
 
 def claimable() -> list[Issue]:
-    """Ready issues whose dependencies are all closed."""
+    """Ready issues whose dependencies are all closed, most valuable first.
+
+    Order used to be whatever `gh issue list` returned, which is newest-first.
+    Issue numbers only increase and agents file followups while they work, so
+    every followup an agent filed outranked every port issue still waiting --
+    permanently, because nothing ever lowers a number. The loop consumed its
+    own exhaust: after one merge the next three picks were all housekeeping it
+    had filed for itself, while the issue designated the conformance oracle sat
+    sixth and the workspace that gates ten others was unreachable.
+
+    So rank by how much an issue unblocks. An issue ten others depend on is
+    worth more than a two-line docs correction, and nothing in the queue said
+    so. Housekeeping breaks ties downward rather than being excluded outright:
+    the loop repairing itself is what makes an unattended run survivable, and a
+    rule that always starves fr:meta would trade one runaway for another.
+    """
     done = closed_numbers()
-    out = []
-    for i in fetch(label="fr:ready"):
-        if all(d in done for d in i.deps):
-            out.append(i)
-    return out
+    ready = [i for i in fetch(label="fr:ready") if all(d in done for d in i.deps)]
+
+    # How many still-open issues are waiting on each one.
+    dependants: dict[int, int] = {}
+    for i in fetch():
+        for d in i.deps:
+            dependants[d] = dependants.get(d, 0) + 1
+
+    def rank(i: Issue) -> tuple[int, int, int]:
+        housekeeping = 1 if {"fr:followup", "fr:meta"} & set(i.labels) else 0
+        return (-dependants.get(i.number, 0), housekeeping, i.number)
+
+    return sorted(ready, key=rank)
 
 
 def claim(n: int) -> bool:
