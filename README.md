@@ -1,14 +1,40 @@
 # FrankenRust
 
-An experiment: port [FrankenPHP](https://github.com/php/frankenphp) — a PHP app
-server that embeds the interpreter rather than shelling out to FPM — from Go to
-Rust, and find out whether it actually matters.
+**This is an experiment about agentic loops. Porting FrankenPHP to Rust is the
+workload, not the goal.**
 
-The deliverable is not the port. The deliverable is **a benchmark honest enough
-to change your mind either way**, including the outcome where it turns out the
-Go layer was never the bottleneck.
+The question is whether a loop of LLM agents — planning, implementing,
+reviewing, and repairing itself, with **no human in the loop** — can sustain
+real engineering work overnight. Not "can an agent write a function", which is
+settled, but: does the *system* hold up over hours, once the easy tasks are
+gone, when nobody is awake to notice it has started doing something stupid?
 
-## What is actually being ported
+That question needs a workload with three properties, and porting
+[FrankenPHP](https://github.com/php/frankenphp) — a PHP app server that embeds
+the interpreter rather than shelling out to FPM — has all three:
+
+- **Verifiable without judgement.** Upstream is the behavioural oracle. Ported
+  code either reproduces its HTTP responses byte-for-byte or it does not, so
+  "done" is a command's exit status rather than an agent's opinion of itself.
+- **Genuinely hard.** FFI, `unsafe`, thread affinity, and a C library that will
+  segfault rather than return an error. Work an agent cannot bluff through.
+- **Falsifiable at the end.** The port is only worth anything if it is faster,
+  and it might well not be. A benchmark that says "no difference" is a real
+  result, and the loop has no way to talk its way out of it.
+
+So the port is a substrate chosen to make the loop's failures *visible*. Most
+of what has been learned so far is not about Rust or PHP. It is about the ways
+an unattended loop goes wrong — grading itself against the wrong directory,
+merging empty diffs, filing work it then prioritises above the actual project,
+and parking the one issue everything else depended on in a state nothing could
+get it out of. Every one of those happened here, and each is written up in
+`orchestrator/logs/retro-*.md` — including the ones the loop diagnosed about
+itself.
+
+If you only read two things, read `orchestrator/loop.py` (the whole system, one
+file) and those retrospectives.
+
+## The workload: what is actually being ported
 
 Less than it sounds. Upstream is three layers with very different portability:
 
@@ -44,6 +70,13 @@ RPS, because that is where a runtime change actually shows up.
 
 For calibration: rav1d's Rust port started ~11% *slower* than the C original and
 took two years of funded work to get under 6%.
+
+None of which the loop is allowed to know in advance. The benchmark's job here
+is to be the one claim an agent cannot write its way around: a loop that grades
+its own work will eventually conclude that its own work is good, and the only
+defence is a number produced by something that does not care. If FrankenRust
+ends up slower, that is a successful experiment and a failed port, and the two
+are not the same thing.
 
 ## Running the loop
 
@@ -161,6 +194,13 @@ The harness **refuses to run** if other containers are competing for CPU. Set
 ## Layout
 
 ```
+orchestrator/loop.py        the entire system: claim, critique, implement, gate, review, merge
+orchestrator/gh.py          GitHub Issues as the work queue, labels as the state machine
+orchestrator/prompts/       one file per role — the only place agent behaviour is specified
+orchestrator/logs/          events.jsonl (the journal) and retro-*.md (the loop on itself)
+scripts/gate.sh             the merge gate. agents are forbidden to weaken it
+scripts/check_orchestrator.py   the loop's self-checks, run in every gate profile
+
 crates/frankenrust-sys      raw FFI: bindgen over PHP headers, compiles upstream's C
 crates/frankenrust-core     safe layer: threads, request context, the 25 callbacks
 crates/frankenrust-server   hyper HTTP/1.1 server, async↔pthread bridge
@@ -168,6 +208,8 @@ vendor/frankenphp/          upstream, READ-ONLY. the behavioural oracle
 tests/conformance/          differential tests vs upstream's own PHP fixtures
 docs/PORTING-NOTES.md       the pattern map every agent reads first
 ```
+
+The top half is the experiment; the bottom half is the workload it runs on.
 
 `vendor/frankenphp/testdata/` is the reason this is verifiable at all: 73 PHP
 fixtures that are implementation-agnostic, so the same script served by any

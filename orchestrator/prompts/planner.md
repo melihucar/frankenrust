@@ -34,9 +34,28 @@ Depends on: #3, #4
   harness exists, or it will fail a gate it cannot possibly satisfy.
 - **Agent** — `codex` for mechanical grind, `claude` for design-heavy work,
   `duel` for the two or three hardest (agents alternate on failure).
-- **Depends on** — issue numbers that must close first. Omit the line if none.
-  Get this right: it is the only thing preventing an agent from trying to
-  implement the SAPI callbacks before the FFI layer links.
+- **Depends on** — issue numbers whose **behaviour this issue calls into**. Omit
+  the line if none. An edge means "I invoke something #N implements", never "I
+  need a file #N creates". Those sound alike and are not: scaffolding is created
+  once and needed by everyone, so an edge drawn from file existence attaches to
+  every sibling at once and collapses the graph into a chain.
+
+  That is not hypothetical. It cost this project a run. Every port issue was
+  made to depend on the one issue that creates the workspace `Cargo.toml`, so
+  the graph had maximum width 2 against three workers, four of its seven levels
+  could occupy exactly one worker, and `#11` carried an edge to the state module
+  while containing zero occurrences of the word `state`. The port advanced one
+  issue at a time all night.
+
+  So before you write an edge, name the symbol. If you cannot say *which
+  function, type or file-under-test from #N this issue calls*, there is no edge
+  — the tree it needs will be there anyway, because the loop rebases every
+  worktree onto current `main` before it gates.
+
+  Get the real ones right, though: they are the only thing stopping an agent
+  implementing the SAPI callbacks before the FFI layer links. Under-declaring a
+  genuine edge costs three failed attempts on an error the implementer cannot
+  fix. Over-declaring one costs a worker sitting idle all night.
 
 Everything else is the spec. Write it for an agent that is competent but has
 not read the codebase: name the exact upstream files and functions to port,

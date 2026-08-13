@@ -101,11 +101,17 @@ MODELS = {
     "fixer": os.environ.get("FR_MODEL_FIX", "claude-opus-5"),
     "planner": os.environ.get("FR_MODEL_PLAN", "claude-opus-5"),
     "resolver": os.environ.get("FR_MODEL_RESOLVE", "claude-opus-5"),
+    "unblocker": os.environ.get("FR_MODEL_UNBLOCK", "claude-opus-5"),
 }
 # How many times an issue may be re-scoped before the resolver must decide it
 # outright. Without a cap, critic and resolver can hand an issue back and forth
 # forever and it never gets built.
 MAX_REVISIONS = int(os.environ.get("FR_MAX_REVISIONS", "2"))
+# How many times an issue may be rescued out of fr:blocked. Separate budget from
+# MAX_REVISIONS: a bad spec and three failed gates are different failures, and
+# sharing one counter means an issue the resolver already re-scoped gets fewer
+# rescues than one it never touched.
+MAX_RECOVERIES = int(os.environ.get("FR_MAX_RECOVERIES", "2"))
 # Consecutive empty polls before believing the queue is finished. GitHub's
 # issue list lags writes by seconds, and one empty read ends the whole run.
 DRAIN_CONFIRMATIONS = int(os.environ.get("FR_DRAIN_CONFIRMATIONS", "3"))
@@ -127,6 +133,9 @@ _codex_lock = threading.Lock()
 # every self-update handed the successor a clean slate and it re-learned the
 # same wall by burning another invocation on it.
 _codex_disabled = os.environ.get("FR_CODEX_DISABLED") == "1"
+# Issues whose recovery budget is spent, so the terminal log line is printed
+# once rather than on every 30s poll.
+_recovery_exhausted: set[int] = set()
 _start = time.time()
 
 
@@ -624,6 +633,90 @@ def resolve_question(issue: gh.Issue, wt: Path, logdir: Path, critique: str) -> 
     return False
 
 
+def recover_blocked() -> int:
+    """Rescue blocked issues that other open work is waiting on.
+
+    The counterpart to resolve_question(), for the other absorbing state. A bad
+    *spec* was adjudicated and re-scoped; a bad *implementation attempt* was
+    parked in fr:blocked and waited for a human who is not coming.
+
+    Triggered by what a block gates, not by an empty queue. When #5 parked at
+    02:30 the loop had fourteen claimable issues and never starved -- it stayed
+    busy on housekeeping it had filed for itself while every port issue sat
+    behind a label nothing removes. Starvation would have been the wrong signal;
+    by the time it fired the night would have been over.
+
+    Returns how many issues it returned to the queue, so the caller can poll
+    again immediately rather than sleeping on a queue that just changed.
+    """
+    recovered = 0
+    for issue, waiting in gh.blocked_gating_work():
+        if issue.recoveries >= MAX_RECOVERIES:
+            # Say this once. The poll that calls us re-runs every 30s while the
+            # queue is waiting on dependencies, which is exactly the state a
+            # spent budget produces, so logging it per poll buries the run.
+            if issue.number not in _recovery_exhausted:
+                _recovery_exhausted.add(issue.number)
+                log(f"    -- #{issue.number} blocked, {len(waiting)} waiting, "
+                    f"recovery budget spent ({issue.recoveries}) — this is terminal")
+                record("recovery_exhausted", issue=issue.number,
+                       gating=len(waiting), recoveries=issue.recoveries)
+            continue
+        log(f"    ~~ recovering #{issue.number} (gates {len(waiting)}: {waiting[:8]})")
+        tid = f"unblock-{issue.number}"
+        logdir = LOGS / str(issue.number)
+        try:
+            wt = make_worktree(tid)
+        except RuntimeError as exc:
+            record("recover_failed", issue=issue.number, reason=f"worktree: {exc}")
+            continue
+        try:
+            # The transcripts are the evidence, and they live in the main
+            # checkout's logs/ -- not in the worktree the unblocker is standing
+            # in. Say so explicitly or it reads an empty directory and concludes
+            # the failure left no trace.
+            extra = (f"\n# What this issue is holding up\n\n"
+                     f"{len(waiting)} open issue(s) depend on it: "
+                     f"{', '.join(f'#{n}' for n in waiting)}\n\n"
+                     f"# Its transcripts\n\n`{logdir}` in the main checkout "
+                     f"(absolute path; you are in a worktree).\n"
+                     f"Rescue {issue.recoveries + 1} of {MAX_RECOVERIES}.\n")
+            _, _, out = invoke("claude", wt, prompt_for("unblocker", issue, extra),
+                               logdir, f"unblock.{issue.recoveries}", role="unblocker")
+
+            if "RECOVERY: CLOSE" in out:
+                gh.close(issue.number,
+                         f"**Unblocker: this issue should not be built.**\n\n{out[-30000:]}")
+                record("recovered", issue=issue.number, decision="close",
+                       gating=len(waiting))
+                continue
+            if "RECOVERY: SPLIT" in out or "RECOVERY: REQUEUE" in out:
+                decision = "split" if "RECOVERY: SPLIT" in out else "requeue"
+                if gh.unblock(issue.number, issue.recoveries + 1):
+                    gh.comment(issue.number,
+                               f"**Unblocker: {decision}, back in the queue.**\n\n{out[-30000:]}")
+                    record("recovered", issue=issue.number, decision=decision,
+                           gating=len(waiting), round=issue.recoveries + 1)
+                    recovered += 1
+                    continue
+                record("recover_failed", issue=issue.number, reason="unblock failed")
+                continue
+
+            # No decision. Leave it blocked -- but this is a loop defect, and an
+            # unblocker that returns nothing is how the absorbing state comes
+            # back wearing a different label.
+            log(f"    !! #{issue.number} unblocker gave no decision")
+            record("recover_failed", issue=issue.number, round=issue.recoveries,
+                   excerpt=out[-1500:])
+        except Exception as exc:  # noqa: BLE001
+            log(f"    !! recovery of #{issue.number} crashed: {exc}")
+            record("recover_failed", issue=issue.number, reason=repr(exc),
+                   trace=traceback.format_exc()[-2000:])
+        finally:
+            retire_worktree(tid)
+    return recovered
+
+
 def work(issue: gh.Issue) -> None:
     """Process one issue. Never raises: the pool re-raises into cmd_run.
 
@@ -861,6 +954,16 @@ def cmd_run() -> int:
             if time.time() - _start > WALLCLOCK_LIMIT:
                 log("!! wallclock limit reached, stopping")
                 break
+            # Recover before claiming, so anything rescued is claimable in this
+            # same batch. Cheap when there is nothing to do -- blocked_gating_work
+            # only reaches an agent for a block that other open issues wait on.
+            recover_blocked()
+            # Mirror the dependency filter onto the labels. Only writes on a
+            # change, so a queue in steady state costs one read.
+            added, removed = gh.sync_waiting()
+            if added or removed:
+                log(f"fr:waiting +{added} -{removed}")
+
             with _claim_lock:
                 # Claim lazily, up to the batch size. Claiming everything and
                 # then slicing strands the remainder in fr:claimed with no
@@ -876,7 +979,13 @@ def cmd_run() -> int:
                 remaining = gh.fetch(label="fr:ready")
                 if remaining:
                     empty = 0
-                    log(f"waiting: {len(remaining)} ready but dependencies unmet")
+                    # Distinguish the two reasons this can happen. "Dependencies
+                    # unmet" with every blocker itself blocked is not waiting,
+                    # it is deadlock, and it used to look identical in the log to
+                    # a batch that was about to free up.
+                    stuck = gh.fetch(label="fr:blocked")
+                    detail = (f", {len(stuck)} blocked" if stuck else "")
+                    log(f"waiting: {len(remaining)} ready but dependencies unmet{detail}")
                     time.sleep(30)
                     continue
                 # GitHub's issue list is eventually consistent -- a queue seeded
@@ -919,13 +1028,27 @@ def cmd_run() -> int:
 
 
 def cmd_status() -> int:
-    for label in ("fr:ready", "fr:claimed", "fr:blocked", "fr:questioned"):
+    for label in ("fr:ready", "fr:waiting", "fr:claimed", "fr:blocked", "fr:questioned"):
         items = gh.fetch(label=label)
         print(f"\n{label} ({len(items)})")
         for i in items:
             print(f"  #{i.number:<4} {i.title}  deps={i.deps or '-'}")
-    closed = gh.closed_numbers()
-    print(f"\nclosed: {len(closed)}")
+    # What can actually be picked up right now, which is not len(fr:ready) and
+    # was never shown anywhere. A status that reports 49 ready when 39 are
+    # claimable is the number that made the queue look healthy while the port
+    # was one issue wide.
+    ready = gh.claimable()
+    print(f"\nclaimable now: {len(ready)}")
+    for i in ready[:MAX_PARALLEL]:
+        print(f"  #{i.number:<4} [{i.gate}/{i.agent}] {i.title}")
+    stuck = gh.blocked_gating_work()
+    if stuck:
+        print(f"\nblocked and gating open work: {len(stuck)}")
+        for i, waiting in stuck:
+            print(f"  #{i.number:<4} gates {len(waiting)} "
+                  f"({', '.join(f'#{n}' for n in waiting[:6])})  "
+                  f"recoveries={i.recoveries}/{MAX_RECOVERIES}")
+    print(f"\nclosed: {len(gh.closed_numbers())}")
     return 0
 
 

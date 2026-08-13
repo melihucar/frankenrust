@@ -19,10 +19,18 @@ jq -r 'select(.event=="critic_revise") | .excerpt' orchestrator/logs/events.json
 ```
 
 Events: `merged`, `blocked`, `gate_fail`, `review_block`, `critic_revise`,
-`resolved`, `resolve_failed`, `rebase_conflict`, `merge_regate_fail`,
+`resolved`, `resolve_failed`, `recovered`, `recover_failed`,
+`recovery_exhausted`, `rebase_conflict`, `merge_regate_fail`,
 `agent_fallback`, `agent_timeout`, `agent_error`, `work_crash`, `reclaimed`,
 `low_disk`, `empty_diff`, `review_diversity_lost`, `retrospective`, `retro_error`, `self_restart`,
 `journal_reset`.
+
+`recovery_exhausted` is the most serious event in that list and the easiest to
+miss, because by definition nothing after it fails: an issue other work depends
+on has spent its rescue budget, so the loop will never touch it again and every
+dependant sits there quietly for the rest of the run. If you see one, diagnose
+what made that issue unrecoverable before anything else in the batch — and note
+that the fix is almost never "raise `MAX_RECOVERIES`".
 
 Three of those describe the loop failing rather than an agent failing, and they
 are the most important things in the file: `work_crash` is an unhandled

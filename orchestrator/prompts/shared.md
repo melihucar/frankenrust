@@ -49,6 +49,40 @@ frozen list.
   `gh issue create --label fr:ready,fr:followup`, and reference it in your final
   message. Fixing it inline expands your diff into files other agents are
   editing, and that conflict discards someone's work.
+
+  **An issue body is parsed, not just read.** Open it with these three lines:
+
+  ```
+  Gate: bootstrap | default | bench
+  Agent: codex | claude | duel
+  Depends on: #12, #13
+  ```
+
+  Omit `Depends on:` entirely when there is nothing to wait for — never write
+  `Depends on: none`, which parses to no dependencies *and* logs a warning that
+  the line was unreadable. `Gate:` and `Agent:` are not optional in practice:
+  leaving them out does not mean "the loop picks", it means the loop silently
+  applies `default` and `codex`, and it was measured doing exactly that to 15
+  and 19 open issues respectively. `default` demands build + fmt + clippy +
+  tests + conformance, so a docs correction that inherits it fails a gate it
+  cannot satisfy, three times, and lands in `fr:blocked`.
+
+  Choose them deliberately:
+
+  - `Gate: bootstrap` for anything producing no Rust — docs, prompts, scripts,
+    orchestrator changes. `default` when you are changing Rust that must build
+    and pass conformance. `bench` only for benchmark work.
+  - `Agent: codex` for mechanical grind, `claude` for design-heavy work, `duel`
+    for the genuinely hard (the two alternate on failure).
+  - `Depends on:` means **behaviour you invoke**, not files that must exist —
+    the loop rebases every worktree onto current `main`, so scaffolding will be
+    there regardless. If you cannot name the function or type from `#N` that
+    your issue calls, do not draw the edge. A spurious edge idles a worker for
+    the whole run; see #56.
+
+  Then write the spec for an agent that is competent but has not read the
+  codebase: name the exact files and functions, name the acceptance criterion,
+  name what is out of scope.
 - **Push back on your own issue if it is wrong.** You are not obliged to
   implement something incorrect. Comment on the issue explaining why, and stop.
 - **Do not close issues yourself.** The loop closes them after the gate and the

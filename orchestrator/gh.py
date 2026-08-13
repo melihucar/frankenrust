@@ -8,18 +8,33 @@ allowed to change while the loop runs, which a hand-written JSON file cannot do.
 
 Label state machine:
 
-    fr:ready ──claim──► fr:claimed ──┬─ merged ─► issue closed
-        ▲                            ├─ failed ─► fr:blocked
-        │                            └─ spec is wrong ─► resolver
-        └──── requeue (re-scoped) ─────────────┴─ or closed with evidence
+    fr:ready ──claim──► fr:claimed ──┬─ merged ─────────► issue closed
+        ▲    (+fr:waiting            ├─ spec is wrong ──► resolver  ──┐
+        │     while deps are open)   └─ failed 3x ──────► fr:blocked  │
+        │                                                    │        │
+        └──── requeue (re-scoped) ◄── unblocker ◄────────────┘        │
+        └──── requeue (re-scoped) ◄───────────────────────────────────┘
+                                     ...or either closes it with evidence
 
-fr:questioned is a last resort, not a resting place: nobody is coming to
-re-scope it. The resolver adjudicates the objection and puts the issue back in
-play or kills it, and `requeue` stamps `Revisions: N` so that exchange cannot
-run forever.
+**No state in this machine is absorbing.** That is the invariant, and it is
+here because it was violated. `fr:questioned` used to be where a challenged
+spec waited for a human who was not coming, so the resolver was added to
+adjudicate it. `fr:blocked` was then exactly the same defect wearing different
+paint -- `block()` set it and nothing anywhere removed it -- and it nearly cost
+the project a night: the toolchain issue that twelve others sat behind failed
+three times, parked, and was rescued only because a person happened to read the
+label at 02:30 and re-scope it by hand. The unblocker is that person, written
+down. `requeue` stamps `Revisions: N` and `unblock` stamps `Recoveries: N`, so
+neither exchange can run forever.
 
-Dependencies live in the issue body as `Depends on: #12, #13`. An issue is
-claimable only once every issue it depends on is closed.
+`fr:waiting` is the one label that is not a state: it is an annotation the loop
+maintains so that the dependency filter `claimable()` has always applied is
+visible from outside. Nothing schedules on it.
+
+Dependencies live in the issue body as `Depends on: #12, #13`, and mean
+*behaviour this issue calls into* -- not files that must exist, which the rebase
+onto `main` provides anyway. An issue is claimable only once every issue it
+depends on is closed.
 """
 
 from __future__ import annotations
@@ -33,7 +48,15 @@ from dataclasses import dataclass, field
 LABELS = {
     "fr:ready": ("0e8a16", "Claimable by an agent"),
     "fr:claimed": ("fbca04", "An agent is working on this"),
-    "fr:blocked": ("b60205", "Failed repeatedly; needs a human"),
+    # Annotation, not a state: it rides alongside fr:ready and nothing schedules
+    # on it. claimable() has always filtered on unmet dependencies, but it did so
+    # silently -- from the outside all 49 ready issues looked equally available
+    # while 10 of them could not be picked by anyone. sync_waiting() mirrors that
+    # hidden predicate into the UI so the queue you read is the queue the loop
+    # sees. Distinct from fr:blocked on purpose: waiting is the system working,
+    # blocked is the system stuck.
+    "fr:waiting": ("bfd4f2", "Ready, but waiting on an open dependency"),
+    "fr:blocked": ("b60205", "Failed repeatedly; awaiting recovery"),
     "fr:questioned": ("5319e7", "An agent challenged this spec; needs re-scoping"),
     "fr:followup": ("c5def5", "Filed by an agent mid-task"),
     # Filed by the retrospective against the loop itself, and claimable like any
@@ -44,14 +67,27 @@ LABELS = {
     "fr:meta": ("d4c5f9", "Improvement to the loop itself"),
 }
 
-DEP_RE = re.compile(r"depends on:?\s*(.+)", re.I)
 ISSUE_RE = re.compile(r"#(\d+)")
-# A line that opens with "depends on" is metadata, not prose. If one of those
-# yields no #N at all -- "Depends on: issues 7 and 8" -- the issue reads as
-# unblocked and gets claimed before its prerequisites exist. Bare numbers are
-# deliberately NOT parsed as a fallback: "Depends on: PHP 8.5" would invent
-# dependencies on #8 and #5, which is a worse failure than the one it fixes.
+# A line that OPENS with "depends on" is metadata; the same words inside a
+# sentence are prose. Both halves of that matter, and getting the second one
+# wrong is what this pattern is for.
+#
+# Extraction used to run `depends on:?\s*(.+)` unanchored over the whole body,
+# so any sentence containing the phrase donated every issue number to its right.
+# #56 -- the issue whose entire job was cutting spurious dependency edges --
+# said "Audit every `Depends on:` edge in the port graph -- #8, #10, #11, #12,
+# #13" and thereby declared dependencies on all of them. It could not be claimed
+# until the port it existed to unblock had finished. The better an issue
+# documented the dependency graph, the more unreachable it made itself.
+#
+# Anchoring fixes that, and the warning below covers the other direction: a line
+# that is metadata but yields no #N -- "Depends on: issues 7 and 8", or #37's
+# "Depends on: nothing" -- reads as unblocked and gets claimed before its
+# prerequisites exist. Bare numbers are deliberately NOT parsed as a fallback:
+# "Depends on: PHP 8.5" would invent dependencies on #8 and #5, which is a worse
+# failure than the one it fixes.
 DEP_LINE_RE = re.compile(r"^[ \t]*[-*]?[ \t]*depends on\b", re.I | re.M)
+DEP_RE = re.compile(r"^[ \t]*[-*]?[ \t]*depends on\b:?(.*)$", re.I | re.M)
 _warned: set[tuple[int, str]] = set()
 
 
@@ -81,6 +117,10 @@ class Issue:
         the gate three times for a reason the implementer cannot fix, and ends
         up blocked. Unioning is also right for a body listing deps as bullets,
         and prose that mentions no issue number contributes nothing.
+
+        Lines only (see DEP_RE): the phrase inside a sentence is prose, and
+        reading it as metadata let a body's own description of the dependency
+        graph become dependencies.
         """
         body = self.body or ""
         found = {int(n) for m in DEP_RE.finditer(body)
@@ -116,6 +156,20 @@ class Issue:
         back and forth forever with nobody watching.
         """
         found = re.findall(r"^\s*revisions:\s*(\d+)", self.body or "", re.I | re.M)
+        return max((int(n) for n in found), default=0)
+
+    @property
+    def recoveries(self) -> int:
+        """How many times this issue has been rescued out of fr:blocked.
+
+        Separate from `revisions` because they bound different loops. A critic
+        objecting to a spec and an implementer failing a gate three times are
+        different failures, and letting one exhaust the other's budget means an
+        issue that was re-scoped twice gets one rescue instead of two. Highest
+        match wins, for the same reason as revisions: the unblocker rewrites the
+        body and can leave a stale counter above the new one.
+        """
+        found = re.findall(r"^\s*recoveries:\s*(\d+)", self.body or "", re.I | re.M)
         return max((int(n) for n in found), default=0)
 
 
@@ -178,6 +232,88 @@ def claimable() -> list[Issue]:
         return (-dependants.get(i.number, 0), housekeeping, i.number)
 
     return sorted(ready, key=rank)
+
+
+def sync_waiting() -> tuple[int, int]:
+    """Mirror the dependency predicate onto the issues as `fr:waiting`.
+
+    Pure annotation: `claimable()` is unchanged and nothing reads this label
+    back. It exists because the scheduling rule was invisible -- `fr:ready` was
+    stamped on issues that no worker could claim, so the queue a human read and
+    the queue the loop saw disagreed, and the disagreement was exactly the set
+    of issues that mattered.
+
+    Only writes on a change. This runs on every poll, which is every 30s while
+    the loop is waiting for dependencies, and re-labelling 49 issues a minute
+    would spend the API budget on saying nothing new.
+
+    Returns (added, removed) for the caller to log.
+    """
+    done = closed_numbers()
+    added = removed = 0
+    for i in fetch(label="fr:ready"):
+        waiting = not all(d in done for d in i.deps)
+        tagged = "fr:waiting" in i.labels
+        if waiting and not tagged:
+            gh(["issue", "edit", str(i.number), "--add-label", "fr:waiting"])
+            added += 1
+        elif tagged and not waiting:
+            gh(["issue", "edit", str(i.number), "--remove-label", "fr:waiting"])
+            removed += 1
+    return added, removed
+
+
+def dependants() -> dict[int, list[int]]:
+    """Open issue numbers waiting on each issue, keyed by the issue they need."""
+    out: dict[int, list[int]] = {}
+    for i in fetch():
+        for d in i.deps:
+            out.setdefault(d, []).append(i.number)
+    return out
+
+
+def blocked_gating_work() -> list[tuple[Issue, list[int]]]:
+    """Blocked issues that other open issues are waiting on, worst first.
+
+    This is the queue the recovery pass drains, and the ordering is the whole
+    point. Last night #5 -- the toolchain twelve issues sat behind -- was
+    blocked at 02:30 and the run did not starve: fourteen housekeeping issues
+    were claimable, so the loop stayed busy on its own exhaust while the port
+    was dead. Recovery keyed on an empty queue would never have fired. What
+    makes a block urgent is what it gates, not whether there is other work.
+    """
+    waiting_on = dependants()
+    done = closed_numbers()
+    out = [(i, sorted(n for n in waiting_on.get(i.number, []) if n not in done))
+           for i in fetch(label="fr:blocked")]
+    return sorted((x for x in out if x[1]), key=lambda x: -len(x[1]))
+
+
+def unblock(n: int, recovery: int) -> bool:
+    """Return a recovered issue to the queue, stamping the recovery count.
+
+    Mirrors requeue(), including re-reading the body the unblocker may have
+    rewritten, and keeps its own counter so a re-scope by the resolver and a
+    rescue after three failed attempts cannot exhaust each other's budget.
+    """
+    rc, out = gh(["issue", "view", str(n), "--json", "body"])
+    if rc != 0:
+        return False
+    try:
+        body = json.loads(out).get("body") or ""
+    except json.JSONDecodeError:
+        return False
+    line = f"Recoveries: {recovery}"
+    if re.search(r"^\s*recoveries:\s*\d+", body, re.I | re.M):
+        body = re.sub(r"^\s*recoveries:\s*\d+", line, body, count=1, flags=re.I | re.M)
+    else:
+        body = f"{body.rstrip()}\n\n{line}\n"
+    rc, _ = gh(["issue", "edit", str(n), "--body-file", "-"], stdin=body)
+    if rc != 0:
+        return False
+    rc, _ = gh(["issue", "edit", str(n), "--add-label", "fr:ready",
+                "--remove-label", "fr:blocked,fr:claimed"])
+    return rc == 0
 
 
 def claim(n: int) -> bool:
