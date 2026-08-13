@@ -32,12 +32,27 @@
 //!   happens in this file at all.
 //! - `RequestBody`'s real (streaming) design: see its doc comment.
 //!
-//! # The one rule for [`ContextSlots`] callers
+//! # The two rules for [`ContextSlots`] callers
 //!
-//! **Never call into PHP from inside a [`ContextSlots::with_context`] /
-//! [`ContextSlots::with_context_mut`] closure.** See that type's doc comment
-//! for why: a Zend bailout `longjmp`s past Rust destructors, so a lock guard
-//! (or anything else) alive on the stack at that moment is never released.
+//! A [`ContextSlots::with_context`] / [`ContextSlots::with_context_mut`]
+//! closure runs with that one slot's lock held. So:
+//!
+//! 1. **Never call into PHP from inside one.** See that type's doc comment
+//!    for why: a Zend bailout `longjmp`s past Rust destructors, so a lock
+//!    guard (or anything else) alive on the stack at that moment is never
+//!    released.
+//! 2. **Never re-enter [`CONTEXT_SLOTS`] for the same `thread_index` from
+//!    inside one** -- not through `set`, `clear`, `with_context`,
+//!    `with_context_mut`, nor anything that calls them (a completion signal
+//!    fired by [`RequestContext::close_context`] is the shape to watch for,
+//!    since `close_context` is itself reached through `with_context_mut`).
+//!    A slot is guarded by a plain `std::sync::Mutex`, which is not
+//!    reentrant, so this deadlocks the PHP thread against itself.
+//!
+//! *Other* indices are fine, and so is growing the table from inside a
+//! closure: [`ContextSlots`] releases the table-level lock before it calls
+//! the closure specifically so that neither of those is a hazard. Rule 2 is
+//! the only re-entry that bites.
 
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -184,11 +199,32 @@ pub struct RequestBody;
 pub struct Request {
     pub method: String,
 
-    /// The request-target exactly as it appeared on the request line -- Go's
-    /// `Request.RequestURI` field, verbatim, before any parsing. Percent
-    /// escapes and a bare trailing `?` (an empty query the client still
-    /// asked for -- Go's `URL.ForceQuery`) survive here unmodified; neither
-    /// can be recovered from [`Request::path`] once it has been decoded.
+    /// The request-target in **origin form**, undecoded: Go's
+    /// `URL.RequestURI()` -- the *method* on `net/url.URL`, which is what
+    /// upstream reads (`fc.requestURI = r.URL.RequestURI()`,
+    /// `context.go:111`), and deliberately **not** `http.Request.RequestURI`,
+    /// the field that holds the request line's target verbatim. "Raw" here
+    /// means undecoded, not "exactly as it arrived on the wire".
+    ///
+    /// Go's method yields the escaped path, then `?` and the raw query
+    /// whenever there is a query *or* the client sent a bare `?`
+    /// (`URL.ForceQuery`), and `/` for an empty path. It carries **no scheme,
+    /// no authority and no fragment** -- even when the client sent an
+    /// absolute-form target, `GET http://example.com/a?b=1 HTTP/1.1`, which
+    /// RFC 9110 §7.1 allows and proxies do send. A server layer built on the
+    /// `http` crate must therefore fill this from
+    /// `uri.path_and_query().map(PathAndQuery::as_str)`, falling back to `/`
+    /// when there is none, and never from `uri` itself: `Uri`'s own string
+    /// form keeps the scheme and authority of an absolute-form target, and
+    /// this field reaches PHP as `$_SERVER['REQUEST_URI']`, where that
+    /// difference breaks every router matching on a path.
+    ///
+    /// Percent escapes and that bare trailing `?` survive here unmodified;
+    /// neither can be recovered from [`Request::path`] once it has been
+    /// decoded, which is why this is a field of its own. `path_and_query()`
+    /// preserves both (the `http` crate hands back the raw slice), so the
+    /// never-reconstruct invariant and the origin-form rule are satisfiable
+    /// at the same time.
     ///
     /// [`RequestContext::new`] copies this straight into `request_uri`: see
     /// that field's doc comment for why it must never be rebuilt from `path`
@@ -213,6 +249,24 @@ pub struct Request {
     pub query: Vec<u8>,
 
     pub headers: Headers,
+
+    /// The body length the transport parsed -- Go's
+    /// `http.Request.ContentLength`, not the `Content-Length` header. `-1`
+    /// means *unknown*, which is what a chunked body reports and what no
+    /// header value can express; `0` means "no body" (or, as in Go, unknown
+    /// for the rare request that has a body and no length).
+    ///
+    /// This is a field of its own, rather than something recovered from
+    /// [`Request::headers`], because upstream copies it straight into the
+    /// SAPI: `info.content_length = C.zend_long(request.ContentLength)`
+    /// (`cgi.go:304`). The header keeps its own two jobs, and neither is this
+    /// one: `$_SERVER['CONTENT_LENGTH']` is `request.Header.Get("Content-Length")`
+    /// (`cgi.go:92`), and so is what [`validate_request`] parses
+    /// (`context.go:157`). Do not unify the three -- upstream reads each
+    /// deliberately, and for a chunked request they legitimately disagree
+    /// (`-1` here, no header at all there).
+    pub content_length: i64,
+
     pub host: String,
     pub remote_addr: String,
     pub proto_major: u16,
@@ -238,6 +292,9 @@ impl Request {
             path: path.into(),
             query: Vec::new(),
             headers: Headers::default(),
+            // Go's zero value, and what net/http reports for a request with
+            // no body; a transport that knows better (chunked -> -1) sets it.
+            content_length: 0,
             host: String::new(),
             remote_addr: String::new(),
             proto_major: 1,
@@ -256,6 +313,14 @@ impl Request {
     /// wire owns setting this to the literal request-target bytes.
     pub fn with_raw_target(mut self, raw_target: impl Into<Vec<u8>>) -> Self {
         self.raw_target = raw_target.into();
+        self
+    }
+
+    /// See [`Request::content_length`]: the *parsed* length, `-1` for a body
+    /// of unknown length. Setting it does not add a `Content-Length` header,
+    /// and adding that header does not set this.
+    pub fn with_content_length(mut self, content_length: i64) -> Self {
+        self.content_length = content_length;
         self
     }
 
@@ -299,6 +364,123 @@ impl std::fmt::Display for RejectedRequest {
 
 impl std::error::Error for RejectedRequest {}
 
+/// Port of Go's `%q` (`strconv.Quote`) over a **byte** string, which is what
+/// `fmt.Errorf("%w: %q", ...)` (`context.go:160`) applies to the header value:
+/// a Go `string` is arbitrary bytes, and `Quote` renders the ones that are not
+/// valid UTF-8 as `\xNN` rather than losing them. `String::from_utf8_lossy`
+/// would replace each with U+FFFD, so a `Content-Length: \xff` would be
+/// reported as `"\u{fffd}"` and the offending byte would be unrecoverable
+/// from the message.
+///
+/// Follows `strconv.Quote` (`strconv/quote.go`, `appendQuotedWith` /
+/// `appendEscapedRune`): an invalid UTF-8 sequence emits its *first* byte as
+/// `\xNN` and advances one byte (Go's `utf8.DecodeRuneInString` returns width
+/// 1 for any invalid encoding, so a truncated 3-byte sequence yields two
+/// escapes, not one replacement character); `"` and `\` are always
+/// backslashed; printable ASCII is literal; `\a \b \f \n \r \t \v` win over
+/// the hex form; other bytes below 0x20 and 0x7f are `\xNN`; a non-printable
+/// rune is `\uXXXX` below 0x10000 and `\UXXXXXXXX` above -- lower-case hex
+/// throughout.
+///
+/// # Where this is not byte-exact, and why that is the floor
+///
+/// Differential-tested against `fmt.Sprintf("%q", string(b))` on go1.26 over
+/// 60,512 byte strings: **0 mismatches across the 42,597 of them built only
+/// from ASCII runes and invalid UTF-8 bytes** -- which is the entire space a
+/// `Content-Length` header inhabits, and the space this function exists for.
+/// Every one of the 685 mismatches needs a *valid non-ASCII* rune, and they
+/// come from the printability oracle for exactly those:
+///
+/// - Go's `strconv.IsPrint` is "Unicode categories L, M, N, P, S, plus ASCII
+///   space". The closest oracle reachable without shipping a Unicode table of
+///   our own is `char::escape_debug`, which agrees except that it also
+///   escapes grapheme-extended characters -- so a combining mark renders as
+///   `\u0301` where Go prints the mark itself (319 cases).
+/// - The two tables are generated from different Unicode versions: go1.26
+///   ships 15.0.0, so it escapes any scalar assigned after it (CJK Ext I and
+///   J, for instance) as unassigned-hence-unprintable, while a newer rustc
+///   prints it (366 cases). That one is not fixable by us in any stable
+///   sense; it moves whenever either toolchain updates.
+///
+/// Both are confined to a diagnostic string for a request that is already a
+/// 400, and neither can lose information the way the lossy conversion this
+/// replaced did: the bytes are still recoverable from the message.
+fn go_quote(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('"');
+
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let valid_up_to = match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                for c in valid.chars() {
+                    quote_rune(&mut out, c);
+                }
+                break;
+            }
+            Err(e) => e.valid_up_to(),
+        };
+
+        let (valid, invalid) = rest.split_at(valid_up_to);
+        for c in std::str::from_utf8(valid)
+            .expect("bytes below valid_up_to are valid UTF-8 by definition")
+            .chars()
+        {
+            quote_rune(&mut out, c);
+        }
+        out.push_str(&format!("\\x{:02x}", invalid[0]));
+        rest = &invalid[1..];
+    }
+
+    out.push('"');
+    out
+}
+
+/// One rune of [`go_quote`]: Go's `appendEscapedRune` with `quote == '"'` and
+/// neither `ASCIIonly` nor `graphicOnly` set, which is what `%q` on a string
+/// uses.
+fn quote_rune(out: &mut String, c: char) {
+    if c == '"' || c == '\\' {
+        out.push('\\');
+        out.push(c);
+        return;
+    }
+
+    let printable = if c.is_ascii() {
+        // Go: `r < utf8.RuneSelf && IsPrint(r)`, and IsPrint over ASCII is
+        // exactly 0x20..=0x7e.
+        (' '..='~').contains(&c)
+    } else {
+        // See go_quote's doc comment for how far this tracks Go's IsPrint.
+        let mut escaped = c.escape_debug();
+        escaped.next() == Some(c) && escaped.next().is_none()
+    };
+    if printable {
+        out.push(c);
+        return;
+    }
+
+    match c {
+        '\u{7}' => out.push_str("\\a"),
+        '\u{8}' => out.push_str("\\b"),
+        '\u{c}' => out.push_str("\\f"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{b}' => out.push_str("\\v"),
+        _ => {
+            let code = c as u32;
+            if code < 0x20 || code == 0x7f {
+                out.push_str(&format!("\\x{code:02x}"));
+            } else if code < 0x1_0000 {
+                out.push_str(&format!("\\u{code:04x}"));
+            } else {
+                out.push_str(&format!("\\U{code:08x}"));
+            }
+        }
+    }
+}
+
 /// Port of `fc.validate()` (`context.go:150-168`) -- the decision only, not
 /// `reject()`'s response-writing side effect.
 pub fn validate_request(request: &Request) -> Result<(), RejectedRequest> {
@@ -323,9 +505,12 @@ pub fn validate_request(request: &Request) -> Result<(), RejectedRequest> {
                 _ => {
                     return Err(RejectedRequest {
                         status: 400,
+                        // `fmt.Errorf("%w: %q", ...)` over the raw header
+                        // bytes (context.go:160) -- see go_quote for why not
+                        // `{:?}` over a lossy String.
                         message: format!(
-                            "invalid Content-Length header: {:?}",
-                            String::from_utf8_lossy(content_length)
+                            "invalid Content-Length header: {}",
+                            go_quote(content_length)
                         ),
                     });
                 }
@@ -366,8 +551,12 @@ pub fn validate_request(request: &Request) -> Result<(), RejectedRequest> {
 ///
 /// It runs on the PHP thread, inside [`RequestContext::close_context`], with
 /// the request's context-slot lock held by whoever called it (see
-/// [`ContextSlots`]) -- so it must not block, must not call into PHP, and
-/// must not panic. Waking a oneshot receiver satisfies all three.
+/// [`ContextSlots`]) -- so it must not block, must not call into PHP, must
+/// not panic, and must not touch [`CONTEXT_SLOTS`] for its own
+/// `thread_index` (that is [`ContextSlots`]'s rule 2, and this closure is the
+/// likeliest place to break it: clearing the slot from here would deadlock
+/// against the very lock that reached `close_context`). Waking a oneshot
+/// receiver satisfies all four.
 #[derive(Default)]
 pub struct CompletionSignal(Option<Box<dyn FnOnce() + Send>>);
 
@@ -410,16 +599,17 @@ impl std::fmt::Debug for CompletionSignal {
 /// boundary for as long as the request lives, which is exactly what this
 /// arena is for.
 ///
-/// Buffers are `Arc<[u8]>` rather than `Box<[u8]>` for the same address
-/// stability either would give (a `Vec` growing moves the handle, never the
-/// heap bytes behind it), plus one extra thing a `Box` cannot: this module's
-/// own tests prove the release-on-drop half of the contract with
-/// `Arc::downgrade` / `Weak::upgrade`, rather than relying on unobservable
-/// deallocation. The extra atomic refcount bump is once per `alloc` call (a
-/// handful per request), not a hot loop.
+/// Buffers are one `Box<[u8]>` per `alloc` call, never a single growing
+/// `Vec<u8>` handing out interior slices: address stability is this type's
+/// defining property, and a bump arena's first reallocation would dangle
+/// every pointer C already holds. A `Vec` of `Box`es moves the *handles* when
+/// it grows and never the bytes behind them. `Box` rather than a shared
+/// handle (`Arc`, `Rc`) for a second reason, spelled out in `alloc`'s SAFETY
+/// comment: only a uniquely-owned buffer can hand out a pointer that C is
+/// allowed to write through, and `sapi_request_info`'s fields are `char *`.
 #[derive(Default)]
 pub struct RequestArena {
-    buffers: Vec<Arc<[u8]>>,
+    buffers: Vec<Box<[u8]>>,
 }
 
 impl RequestArena {
@@ -432,28 +622,48 @@ impl RequestArena {
     /// same as it would for any other embedded-NUL C string this port hands
     /// across the FFI boundary.
     ///
-    /// SAFETY (for callers that go on to dereference the returned pointer):
-    /// the pointer is valid for exactly as long as this `RequestArena` (and
-    /// so the `RequestContext` that owns it) is alive. Each call pushes a
-    /// new, independent `Arc<[u8]>` into `self.buffers`; that `Arc` owns one
-    /// heap allocation holding its refcounts and byte data together, separate
-    /// from the `Vec`'s own backing storage. Growing `self.buffers` (a `Vec`
-    /// of 16-byte fat pointers -- address plus length) reallocates and moves
-    /// *those* handles around, but never the allocation any one of them
-    /// points to, and that allocation is not freed while the `Arc` in
-    /// `self.buffers` keeps it alive. So a pointer returned by an earlier
-    /// call stays valid across later ones, and for the rest of the request
-    /// after that. It stops being valid the moment this arena drops -- see
-    /// [`RequestContext::close_context`] for why that is not the same moment
-    /// as the request being marked done.
+    /// SAFETY (for callers that go on to dereference the returned pointer),
+    /// in two halves -- *lifetime* and *provenance*:
+    ///
+    /// **Lifetime.** The pointer is valid for exactly as long as this
+    /// `RequestArena` (and so the `RequestContext` that owns it) is alive.
+    /// Each call pushes a new, independent `Box<[u8]>` into `self.buffers`;
+    /// that `Box` owns one heap allocation, separate from the `Vec`'s own
+    /// backing storage. Growing `self.buffers` (a `Vec` of 16-byte fat
+    /// pointers -- address plus length) reallocates and moves *those* handles
+    /// around, but never the allocation any one of them points to, and that
+    /// allocation is not freed while its `Box` stays in `self.buffers`. So a
+    /// pointer returned by an earlier call stays valid across later ones, and
+    /// for the rest of the request after that. It stops being valid the
+    /// moment this arena drops -- see [`RequestContext::close_context`] for
+    /// why that is not the same moment as the request being marked done.
+    ///
+    /// **Provenance.** The pointer is derived from `&mut **last_mut()`, a
+    /// unique borrow of the buffer's own allocation, so it is valid for
+    /// **writes** as well as reads. That is not a detail: every field this
+    /// feeds is declared `char *`, not `const char *`, in `sapi_request_info`
+    /// (`frankenphp.c:367-372` NULLs `request_method`, `query_string`,
+    /// `content_type`, `path_translated` and `request_uri`), so the C
+    /// signature we hand it to promises a writable buffer. Deriving the
+    /// pointer from a shared reference instead -- `Arc::as_ptr`, or any
+    /// `&[u8] as *mut` -- keeps the address and silently loses the
+    /// permission: the cast compiles, and the first write through it is UB
+    /// (Miri: "only grants SharedReadOnly permission for this location").
+    /// The `&mut` is also taken *after* the push, from the buffer in its
+    /// final home, because moving the `Box` into the `Vec` afterwards would
+    /// invalidate a pointer derived before the move. No second pointer into
+    /// the allocation is ever handed out, so C's writes alias nothing of
+    /// ours.
     pub fn alloc(&mut self, bytes: &[u8]) -> *mut c_char {
         let mut buf = Vec::with_capacity(bytes.len() + 1);
         buf.extend_from_slice(bytes);
         buf.push(0);
-        let arc: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
-        let ptr = arc.as_ptr() as *mut c_char;
-        self.buffers.push(arc);
-        ptr
+        self.buffers.push(buf.into_boxed_slice());
+        self.buffers
+            .last_mut()
+            .expect("just pushed")
+            .as_mut_ptr()
+            .cast::<c_char>()
     }
 }
 
@@ -582,9 +792,12 @@ impl RequestContext {
 /// grows once per newly-seen `thread_index`); each thread's own `Mutex`
 /// guards its slot for the hot path (set/get/clear on every request), so
 /// unrelated PHP threads never contend with each other the way one global
-/// lock over the whole table would make them.
+/// lock over the whole table would make them. Each slot is behind its own
+/// `Arc` so that every accessor can *clone the slot out and drop the
+/// table-level guard* before it does anything else -- see
+/// [`ContextSlots::slot`].
 ///
-/// # The one rule for callers
+/// # Rule 1: never call into PHP from a closure
 ///
 /// **Never call into PHP from inside a [`ContextSlots::with_context`] /
 /// [`ContextSlots::with_context_mut`] closure.** Copy out what you need,
@@ -616,8 +829,30 @@ impl RequestContext {
 /// from a frame still on the stack. That is a constraint on the callbacks
 /// that use this table, not on the table itself; it is recorded here because
 /// this is where a reviewer will look for it.
+///
+/// # Rule 2: never re-enter this table for the *same* index from a closure
+///
+/// Rule 1 grants a reader licence to do any PHP-free work inside the closure,
+/// and touching this table again is PHP-free. For the *same* `thread_index`
+/// it is nonetheless a self-deadlock: the slot is a plain
+/// `std::sync::Mutex`, which is not reentrant, so `set`, `clear`,
+/// `with_context`, `with_context_mut` -- or anything reaching them, a
+/// completion signal fired from [`RequestContext::close_context`] most
+/// plausibly -- wedge the PHP thread against a lock it is holding itself.
+/// That is the same outcome rule 1 exists to prevent: the request is never
+/// answered.
+///
+/// Re-entering for a *different* index, and growing the table from inside a
+/// closure, are both fine, and deliberately so: [`ContextSlots::slot`] clones
+/// the slot's `Arc` out and drops the table-level `RwLock` guard before the
+/// closure ever runs. Without that, a closure calling `set` on a not-yet-seen
+/// index would block on the write lock while its caller still held a read
+/// lock, and a nested read would deadlock against any writer already queued
+/// (std's `RwLock` is write-preferring). Only the one slot's `Mutex` is held
+/// across the closure, which is the lock that has to be held for the borrow
+/// handed to the closure to mean anything.
 pub struct ContextSlots {
-    slots: RwLock<Vec<Mutex<Option<RequestContext>>>>,
+    slots: RwLock<Vec<Arc<Mutex<Option<RequestContext>>>>>,
 }
 
 /// Read through these two helpers rather than `.unwrap()`, deliberately.
@@ -645,6 +880,11 @@ fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn recover_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl ContextSlots {
     pub const fn new() -> Self {
         Self {
@@ -652,61 +892,69 @@ impl ContextSlots {
         }
     }
 
-    fn ensure_len(&self, thread_index: usize) {
-        let needed = thread_index + 1;
-        if recover_read(&self.slots).len() >= needed {
-            return;
+    /// `thread_index`'s slot, growing the table if this index has not been
+    /// seen before.
+    ///
+    /// Every accessor goes through here, and every one of them holds **no
+    /// table-level guard** by the time it locks the slot: this returns an
+    /// owned `Arc`, and both the read guard on the fast path and the write
+    /// guard on the growth path die inside this function. That is what makes
+    /// rule 2 apply only to the same index -- growing the table, or reaching
+    /// another slot, from inside a `with_context*` closure would otherwise
+    /// deadlock on the `RwLock` (see this type's doc comment).
+    fn slot(&self, thread_index: usize) -> Arc<Mutex<Option<RequestContext>>> {
+        // Bound as its own statement so the read guard is released here, not
+        // at the end of an enclosing `if let`: the write lock below would
+        // otherwise be taken while this thread still held a read lock.
+        let existing = recover_read(&self.slots).get(thread_index).map(Arc::clone);
+        if let Some(slot) = existing {
+            return slot;
         }
-        let mut slots = self
-            .slots
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while slots.len() < needed {
-            slots.push(Mutex::new(None));
+
+        let mut slots = recover_write(&self.slots);
+        while slots.len() <= thread_index {
+            slots.push(Arc::new(Mutex::new(None)));
         }
+        Arc::clone(&slots[thread_index])
     }
 
     /// Installs `ctx` as `thread_index`'s context, dropping (and so
     /// releasing the arena of) whatever context previously occupied the
     /// slot, if any.
     pub fn set(&self, thread_index: usize, ctx: RequestContext) {
-        self.ensure_len(thread_index);
-        let slots = recover_read(&self.slots);
-        *recover_lock(&slots[thread_index]) = Some(ctx);
+        let slot = self.slot(thread_index);
+        *recover_lock(&slot) = Some(ctx);
     }
 
     /// Drops `thread_index`'s context, if any -- releasing its arena.
     pub fn clear(&self, thread_index: usize) {
-        self.ensure_len(thread_index);
-        let slots = recover_read(&self.slots);
-        *recover_lock(&slots[thread_index]) = None;
+        let slot = self.slot(thread_index);
+        *recover_lock(&slot) = None;
     }
 
     /// Runs `f` with `thread_index`'s context, holding that slot's lock for
-    /// the duration. `f` must not call into PHP -- see this type's "one rule
-    /// for callers".
+    /// the duration. `f` must not call into PHP, and must not re-enter this
+    /// table for `thread_index` -- see this type's two rules for callers.
     pub fn with_context<R>(
         &self,
         thread_index: usize,
         f: impl FnOnce(Option<&RequestContext>) -> R,
     ) -> R {
-        self.ensure_len(thread_index);
-        let slots = recover_read(&self.slots);
-        let guard = recover_lock(&slots[thread_index]);
+        let slot = self.slot(thread_index);
+        let guard = recover_lock(&slot);
         f(guard.as_ref())
     }
 
     /// Mutable counterpart of [`ContextSlots::with_context`], needed by
-    /// anything that pushes into the context's arena. The same rule applies:
-    /// `f` must not call into PHP.
+    /// anything that pushes into the context's arena. The same two rules
+    /// apply.
     pub fn with_context_mut<R>(
         &self,
         thread_index: usize,
         f: impl FnOnce(Option<&mut RequestContext>) -> R,
     ) -> R {
-        self.ensure_len(thread_index);
-        let slots = recover_read(&self.slots);
-        let mut guard = recover_lock(&slots[thread_index]);
+        let slot = self.slot(thread_index);
+        let mut guard = recover_lock(&slot);
         f(guard.as_mut())
     }
 }
@@ -727,6 +975,33 @@ mod tests {
 
     fn test_context(request: Option<Request>) -> RequestContext {
         RequestContext::new(String::new(), Vec::new(), request, CompletionSignal::none())
+    }
+
+    /// Runs `body` on a scratch thread and fails the test if it has not
+    /// finished within ten seconds.
+    ///
+    /// The callers below are deadlock regression tests, and a deadlock is not
+    /// a test failure by default -- it is a `cargo test` that never returns,
+    /// which in the gate reads as a hung machine rather than as a red test.
+    /// This turns one into the other.
+    fn run_or_fail_on_deadlock(what: &str, body: impl FnOnce() + Send + 'static) {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            body();
+            let _ = done_tx.send(());
+        });
+
+        match done_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            // Disconnected without a send means `body` panicked; join re-raises it.
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                worker.join().expect("watched thread must not panic");
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("{what}: still running after 10s -- deadlocked")
+            }
+        }
     }
 
     #[test]
@@ -803,6 +1078,66 @@ mod tests {
     }
 
     #[test]
+    fn go_quote_matches_gos_percent_q_over_byte_strings() {
+        // Go: fmt.Sprintf("%q", s) == strconv.Quote(s), over a *byte* string.
+        for (raw, want) in [
+            (b"".as_slice(), r#""""#),
+            (b"5".as_slice(), r#""5""#),
+            (b"a b".as_slice(), r#""a b""#),
+            // Not valid UTF-8: the byte survives as \xNN rather than being
+            // replaced by U+FFFD.
+            (b"\xff".as_slice(), r#""\xff""#),
+            (b"\x80\xfe".as_slice(), r#""\x80\xfe""#),
+            // A truncated 3-byte sequence: Go's DecodeRuneInString reports
+            // width 1 for any invalid encoding, so this is two escapes, not
+            // one replacement character.
+            (b"\xe4\xb8".as_slice(), r#""\xe4\xb8""#),
+            (b"1\x002".as_slice(), r#""1\x002""#),
+            (b"a\tb\nc\r".as_slice(), r#""a\tb\nc\r""#),
+            (b"\x07\x08\x0c\x0b".as_slice(), r#""\a\b\f\v""#),
+            (b"\x1b".as_slice(), r#""\x1b""#),
+            (b"\x7f".as_slice(), r#""\x7f""#),
+            (b"say \"hi\"\\".as_slice(), r#""say \"hi\"\\""#),
+            // Printable non-ASCII stays literal, as Go's IsPrint has it:
+            // Nd, Ll and So respectively.
+            ("\u{663}".as_bytes(), "\"\u{663}\""),
+            ("\u{e9}".as_bytes(), "\"\u{e9}\""),
+            ("\u{1f600}".as_bytes(), "\"\u{1f600}\""),
+            // Non-printable: \u with four hex digits below 0x10000 (U+0080,
+            // Cc), \U with eight above it (U+E0001, Cf).
+            ("\u{80}".as_bytes(), r#""\u0080""#),
+            ("\u{e0001}".as_bytes(), r#""\U000e0001""#),
+            // The documented divergence, pinned rather than hidden: Go counts
+            // category M printable and emits a combining mark literally, while
+            // char::escape_debug escapes grapheme-extended characters. See
+            // go_quote's doc comment for the measured extent of this.
+            ("\u{301}".as_bytes(), r#""\u0301""#),
+        ] {
+            assert_eq!(go_quote(raw), want, "go_quote({raw:?})");
+        }
+    }
+
+    #[test]
+    fn invalid_content_length_message_keeps_non_utf8_bytes() {
+        // Upstream builds this with fmt.Errorf("%w: %q", ...) over the raw
+        // header value (context.go:160), so a byte that is not valid UTF-8
+        // reaches the client as \xff -- not as the U+FFFD a lossy conversion
+        // would substitute, which destroys the one piece of information the
+        // message exists to carry.
+        let request = Request::new("POST", b"/".to_vec()).with_header("Content-Length", vec![0xff]);
+        let err = validate_request(&request).unwrap_err();
+        assert_eq!(err.status, 400);
+        assert_eq!(err.message, r#"invalid Content-Length header: "\xff""#);
+
+        let ascii =
+            Request::new("POST", b"/".to_vec()).with_header("Content-Length", b"abc".to_vec());
+        assert_eq!(
+            validate_request(&ascii).unwrap_err().message,
+            r#"invalid Content-Length header: "abc""#
+        );
+    }
+
+    #[test]
     fn validate_accepts_duplicate_valid_content_length_headers() {
         // Header.Get reads "5", the first value -- joining the two into "5, 5"
         // would fail to parse and turn a request upstream accepts into a 400.
@@ -819,6 +1154,36 @@ mod tests {
             &Request::new("POST", b"/".to_vec()).with_header("Content-Length", b"42".to_vec())
         )
         .is_ok());
+    }
+
+    #[test]
+    fn content_length_is_the_parsed_length_not_the_header() {
+        // A chunked body: Go's transport reports -1, which upstream copies
+        // verbatim into sapi_request_info (cgi.go:304) and which no
+        // Content-Length header value can express. Recovering it from
+        // `headers` is therefore impossible -- hence the separate field.
+        let chunked = Request::new("POST", b"/".to_vec())
+            .with_header("Transfer-Encoding", b"chunked".to_vec())
+            .with_content_length(-1);
+        assert_eq!(chunked.content_length, -1);
+        assert_eq!(chunked.headers.get_first("Content-Length"), None);
+        assert!(
+            validate_request(&chunked).is_ok(),
+            "validate() reads the header (context.go:157), and there is none \
+             to reject -- it must not reject the parsed -1 as negative"
+        );
+
+        // The two are independent in the other direction too: upstream reads
+        // the header for $_SERVER['CONTENT_LENGTH'] (cgi.go:92) and the parsed
+        // value for the SAPI, and nothing derives one from the other.
+        let sized =
+            Request::new("POST", b"/".to_vec()).with_header("Content-Length", b"5".to_vec());
+        assert_eq!(sized.content_length, 0);
+        assert_eq!(
+            sized.with_content_length(5).content_length,
+            5,
+            "whoever builds the Request fills both in"
+        );
     }
 
     #[test]
@@ -874,6 +1239,44 @@ mod tests {
         // `Arc` handles, never the heap bytes they point at.
         let bytes = unsafe { std::ffi::CStr::from_ptr(first) };
         assert_eq!(bytes.to_bytes(), b"hello");
+    }
+
+    #[test]
+    fn arena_pointers_are_writable_not_just_readable() {
+        let mut arena = RequestArena::default();
+        let first = arena.alloc(b"hello");
+
+        // The five `sapi_request_info` fields these pointers feed are `char *`,
+        // not `const char *`, so C is entitled to write through them. This is
+        // the probe that catches a pointer carrying read-only provenance --
+        // `Arc::as_ptr() as *mut c_char`, say, which keeps the address and
+        // loses the permission. Such a write is UB rather than a crash, so it
+        // passes under rustc and fails under Miri; this test exists to be run
+        // by `cargo +nightly miri test -p frankenrust-core`.
+        //
+        // SAFETY: `first` points at a live, uniquely-owned 6-byte buffer of
+        // `arena`'s ("hello" plus alloc's trailing NUL). No other pointer into
+        // it exists, and `arena` outlives every write below.
+        unsafe { first.write(b'H' as c_char) };
+
+        // Force the arena's own Vec<Box<[u8]>> spine to reallocate, repeatedly.
+        for i in 0..2_000 {
+            arena.alloc(format!("entry-{i}").as_bytes());
+        }
+
+        // SAFETY: as above, plus alloc's documented guarantee that growing the
+        // spine moves the `Box` handles and never the bytes behind them, so
+        // `first` still points at the same live buffer. Offset 4 is its last
+        // non-NUL byte.
+        unsafe { first.add(4).write(b'O' as c_char) };
+
+        // SAFETY: same buffer, still NUL-terminated at offset 5.
+        let round_tripped = unsafe { std::ffi::CStr::from_ptr(first) };
+        assert_eq!(
+            round_tripped.to_bytes(),
+            b"HellO",
+            "both writes must have landed in the same still-valid buffer"
+        );
     }
 
     #[test]
@@ -950,26 +1353,38 @@ mod tests {
 
     #[test]
     fn drop_releases_arena_but_is_done_does_not() {
-        let mut ctx = test_context(Some(Request::new("GET", b"/".to_vec())));
-        ctx.arena.alloc(b"hello");
-        let weak = Arc::downgrade(&ctx.arena.buffers[0]);
-        assert!(
-            weak.upgrade().is_some(),
-            "sanity: buffer alive right after alloc"
-        );
+        let request = Request::new("GET", b"/".to_vec());
+        // A live `Weak` here means the `RequestContext` itself is still
+        // alive: it owns `request`, which owns this `Arc`. The arena is a
+        // plain owned field of the same struct, so the two are released at
+        // exactly the same moment -- which is the property this test is
+        // about, the arena's *reclaim point*, not whether `Box` frees.
+        let context_alive = Arc::downgrade(&request.cancelled);
+        let mut ctx = test_context(Some(request));
+        let buffer = ctx.arena.alloc(b"hello");
 
         ctx.close_context();
         assert!(ctx.is_done);
         assert!(
-            weak.upgrade().is_some(),
+            context_alive.upgrade().is_some(),
+            "marking is_done must not drop the context"
+        );
+        // SAFETY: `ctx` still owns the arena `buffer` came from, and
+        // close_context documents that it does not touch the arena; nothing
+        // has freed it, so this reads back the bytes alloc copied in.
+        let still_there = unsafe { std::ffi::CStr::from_ptr(buffer) };
+        assert_eq!(
+            still_there.to_bytes(),
+            b"hello",
             "marking is_done must not release the arena -- a worker script keeps \
              writing after fastcgi_finish_request()"
         );
 
         drop(ctx);
         assert!(
-            weak.upgrade().is_none(),
-            "dropping the RequestContext must release its arena"
+            context_alive.upgrade().is_none(),
+            "dropping the RequestContext must release everything it owns, its \
+             arena included"
         );
     }
 
@@ -995,15 +1410,29 @@ mod tests {
     #[test]
     fn context_slots_set_replaces_and_drops_previous() {
         let slots = ContextSlots::new();
-        let mut first = test_context(None);
+        let request = Request::new("GET", b"/".to_vec());
+        // As in drop_releases_arena_but_is_done_does_not: this Weak tracks the
+        // whole context, arena included.
+        let first_alive = Arc::downgrade(&request.cancelled);
+        let mut first = test_context(Some(request));
         first.arena.alloc(b"first");
-        let weak = Arc::downgrade(&first.arena.buffers[0]);
         slots.set(2, first);
+        assert!(first_alive.upgrade().is_some(), "sanity: still in the slot");
 
         slots.set(2, test_context(None));
         assert!(
-            weak.upgrade().is_none(),
+            first_alive.upgrade().is_none(),
             "set() must drop (and so release the arena of) the previous context"
+        );
+
+        slots.clear(2);
+        let request = Request::new("GET", b"/".to_vec());
+        let second_alive = Arc::downgrade(&request.cancelled);
+        slots.set(2, test_context(Some(request)));
+        slots.clear(2);
+        assert!(
+            second_alive.upgrade().is_none(),
+            "clear() must drop (and so release the arena of) the context too"
         );
     }
 
@@ -1023,6 +1452,64 @@ mod tests {
         slots.set(3, test_context(None));
         slots.clear(3);
         assert!(slots.with_context(3, |ctx| ctx.is_none()));
+    }
+
+    #[test]
+    fn a_closure_may_reach_another_slot_and_may_grow_the_table() {
+        // Rule 2 forbids re-entering the table for the *same* thread_index.
+        // Everything else must work: the accessors drop the table-level lock
+        // before calling the closure precisely so that a PHP-free closure --
+        // which the type's rule 1 explicitly permits -- cannot wedge itself.
+        let slots = Arc::new(ContextSlots::new());
+        slots.set(0, test_context(None));
+        slots.set(1, test_context(None));
+
+        let slots = Arc::clone(&slots);
+        run_or_fail_on_deadlock("nested access from a with_context closure", move || {
+            // Another index, while index 0's slot lock is held.
+            slots.with_context(0, |ctx| {
+                assert!(ctx.is_some());
+                assert!(slots.with_context(1, |other| other.is_some()));
+            });
+
+            // Growth from inside a closure: `set` on a never-seen index needs
+            // the table's write lock, which a read guard held across the
+            // closure would block against forever.
+            slots.with_context_mut(0, |ctx| {
+                ctx.expect("slot 0 was set").arena.alloc(b"x");
+                slots.set(4096, test_context(None));
+            });
+            assert!(slots.with_context(4096, |ctx| ctx.is_some()));
+        });
+    }
+
+    #[test]
+    fn a_nested_read_is_not_blocked_by_a_queued_writer() {
+        let slots = Arc::new(ContextSlots::new());
+        slots.set(0, test_context(None));
+        slots.set(1, test_context(None));
+
+        let slots = Arc::clone(&slots);
+        run_or_fail_on_deadlock("nested read with a writer queued", move || {
+            slots.with_context(0, |ctx| {
+                assert!(ctx.is_some());
+
+                // A writer racing to grow the table. std's RwLock is
+                // write-preferring, so were this closure running under a read
+                // guard, this writer would queue behind it and the nested read
+                // below would queue behind the writer: a three-way wedge with
+                // nobody breaking any documented rule.
+                let grower = {
+                    let slots = Arc::clone(&slots);
+                    std::thread::spawn(move || slots.set(8192, test_context(None)))
+                };
+                std::thread::sleep(std::time::Duration::from_millis(50));
+
+                assert!(slots.with_context(1, |other| other.is_some()));
+                grower.join().expect("growing thread must not panic");
+            });
+            assert!(slots.with_context(8192, |ctx| ctx.is_some()));
+        });
     }
 
     #[test]
