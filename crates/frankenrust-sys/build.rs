@@ -304,6 +304,10 @@ fn main() {
         // list as they need more of frankenphp.h's / types.h's surface.
         .allowlist_function("frankenphp_get_version")
         .allowlist_function("frankenphp_get_config")
+        .allowlist_function("frankenphp_register_server_vars")
+        .allowlist_function("frankenphp_register_known_variable")
+        .allowlist_function("frankenphp_register_variable_safe")
+        .allowlist_function("frankenphp_init_persistent_string")
         // The two real thread entry points (frankenphp.h:190-191): not called by
         // this issue's abort-stubs, but tests/version.rs takes their address (never
         // calls them) so the linker's --gc-sections can see a live reference into
