@@ -1093,6 +1093,40 @@ mod tests {
         );
     }
 
+    /// The `$_SERVER` batch follows the arena's rule, and for the same
+    /// reason: `shim.c` is still reading it while the script runs, and
+    /// `go_frankenphp_finish_php_request` (`threadworker.go:328-336`) calls
+    /// `closeContext()` without clearing the slot.
+    #[test]
+    fn is_done_does_not_release_the_server_vars_batch_but_drop_does() {
+        let mut request = Request::new("GET", "/index.php", "");
+        request.host = "example.com".to_string();
+        let mut ctx = test_context(Some(request));
+
+        assert!(
+            ctx.server_vars.is_none(),
+            "sanity: nothing installed before the first collection"
+        );
+        let batch = crate::cgi::build_server_vars_batch(&ctx).expect("the context has a request");
+        ctx.install_server_vars(batch);
+        assert!(ctx.server_vars.is_some());
+
+        ctx.close_context();
+        assert!(ctx.is_done);
+        assert!(
+            ctx.server_vars.is_some(),
+            "marking is_done must not release the batch: the C side may still be \
+             mid-registration, and the script keeps running after \
+             fastcgi_finish_request()"
+        );
+
+        // The release itself is ownership, not a code path: `server_vars` is a
+        // field, so dropping the context drops it. What is worth pinning is
+        // that nothing *else* drops it first, which is what the two assertions
+        // above check.
+        drop(ctx);
+    }
+
     /// The reviewed defect this pins down: `RequestBody` was a fieldless
     /// placeholder, so a body could not be attached to a request at all. #12
     /// owns `go_read_post` and is explicitly forbidden from editing this
