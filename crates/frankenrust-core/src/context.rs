@@ -902,6 +902,33 @@ mod tests {
     }
 
     #[test]
+    fn close_context_snapshots_client_has_closed_into_client_had_closed() {
+        let request = Request::new("GET", b"/index.php".to_vec());
+        let cancelled = Arc::clone(&request.cancelled);
+        let mut ctx = test_context(Some(request));
+
+        assert!(!ctx.client_has_closed());
+        ctx.close_context();
+        assert!(
+            !ctx.client_had_closed,
+            "sanity: an untouched cancellation flag must not read as closed"
+        );
+
+        // A second request context, cancelled before close_context runs --
+        // client_had_closed must capture that snapshot.
+        let request = Request::new("GET", b"/index.php".to_vec());
+        let cancelled_before_close = Arc::clone(&request.cancelled);
+        cancelled_before_close.store(true, Ordering::SeqCst);
+        let mut cancelled_ctx = test_context(Some(request));
+        assert!(cancelled_ctx.client_has_closed());
+        cancelled_ctx.close_context();
+        assert!(cancelled_ctx.client_had_closed);
+
+        // cancelled is only read, never written, by this module.
+        assert!(!cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn a_completion_signal_may_consume_what_it_captures() {
         // The documented async end is `oneshot::Sender::send(self, ..)`,
         // which consumes the sender. This only type-checks if the signal is
