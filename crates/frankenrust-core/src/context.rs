@@ -19,7 +19,7 @@
 use std::io::Read;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// `request.TLS == nil` vs. non-nil (`cgi.go:54-70`) collapsed into an enum:
 /// TLS itself is out of scope for this port (`docs/PORTING-NOTES.md`), so
@@ -107,6 +107,77 @@ impl std::fmt::Debug for RequestBody {
         // A body is a stream: reading it to print it would consume it.
         f.debug_struct("RequestBody")
             .field("present", &self.reader.is_some())
+            .finish()
+    }
+}
+
+/// Port of `fc.done` (`context.go:52`) -- the `chan any` that `closeContext`
+/// closes (`context.go:145`) and the waiting HTTP handler receives from
+/// (`threadregular.go:148`, `:169`; `worker.go:230`, `:255`). Exactly one
+/// waiter per request, released exactly once.
+///
+/// # Why a callback rather than a channel end
+///
+/// Closing a Go channel is awaitable from a goroutine for free. Here the two
+/// ends sit on opposite sides of the async<->pthread boundary and pull in
+/// opposite directions:
+///
+/// - The *waiting* end is a tokio task in `frankenrust-server`, and
+///   `docs/PORTING-NOTES.md:141-145` / `docs/ARCHITECTURE.md:182-183` fix its
+///   shape: it `await`s a oneshot receiver. A `std::sync::mpsc::Sender` cannot
+///   serve that end, because its `Receiver` is not a `Future` -- the handler
+///   would have to park a runtime thread inside `recv()` for the whole script
+///   run, and enough concurrent requests would then starve the very tasks
+///   feeding the request body.
+/// - The *firing* end is this PHP pthread, and `frankenrust-core` may not
+///   reach for `tokio::sync::oneshot` to satisfy the waiter: this crate is the
+///   PHP side (`docs/ARCHITECTURE.md:80-91`), and `docs/PORTING-NOTES.md:123`
+///   is explicit that the PHP side does not use tokio channels.
+///
+/// So the signal is supplied by whoever built the request, exactly as
+/// [`RequestBody`] is: `frankenrust-server` wraps a
+/// `tokio::sync::oneshot::Sender` (whose `send` consumes the sender, never
+/// blocks and is callable from any thread), and tests here use
+/// [`CompletionSignal::none`].
+///
+/// # What the closure may do
+///
+/// It runs on the PHP thread inside [`RequestContext::close_context`], with
+/// the context slot's lock held by whoever called it, so it must not block,
+/// must not call into PHP, and must not panic -- a panic here would unwind
+/// out of an `extern "C"` callback and abort the process. Waking a oneshot
+/// receiver satisfies all three; anything that waits for the async side to
+/// *act* does not.
+#[derive(Default)]
+pub struct CompletionSignal(Option<Box<dyn FnOnce() + Send>>);
+
+impl CompletionSignal {
+    /// The signal `frankenrust-server` builds around its oneshot sender.
+    pub fn new(signal: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(signal)))
+    }
+
+    /// No waiter at all -- for a context nobody is awaiting (tests, and the
+    /// bodyless probe requests #10's thread lifecycle installs).
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// `close(fc.done)`: fires at most once, however often it is called.
+    /// `close_context` is already idempotent through `is_done`; this is the
+    /// belt to that pair of braces, and it is what lets the closure be
+    /// `FnOnce` (and so hold a consuming `oneshot::Sender`).
+    fn fire(&mut self) {
+        if let Some(signal) = self.0.take() {
+            signal();
+        }
+    }
+}
+
+impl std::fmt::Debug for CompletionSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CompletionSignal")
+            .field(&if self.0.is_some() { "pending" } else { "fired" })
             .finish()
     }
 }
@@ -274,7 +345,17 @@ pub struct Request {
     /// *escaped*. One field cannot serve both: `/index.php%2Fextra` must
     /// split as the decoded `/index.php/extra` while `$_SERVER['REQUEST_URI']`
     /// shows the escaped form.
-    pub path: String,
+    ///
+    /// Bytes, not `String`, and for the same reason header values are
+    /// (issue #11's hazards): percent-decoding produces **arbitrary octets**.
+    /// Go's `net/url` unescapes `%FF` into the byte 0xFF and hands it to
+    /// `URL.Path`, from which upstream derives `PATH_INFO`, `SCRIPT_NAME`,
+    /// `PHP_SELF` and `SCRIPT_FILENAME` -- all `$_SERVER` entries, and PHP
+    /// strings are byte strings. A `String` here would force whatever decodes
+    /// the request target to either reject such a path (a 400 upstream
+    /// serves) or replace the byte with U+FFFD (a path that names a different
+    /// file than upstream opens), and neither is upstream's behaviour.
+    pub path: Vec<u8>,
     /// Go's `request.URL.RawPath`: the escaped path exactly as it arrived on
     /// the request line, left **empty** when `path` is already its own
     /// escaping (which is the overwhelmingly common case, and the condition
@@ -283,9 +364,15 @@ pub struct Request {
     /// Whatever fills a `Request` from the wire owes the same invariant
     /// `net/url` maintains when it sets `RawPath`: set this only when it is a
     /// valid escaping of `path`. See [`Request::escaped_path`].
-    pub raw_path: String,
-    /// The raw, undecoded query string (Go's `request.URL.RawQuery`).
-    pub raw_query: String,
+    ///
+    /// Bytes for the same reason `path` is: this is request-line text copied
+    /// verbatim, and `net/url`'s parser rejects only ASCII control bytes, so
+    /// a byte >= 0x80 reaches `RawPath` -- and from there `REQUEST_URI`.
+    pub raw_path: Vec<u8>,
+    /// The raw, undecoded query string (Go's `request.URL.RawQuery`). Bytes:
+    /// like `raw_path` this is verbatim request-line text, and it reaches PHP
+    /// as `QUERY_STRING` and `SG(request_info).query_string` unmodified.
+    pub raw_query: Vec<u8>,
     /// Go's `request.URL.ForceQuery`: set when the request target had a
     /// bare trailing `?` with nothing after it (e.g. `GET /index.php?
     /// HTTP/1.1`), which `net/url` parses as `RawQuery == ""` with
@@ -325,13 +412,13 @@ pub struct Request {
 impl Request {
     pub fn new(
         method: impl Into<String>,
-        path: impl Into<String>,
-        raw_query: impl Into<String>,
+        path: impl Into<Vec<u8>>,
+        raw_query: impl Into<Vec<u8>>,
     ) -> Self {
         Self {
             method: method.into(),
             path: path.into(),
-            raw_path: String::new(),
+            raw_path: Vec::new(),
             raw_query: raw_query.into(),
             force_query: false,
             headers: Headers::default(),
@@ -359,7 +446,7 @@ impl Request {
         self
     }
 
-    pub fn with_raw_path(mut self, raw_path: impl Into<String>) -> Self {
+    pub fn with_raw_path(mut self, raw_path: impl Into<Vec<u8>>) -> Self {
         self.raw_path = raw_path.into();
         self
     }
@@ -384,13 +471,13 @@ impl Request {
     /// [`Request::raw_path`] documents the same obligation for our transport,
     /// so we trust it rather than re-implementing `net/url`'s unescaper to
     /// re-derive a fact its producer already knows.
-    pub fn escaped_path(&self) -> String {
+    pub fn escaped_path(&self) -> Vec<u8> {
         if !self.raw_path.is_empty() {
             return self.raw_path.clone();
         }
-        if self.path == "*" {
+        if self.path.as_slice() == b"*" {
             // Go: don't escape (golang/go#11202) -- `OPTIONS *`.
-            return "*".to_string();
+            return b"*".to_vec();
         }
         escape_path(&self.path)
     }
@@ -404,14 +491,14 @@ impl Request {
     /// can: a request line ending in a bare `?` (`GET /index.php?
     /// HTTP/1.1`) parses with `RawQuery == ""` and `ForceQuery == true`, and
     /// must round-trip back out with the `?`. See [`Request::force_query`].
-    pub fn request_uri(&self) -> String {
+    pub fn request_uri(&self) -> Vec<u8> {
         let mut uri = self.escaped_path();
         if uri.is_empty() {
-            uri.push('/');
+            uri.push(b'/');
         }
         if self.force_query || !self.raw_query.is_empty() {
-            uri.push('?');
-            uri.push_str(&self.raw_query);
+            uri.push(b'?');
+            uri.extend_from_slice(&self.raw_query);
         }
         uri
     }
@@ -439,22 +526,20 @@ fn should_escape_path_byte(c: u8) -> bool {
 
 /// Port of Go's `escape(s, encodePath)` (`net/url`): `%XX` with upper-case
 /// hex, and (unlike `encodeQueryComponent`) space escaped as `%20`, not `+`.
-fn escape_path(path: &str) -> String {
-    if !path.bytes().any(should_escape_path_byte) {
-        return path.to_string();
+fn escape_path(path: &[u8]) -> Vec<u8> {
+    if !path.iter().copied().any(should_escape_path_byte) {
+        return path.to_vec();
     }
 
     const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(path.len());
-    for byte in path.bytes() {
+    let mut out = Vec::with_capacity(path.len());
+    for &byte in path {
         if should_escape_path_byte(byte) {
-            out.push('%');
-            out.push(UPPER_HEX[(byte >> 4) as usize] as char);
-            out.push(UPPER_HEX[(byte & 0x0f) as usize] as char);
+            out.push(b'%');
+            out.push(UPPER_HEX[(byte >> 4) as usize]);
+            out.push(UPPER_HEX[(byte & 0x0f) as usize]);
         } else {
-            // Every unescaped byte is ASCII (`should_escape_path_byte`
-            // returns true for anything >= 0x80), so this cast is lossless.
-            out.push(byte as char);
+            out.push(byte);
         }
     }
     out
@@ -483,7 +568,7 @@ impl std::error::Error for RejectedRequest {}
 /// `reject()`'s response-writing side effect (see this module's doc comment
 /// and issue #11's spec).
 pub fn validate_request(request: &Request) -> Result<(), RejectedRequest> {
-    if request.path.as_bytes().contains(&0) {
+    if request.path.contains(&0) {
         return Err(RejectedRequest {
             status: 400,
             message: "invalid request path".to_string(),
@@ -573,11 +658,14 @@ pub struct RequestContext {
     pub split_path: Vec<String>,
     pub request: Option<Request>,
 
-    pub doc_uri: String,
-    pub path_info: String,
-    pub script_name: String,
-    pub script_filename: String,
-    pub request_uri: String,
+    /// All five are derived from [`Request::path`] / [`Request::raw_path`] and
+    /// go straight into `$_SERVER` and `SG(request_info)`, so they carry that
+    /// field's byte model rather than re-imposing UTF-8 on it.
+    pub doc_uri: Vec<u8>,
+    pub path_info: Vec<u8>,
+    pub script_name: Vec<u8>,
+    pub script_filename: Vec<u8>,
+    pub request_uri: Vec<u8>,
 
     /// Whether the request is already closed by us (`context.go:37`).
     pub is_done: bool,
@@ -589,8 +677,9 @@ pub struct RequestContext {
     /// writing a response body (`context.go:52`'s `done chan any`, closed by
     /// `closeContext()`). What is on the other end and how it becomes an
     /// HTTP response is #13/#14's async<->pthread bridge; this module only
-    /// owns the slot and the `close_context` call that fires it.
-    completion_signal: mpsc::Sender<()>,
+    /// owns the slot and the `close_context` call that fires it. See
+    /// [`CompletionSignal`].
+    completion_signal: CompletionSignal,
 
     pub arena: RequestArena,
 
@@ -624,7 +713,7 @@ impl RequestContext {
         document_root: String,
         split_path: Option<Vec<String>>,
         request: Option<Request>,
-        completion_signal: mpsc::Sender<()>,
+        completion_signal: CompletionSignal,
     ) -> Result<Self, crate::cgi::InvalidSplitPath> {
         let split_path = match split_path {
             // `splitCgiPath`'s own default (cgi.go:195-197), already
@@ -634,8 +723,8 @@ impl RequestContext {
         };
 
         let (doc_uri, path_info, script_name, script_filename) = match &request {
-            Some(r) => crate::cgi::split_cgi_path(&r.path, &split_path, &document_root),
-            None => (String::new(), String::new(), String::new(), String::new()),
+            Some(r) => crate::cgi::split_cgi_path(&r.path, &split_path, document_root.as_bytes()),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
 
         // `fc.requestURI = r.URL.RequestURI()` (context.go:111) -- the
@@ -643,7 +732,7 @@ impl RequestContext {
         // `split_cgi_path` above consumed. See `Request::request_uri`.
         let request_uri = match &request {
             Some(r) => r.request_uri(),
-            None => String::new(),
+            None => Vec::new(),
         };
 
         Ok(Self {
@@ -710,7 +799,7 @@ impl RequestContext {
             return;
         }
         self.client_had_closed = self.client_has_closed();
-        let _ = self.completion_signal.send(());
+        self.completion_signal.fire();
         self.is_done = true;
     }
 }
@@ -878,10 +967,16 @@ pub static CONTEXT_SLOTS: ContextSlots = ContextSlots::new();
 mod tests {
     use super::*;
 
+    use std::sync::mpsc;
+
     fn test_context(request: Option<Request>) -> RequestContext {
-        let (tx, _rx) = mpsc::channel();
-        RequestContext::new("/var/www".to_string(), None, request, tx)
-            .expect("the default split path is valid")
+        RequestContext::new(
+            "/var/www".to_string(),
+            None,
+            request,
+            CompletionSignal::none(),
+        )
+        .expect("the default split path is valid")
     }
 
     #[test]
@@ -955,15 +1050,15 @@ mod tests {
         // escaped form when it differs.
         let request =
             Request::new("GET", "/index.php/extra", "x=1").with_raw_path("/index.php%2Fextra");
-        assert_eq!(request.request_uri(), "/index.php%2Fextra?x=1");
+        assert_eq!(request.request_uri(), b"/index.php%2Fextra?x=1");
 
         let ctx = test_context(Some(request));
-        assert_eq!(ctx.request_uri, "/index.php%2Fextra?x=1");
+        assert_eq!(ctx.request_uri, b"/index.php%2Fextra?x=1");
         assert_eq!(
-            ctx.script_name, "/index.php",
+            ctx.script_name, b"/index.php",
             "path splitting still runs on the decoded path"
         );
-        assert_eq!(ctx.path_info, "/extra");
+        assert_eq!(ctx.path_info, b"/extra");
     }
 
     #[test]
@@ -973,32 +1068,38 @@ mod tests {
         // '&' '+' '$' ',' ';' '/' and the unreserved marks left alone.
         assert_eq!(
             Request::new("GET", "/index.php", "").request_uri(),
-            "/index.php"
+            b"/index.php"
         );
-        assert_eq!(Request::new("GET", "/a b", "").request_uri(), "/a%20b");
-        assert_eq!(Request::new("GET", "/a?b", "").request_uri(), "/a%3Fb");
+        assert_eq!(Request::new("GET", "/a b", "").request_uri(), b"/a%20b");
+        assert_eq!(Request::new("GET", "/a?b", "").request_uri(), b"/a%3Fb");
         assert_eq!(
             Request::new("GET", "/a~b-c_d.e", "").request_uri(),
-            "/a~b-c_d.e"
+            b"/a~b-c_d.e"
         );
         assert_eq!(
             Request::new("GET", "/a:b@c=d&e+f$g,h;i", "").request_uri(),
-            "/a:b@c=d&e+f$g,h;i"
+            b"/a:b@c=d&e+f$g,h;i"
         );
         assert_eq!(
             Request::new("GET", "/caf\u{e9}", "").request_uri(),
-            "/caf%C3%A9",
+            b"/caf%C3%A9",
             "non-ASCII is escaped byte-wise, as Go's escape() does"
         );
         assert_eq!(
             Request::new("GET", "", "").request_uri(),
-            "/",
+            b"/",
             "RequestURI() substitutes \"/\" for an empty path"
         );
         assert_eq!(
             Request::new("OPTIONS", "*", "").request_uri(),
-            "*",
+            b"*",
             "golang/go#11202: `OPTIONS *` is not escaped"
+        );
+        assert_eq!(
+            Request::new("GET", b"/caf\xe9".to_vec(), "").request_uri(),
+            b"/caf%E9",
+            "a lone latin-1 byte in the decoded path escapes to one %XX pair, \
+             not to the two bytes of U+FFFD's UTF-8 encoding"
         );
     }
 
@@ -1009,19 +1110,19 @@ mod tests {
         // appends "?" for either `ForceQuery || RawQuery != ""`, so the two
         // cases must not collapse to the same output.
         let forced = Request::new("GET", "/index.php", "").with_force_query(true);
-        assert_eq!(forced.request_uri(), "/index.php?");
+        assert_eq!(forced.request_uri(), b"/index.php?");
 
         let absent = Request::new("GET", "/index.php", "");
         assert_eq!(
             absent.request_uri(),
-            "/index.php",
+            b"/index.php",
             "an absent query must not gain a trailing '?'"
         );
 
         let real_query = Request::new("GET", "/index.php", "x=1").with_force_query(true);
         assert_eq!(
             real_query.request_uri(),
-            "/index.php?x=1",
+            b"/index.php?x=1",
             "force_query is redundant but harmless when a real query is present"
         );
     }
@@ -1031,23 +1132,21 @@ mod tests {
         // WithRequestSplitPath (requestoptions.go:86-113) lower-cases ASCII
         // entries and rejects non-ASCII ones; split_pos folds only the bytes
         // of the *path*, so an un-normalised entry silently never matches.
-        let (tx, _rx) = mpsc::channel();
         let ctx = RequestContext::new(
             "/var/www".to_string(),
             Some(vec![".PHP".to_string()]),
             Some(Request::new("GET", "/index.php/foo", "")),
-            tx,
+            CompletionSignal::none(),
         )
         .expect(".PHP is ASCII, so it normalises rather than failing");
-        assert_eq!(ctx.script_name, "/index.php");
-        assert_eq!(ctx.path_info, "/foo");
+        assert_eq!(ctx.script_name, b"/index.php");
+        assert_eq!(ctx.path_info, b"/foo");
 
-        let (tx, _rx) = mpsc::channel();
         let rejected = RequestContext::new(
             "/var/www".to_string(),
             Some(vec![".php".to_string(), ".Ⱥphp".to_string()]),
             Some(Request::new("GET", "/index.php", "")),
-            tx,
+            CompletionSignal::none(),
         );
         assert_eq!(rejected.err(), Some(crate::cgi::InvalidSplitPath));
     }
@@ -1092,6 +1191,68 @@ mod tests {
         let with_length =
             Request::new("POST", "/", "").with_header("Content-Length", b"42".to_vec());
         assert!(validate_request(&with_length).is_ok());
+    }
+
+    /// `closeContext` closes `fc.done` (`context.go:145`) and returns early on
+    /// a second call (`context.go:137-139`). Both halves are load-bearing and
+    /// neither was covered: never firing leaves the HTTP handler awaiting
+    /// forever, and firing twice is a double-send on the transport's oneshot.
+    #[test]
+    fn close_context_fires_the_completion_signal_exactly_once() {
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        let mut ctx = RequestContext::new(
+            "/var/www".to_string(),
+            None,
+            Some(Request::new("GET", "/index.php", "")),
+            CompletionSignal::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
+        .expect("the default split path is valid");
+
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "sanity: nothing signalled before close_context"
+        );
+        ctx.close_context();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "close_context must release the waiting handler"
+        );
+
+        ctx.close_context();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "closeContext returns early on fc.isDone -- a script that calls \
+             fastcgi_finish_request() and then ends must not signal twice"
+        );
+    }
+
+    /// The signal must be able to *consume* what it captures, because the
+    /// documented async end is `tokio::sync::oneshot::Sender::send(self, ..)`
+    /// and that sender is not reusable. This is a compile-time assertion as
+    /// much as a runtime one: the body below moves `payload` out of the
+    /// closure, which only type-checks if the signal is `FnOnce`.
+    #[test]
+    fn a_completion_signal_may_consume_what_it_captures() {
+        let (tx, rx) = mpsc::channel();
+        let payload = "response ready".to_string();
+        let mut ctx = RequestContext::new(
+            "/var/www".to_string(),
+            None,
+            Some(Request::new("GET", "/index.php", "")),
+            CompletionSignal::new(move || {
+                let _ = tx.send(payload);
+            }),
+        )
+        .expect("the default split path is valid");
+
+        ctx.close_context();
+        assert_eq!(rx.try_recv().unwrap(), "response ready");
     }
 
     #[test]

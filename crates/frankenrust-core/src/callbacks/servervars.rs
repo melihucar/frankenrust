@@ -173,16 +173,20 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use crate::context::{Request, RequestContext};
+    use crate::context::{CompletionSignal, Request, RequestContext};
 
     /// Installs a context on `thread_index` and returns the batch
     /// `shim.c` would have received.
     fn collect(thread_index: usize, request: Request) -> Option<frankenrust_server_vars_batch> {
-        let (tx, _rx) = mpsc::channel();
         CONTEXT_SLOTS.set(
             thread_index,
-            RequestContext::new("/var/www".to_string(), None, Some(request), tx)
-                .expect("the default split path is valid"),
+            RequestContext::new(
+                "/var/www".to_string(),
+                None,
+                Some(request),
+                CompletionSignal::none(),
+            )
+            .expect("the default split path is valid"),
         );
 
         let mut batch = frankenrust_server_vars_batch::default();
@@ -265,13 +269,17 @@ mod tests {
         // Reserved to this test alone -- see the tests above.
         const THREAD_INDEX: usize = 42;
 
-        let (tx, _rx) = mpsc::channel();
         let mut request = Request::new("GET", "/index.php", "");
         request.host = "example.com".to_string();
         CONTEXT_SLOTS.set(
             THREAD_INDEX,
-            RequestContext::new("/var/www".to_string(), None, Some(request), tx)
-                .expect("the default split path is valid"),
+            RequestContext::new(
+                "/var/www".to_string(),
+                None,
+                Some(request),
+                CompletionSignal::none(),
+            )
+            .expect("the default split path is valid"),
         );
 
         // SAFETY: the null case is precisely what is under test, and the

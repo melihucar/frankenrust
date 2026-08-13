@@ -21,11 +21,18 @@ use crate::context::{RequestContext, Scheme};
 // ---------------------------------------------------------------------------
 
 /// Port of `ensureLeadingSlash` (`cgi.go:378-384`).
-pub fn ensure_leading_slash(path: &str) -> String {
-    if path.is_empty() || path.starts_with('/') {
-        path.to_string()
+///
+/// Bytes rather than `&str` throughout this section: the decoded URL path is
+/// arbitrary octets (see [`crate::context::Request::path`]), and every one of
+/// these helpers either consumes it or produces a `$_SERVER` value from it.
+pub fn ensure_leading_slash(path: &[u8]) -> Vec<u8> {
+    if path.is_empty() || path[0] == b'/' {
+        path.to_vec()
     } else {
-        format!("/{path}")
+        let mut out = Vec::with_capacity(path.len() + 1);
+        out.push(b'/');
+        out.extend_from_slice(path);
+        out
     }
 }
 
@@ -72,12 +79,11 @@ pub fn normalize_split_path(split_path: Vec<String>) -> Result<Vec<String>, Inva
 /// `split_path`'s entries are assumed ASCII and already lower-cased, which is
 /// what [`normalize_split_path`] guarantees (upstream leans on
 /// `WithRequestSplitPath` for the same guarantee).
-pub fn split_pos(path: &str, split_path: &[String]) -> isize {
+pub fn split_pos(path: &[u8], split_path: &[String]) -> isize {
     if split_path.is_empty() {
         return 0;
     }
 
-    let path = path.as_bytes();
     let path_len = path.len();
 
     for split in split_path {
@@ -182,14 +188,16 @@ pub fn split_remote_addr(remote_addr: &str) -> (String, String) {
 
 /// Port of Go's `path/filepath.Clean` for Unix (single `/` separator; the
 /// only separator `frankenrust-sys/build.rs` supports -- it panics on
-/// Windows). Operates byte-wise, which is safe even on non-UTF8-clean input:
-/// `.`/`/` are ASCII and never appear as a UTF-8 continuation byte.
-fn clean_path(path: &str) -> String {
+/// Windows). Byte-wise like Go's, and correct on non-UTF-8 input for the same
+/// reason Go's is: `.` and `/` are ASCII, and an ASCII byte never appears
+/// inside a multi-byte UTF-8 sequence, so no segment can be split mid-
+/// character.
+fn clean_path(path: &[u8]) -> Vec<u8> {
     if path.is_empty() {
-        return ".".to_string();
+        return b".".to_vec();
     }
 
-    let bytes = path.as_bytes();
+    let bytes = path;
     let n = bytes.len();
     let rooted = bytes[0] == b'/';
     let mut out: Vec<u8> = Vec::with_capacity(n);
@@ -252,25 +260,34 @@ fn clean_path(path: &str) -> String {
     }
 
     if out.is_empty() {
-        return ".".to_string();
+        return b".".to_vec();
     }
-    // `out` only ever contains bytes copied verbatim from `path` (a valid
-    // `&str`) plus ASCII '.'/'/' pushed by this function, so it is valid
-    // UTF-8.
-    String::from_utf8(out).expect("clean_path only copies valid-UTF-8 input plus ASCII")
+    out
+}
+
+/// `prefix`, `/` and `suffix` in one buffer -- the byte-level stand-in for the
+/// `format!("{prefix}/{suffix}")` the `&str` version of
+/// [`sanitized_path_join`] used, including the empty-`prefix` case, which is
+/// how that function spells `"/" + reqPath` (`cgi.go:333`).
+fn join_with_slash(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + 1 + suffix.len());
+    out.extend_from_slice(prefix);
+    out.push(b'/');
+    out.extend_from_slice(suffix);
+    out
 }
 
 /// Port of `sanitizedPathJoin` (`cgi.go:326-352`): `filepath.Join(root,
 /// filepath.Clean("/"+reqPath))`, traversal-safe by construction because the
 /// inner `Clean` call resolves and discards any `..` that would otherwise
 /// escape above the root.
-pub fn sanitized_path_join(root: &str, req_path: &str) -> String {
-    let root = if root.is_empty() { "." } else { root };
-    let cleaned_req_path = clean_path(&format!("/{req_path}"));
-    let mut joined = clean_path(&format!("{root}/{cleaned_req_path}"));
+pub fn sanitized_path_join(root: &[u8], req_path: &[u8]) -> Vec<u8> {
+    let root: &[u8] = if root.is_empty() { b"." } else { root };
+    let cleaned_req_path = clean_path(&join_with_slash(b"", req_path));
+    let mut joined = clean_path(&join_with_slash(root, &cleaned_req_path));
 
-    if req_path.ends_with('/') && req_path.len() > 1 {
-        joined.push('/');
+    if req_path.last() == Some(&b'/') && req_path.len() > 1 {
+        joined.push(b'/');
     }
 
     joined
@@ -280,20 +297,20 @@ pub fn sanitized_path_join(root: &str, req_path: &str) -> String {
 /// (`cgi.go:204-215`, `#14`'s `SCRIPT_FILENAME` override is out of scope for
 /// this issue). Returns `(doc_uri, path_info, script_name, script_filename)`.
 pub fn split_cgi_path(
-    path: &str,
+    path: &[u8],
     split_path: &[String],
-    document_root: &str,
-) -> (String, String, String, String) {
-    let (mut doc_uri, mut path_info) = (String::new(), String::new());
+    document_root: &[u8],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (mut doc_uri, mut path_info) = (Vec::new(), Vec::new());
 
     let pos = split_pos(path, split_path);
     if pos > -1 {
         let pos = pos as usize;
-        doc_uri = path[..pos].to_string();
-        path_info = path[pos..].to_string();
+        doc_uri = path[..pos].to_vec();
+        path_info = path[pos..].to_vec();
     }
 
-    let script_name = ensure_leading_slash(path.strip_suffix(path_info.as_str()).unwrap_or(path));
+    let script_name = ensure_leading_slash(path.strip_suffix(path_info.as_slice()).unwrap_or(path));
     let script_filename = sanitized_path_join(document_root, &script_name);
 
     (doc_uri, path_info, script_name, script_filename)
@@ -566,11 +583,33 @@ pub struct ComputedServerVars {
     pub ssl_cipher: Vec<u8>,
     pub scheme: Scheme,
     /// `28 + len(request.Header) + len(fc.env) + lengthOfEnv` (`cgi.go:107`)
-    /// -- a `zend_hash_extend` sizing hint, not a hard count. `fc.env`
-    /// (prepared env) and the OS-env length are both out of scope for this
-    /// issue (the latter is #10's `go_init_os_env`), so this is `28 +
-    /// len(request.Header)` here; an undercount only costs one rehash.
+    /// -- a `zend_hash_extend` sizing hint, not a hard count. `len(fc.env)`
+    /// (the prepared env) is out of scope for this issue and is the one term
+    /// missing here; `lengthOfEnv` is not, because
+    /// `frankenphp_register_server_vars` copies the whole OS-env snapshot
+    /// into `$_SERVER` before it registers anything else
+    /// (`frankenphp.c:1223`), so dropping that term means every request
+    /// under-sizes the table by the size of the environment and pays for the
+    /// rehash. See [`length_of_env`].
     pub total_num_vars: usize,
+}
+
+/// Port of `lengthOfEnv` (`env.go:11`, `:16`): `len(os.Environ())`, snapshot
+/// once.
+///
+/// Upstream captures it inside `go_init_os_env`, which is #10's callback and
+/// not ours to call -- but the value it captures is nothing more than the size
+/// of the process environment, which we can read directly. Snapshotting it in
+/// a `OnceLock` on first use reproduces upstream's own lifetime for it:
+/// `lengthOfEnv` is written exactly once, during main-thread startup, and
+/// never updated afterwards (`go_putenv` does not touch it).
+///
+/// If #10 has not populated `main_thread_env` yet this over-sizes the table
+/// rather than under-sizing it, which is the harmless direction for a
+/// `zend_hash_extend` hint.
+fn length_of_env() -> usize {
+    static LENGTH_OF_ENV: OnceLock<usize> = OnceLock::new();
+    *LENGTH_OF_ENV.get_or_init(|| std::env::vars_os().count())
 }
 
 /// Port of `addKnownVariablesToServer` (`cgi.go:47-148`), minus the actual
@@ -600,25 +639,28 @@ pub fn compute_server_vars(ctx: &RequestContext) -> Option<ComputedServerVars> {
         .get_first("Content-Length")
         .unwrap_or_default()
         .to_vec();
-    let php_self = format!("{}{}", ctx.script_name, ctx.path_info);
-    let total_num_vars = 28 + request.headers.name_count();
+    // `phpSelf := fc.scriptName + fc.pathInfo` (cgi.go:102) -- a byte
+    // concatenation, since both halves come from the decoded URL path.
+    let mut php_self = ctx.script_name.clone();
+    php_self.extend_from_slice(&ctx.path_info);
+    let total_num_vars = 28 + request.headers.name_count() + length_of_env();
 
     Some(ComputedServerVars {
         remote_addr: ip.clone().into_bytes(),
         remote_host: ip.into_bytes(),
         remote_port: port.into_bytes(),
         document_root: ctx.document_root.clone().into_bytes(),
-        path_info: ctx.path_info.clone().into_bytes(),
-        php_self: php_self.into_bytes(),
-        document_uri: ctx.doc_uri.clone().into_bytes(),
-        script_filename: ctx.script_filename.clone().into_bytes(),
-        script_name: ctx.script_name.clone().into_bytes(),
+        path_info: ctx.path_info.clone(),
+        php_self,
+        document_uri: ctx.doc_uri.clone(),
+        script_filename: ctx.script_filename.clone(),
+        script_name: ctx.script_name.clone(),
         server_name: req_host.into_bytes(),
         server_port: req_port.into_bytes(),
         content_length,
         server_protocol: request.proto.clone().into_bytes(),
         http_host: request.host.clone().into_bytes(),
-        request_uri: ctx.request_uri.clone().into_bytes(),
+        request_uri: ctx.request_uri.clone(),
         ssl_cipher: Vec::new(),
         scheme: request.scheme,
         total_num_vars,
@@ -904,7 +946,10 @@ pub fn update_request_info(ctx: &mut RequestContext, info: &mut sapi_request_inf
     let path_translated = if ctx.path_info.is_empty() {
         None
     } else {
-        Some(sanitized_path_join(&ctx.document_root, &ctx.path_info))
+        Some(sanitized_path_join(
+            ctx.document_root.as_bytes(),
+            &ctx.path_info,
+        ))
     };
     let request_uri = ctx.request_uri.clone();
     // `request` (and so the borrow of `ctx.request`) is not used again past
@@ -914,7 +959,7 @@ pub fn update_request_info(ctx: &mut RequestContext, info: &mut sapi_request_inf
         Some(cstr) => cstr,
         None => ctx.arena.alloc(method.as_bytes()) as *const c_char,
     };
-    info.query_string = ctx.arena.alloc(raw_query.as_bytes());
+    info.query_string = ctx.arena.alloc(&raw_query);
     info.content_length = content_length as frankenrust_sys::zend_long;
 
     if let Some(content_type) = content_type {
@@ -928,10 +973,10 @@ pub fn update_request_info(ctx: &mut RequestContext, info: &mut sapi_request_inf
     }
 
     if let Some(path_translated) = path_translated {
-        info.path_translated = ctx.arena.alloc(path_translated.as_bytes());
+        info.path_translated = ctx.arena.alloc(&path_translated);
     }
 
-    info.request_uri = ctx.arena.alloc(request_uri.as_bytes());
+    info.request_uri = ctx.arena.alloc(&request_uri);
     info.proto_num = proto_num;
 
     match authorization {
@@ -943,13 +988,16 @@ pub fn update_request_info(ctx: &mut RequestContext, info: &mut sapi_request_inf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::Request;
-    use std::sync::mpsc;
+    use crate::context::{CompletionSignal, Request};
 
     fn test_context(request: Option<Request>) -> RequestContext {
-        let (tx, _rx) = mpsc::channel();
-        RequestContext::new("/var/www".to_string(), None, request, tx)
-            .expect("the default split path is valid")
+        RequestContext::new(
+            "/var/www".to_string(),
+            None,
+            request,
+            CompletionSignal::none(),
+        )
+        .expect("the default split path is valid")
     }
 
     // --- TestEnsureLeadingSlash (cgi_test.go:10-34) -------------------------
@@ -967,7 +1015,11 @@ mod tests {
             ("index.php/path/info", "/index.php/path/info"),
         ];
         for (input, expected) in cases {
-            assert_eq!(ensure_leading_slash(input), expected, "input {input:?}");
+            assert_eq!(
+                ensure_leading_slash(input.as_bytes()),
+                expected.as_bytes(),
+                "input {input:?}"
+            );
         }
     }
 
@@ -1062,7 +1114,11 @@ mod tests {
         ];
 
         for (path, split_path, want) in cases {
-            assert_eq!(split_pos(path, split_path), *want, "path {path:?}");
+            assert_eq!(
+                split_pos(path.as_bytes(), split_path),
+                *want,
+                "path {path:?}"
+            );
         }
     }
 
@@ -1075,7 +1131,7 @@ mod tests {
         // is computed directly against the original bytes.
         let path = "/ȺȺȺȺshell.php.txt.php";
         let split = vec![".php".to_string()];
-        assert_eq!(split_pos(path, &split), 18);
+        assert_eq!(split_pos(path.as_bytes(), &split), 18);
     }
 
     // --- TestSplitPosSecurityRegressionUnicodeBypass (cgi_test.go:312-332) ---
@@ -1097,7 +1153,7 @@ mod tests {
         ];
         for payload in payloads {
             assert_eq!(
-                split_pos(payload, &split),
+                split_pos(payload.as_bytes(), &split),
                 -1,
                 "payload {payload:?} must not match"
             );
@@ -1106,30 +1162,27 @@ mod tests {
 
     // --- Fresh tests for sanitizedPathJoin (cgi.go:326-352) ------------------
 
+    /// `sanitized_path_join` over `&str` inputs, so the tables below stay
+    /// readable. The non-UTF-8 case has its own test.
+    fn spj(root: &str, req_path: &str) -> Vec<u8> {
+        sanitized_path_join(root.as_bytes(), req_path.as_bytes())
+    }
+
     #[test]
     fn sanitized_path_join_rejects_dotdot_traversal() {
+        assert_eq!(spj("/var/www", "../../etc/passwd"), b"/var/www/etc/passwd");
         assert_eq!(
-            sanitized_path_join("/var/www", "../../etc/passwd"),
-            "/var/www/etc/passwd"
+            spj("/var/www", "/../../../etc/passwd"),
+            b"/var/www/etc/passwd"
         );
-        assert_eq!(
-            sanitized_path_join("/var/www", "/../../../etc/passwd"),
-            "/var/www/etc/passwd"
-        );
-        assert_eq!(sanitized_path_join("/var/www", "/a/../../b"), "/var/www/b");
+        assert_eq!(spj("/var/www", "/a/../../b"), b"/var/www/b");
     }
 
     #[test]
     fn sanitized_path_join_handles_absolute_request_paths() {
-        assert_eq!(
-            sanitized_path_join("/var/www", "/index.php"),
-            "/var/www/index.php"
-        );
-        assert_eq!(
-            sanitized_path_join("/var/www", "index.php"),
-            "/var/www/index.php"
-        );
-        assert_eq!(sanitized_path_join("/var/www", "/"), "/var/www");
+        assert_eq!(spj("/var/www", "/index.php"), b"/var/www/index.php");
+        assert_eq!(spj("/var/www", "index.php"), b"/var/www/index.php");
+        assert_eq!(spj("/var/www", "/"), b"/var/www");
     }
 
     #[test]
@@ -1137,19 +1190,19 @@ mod tests {
         // "%2f"/"%2e" are not '/'/'.' bytes -- this function receives an
         // already-decoded path from its caller and must not itself treat a
         // literal percent-sequence as a traversal attempt or a separator.
-        let joined = sanitized_path_join("/var/www", "/foo%2f..%2f..%2fetc%2fpasswd");
-        assert_eq!(joined, "/var/www/foo%2f..%2f..%2fetc%2fpasswd");
-        assert!(joined.starts_with("/var/www/"));
+        let joined = spj("/var/www", "/foo%2f..%2f..%2fetc%2fpasswd");
+        assert_eq!(joined, b"/var/www/foo%2f..%2f..%2fetc%2fpasswd");
+        assert!(joined.starts_with(b"/var/www/"));
     }
 
     #[test]
     fn sanitized_path_join_preserves_trailing_slash() {
-        assert_eq!(sanitized_path_join("/var/www", "/dir/"), "/var/www/dir/");
+        assert_eq!(spj("/var/www", "/dir/"), b"/var/www/dir/");
     }
 
     #[test]
     fn sanitized_path_join_defaults_empty_root_to_dot() {
-        assert_eq!(sanitized_path_join("", "/etc/passwd"), "etc/passwd");
+        assert_eq!(spj("", "/etc/passwd"), b"etc/passwd");
     }
 
     #[test]
@@ -1159,13 +1212,22 @@ mod tests {
         // the separator one past it, leaving the separator behind. The outer
         // Clean collapses the resulting "//" almost everywhere, which is why
         // only a `..` inside the *root* shows it.
+        assert_eq!(spj("/var/www/..", "/index.php"), b"/var/index.php");
+        assert_eq!(spj("/var/www/../www", "/a.php"), b"/var/www/a.php");
+    }
+
+    /// Traversal safety must not depend on the path being UTF-8: the decoded
+    /// path is arbitrary octets, and `..` is still `..` next to a 0xFF.
+    #[test]
+    fn sanitized_path_join_is_traversal_safe_on_non_utf8_paths() {
         assert_eq!(
-            sanitized_path_join("/var/www/..", "/index.php"),
-            "/var/index.php"
+            sanitized_path_join(b"/var/www", b"/\xff/../../etc/passwd"),
+            b"/var/www/etc/passwd"
         );
         assert_eq!(
-            sanitized_path_join("/var/www/../www", "/a.php"),
-            "/var/www/a.php"
+            sanitized_path_join(b"/var/www", b"/caf\xe9.php"),
+            b"/var/www/caf\xe9.php",
+            "a latin-1 byte must survive the join unchanged, not become U+FFFD"
         );
     }
 
@@ -1215,7 +1277,11 @@ mod tests {
             ("/a/b/../c", "/a/c"),
         ];
         for (input, expected) in cases {
-            assert_eq!(clean_path(input), expected, "clean_path({input:?})");
+            assert_eq!(
+                clean_path(input.as_bytes()),
+                expected.as_bytes(),
+                "clean_path({input:?})"
+            );
         }
     }
 
@@ -1256,10 +1322,10 @@ mod tests {
         // of the *path* only, so it compares against the split entry
         // verbatim and ".PHP" would never match anything.
         let raw = vec![".PHP".to_string()];
-        assert_eq!(split_pos("/index.php", &raw), -1);
+        assert_eq!(split_pos(b"/index.php", &raw), -1);
 
         let normalised = normalize_split_path(raw).unwrap();
-        assert_eq!(split_pos("/index.php", &normalised), 10);
+        assert_eq!(split_pos(b"/index.php", &normalised), 10);
     }
 
     // --- Headers -> HTTP_* (issue #11 acceptance) -----------------------------
@@ -1345,11 +1411,87 @@ mod tests {
         request.host = "example.com".to_string();
         let ctx = test_context(Some(request));
 
-        assert_eq!(ctx.script_name, "/index.php");
-        assert_eq!(ctx.path_info, "/extra/path");
+        assert_eq!(ctx.script_name, b"/index.php");
+        assert_eq!(ctx.path_info, b"/extra/path");
 
         let vars = compute_server_vars(&ctx).unwrap();
         assert_eq!(vars.php_self, b"/index.php/extra/path");
+    }
+
+    /// `total_num_vars` is `28 + len(request.Header) + len(fc.env) +
+    /// lengthOfEnv` (`cgi.go:107`). The OS-env term is the one that is easy
+    /// to drop -- it is a package-level Go var rather than something visible
+    /// at the call site -- and dropping it under-sizes `$_SERVER` by the size
+    /// of the environment on *every* request, because
+    /// `frankenphp_register_server_vars` copies `main_thread_env` in wholesale
+    /// (`frankenphp.c:1223`) right after the `zend_hash_extend` this number
+    /// feeds. `len(fc.env)` is the prepared env, which is out of scope for
+    /// issue #11.
+    #[test]
+    fn server_vars_total_num_vars_counts_the_os_environment() {
+        let mut request = Request::new("GET", "/index.php", "")
+            .with_header("X-Foo", b"a".to_vec())
+            .with_header("Accept-Encoding", b"gzip".to_vec());
+        request.host = "example.com".to_string();
+        let ctx = test_context(Some(request));
+
+        let vars = compute_server_vars(&ctx).unwrap();
+        assert_eq!(vars.total_num_vars, 28 + 2 + std::env::vars_os().count());
+        assert!(
+            length_of_env() > 0,
+            "sanity: a test process always has some environment, so this test \
+             would still fail if the OS-env term were dropped again"
+        );
+    }
+
+    /// The byte model, end to end. Percent-decoding produces arbitrary octets
+    /// -- Go's `net/url` turns `%FF` into the byte 0xFF and leaves it in
+    /// `URL.Path` -- and every `$_SERVER` entry and `SG(request_info)` field
+    /// derived from that path has to carry those octets through untouched.
+    ///
+    /// The reviewed defect this pins down: the path was modelled as a `String`,
+    /// which cannot hold them at all, so whatever decoded the request target
+    /// would have had to either reject `/index.php/caf%E9` -- which upstream
+    /// serves -- or substitute U+FFFD, silently changing PATH_INFO, PHP_SELF
+    /// and PATH_TRANSLATED into a name for a different file. No test caught
+    /// that, because every path in this suite happened to be ASCII.
+    #[test]
+    fn a_non_utf8_decoded_path_survives_into_server_vars_and_request_info() {
+        let mut request =
+            Request::new("GET", b"/index.php/caf\xe9".to_vec(), b"q=caf\xe9".to_vec())
+                .with_raw_path(b"/index.php/caf%E9".to_vec());
+        request.host = "example.com".to_string();
+        let mut ctx = test_context(Some(request));
+
+        assert_eq!(ctx.script_name, b"/index.php");
+        assert_eq!(ctx.path_info, b"/caf\xe9");
+        assert_eq!(ctx.script_filename, b"/var/www/index.php");
+        assert_eq!(ctx.request_uri, b"/index.php/caf%E9?q=caf\xe9");
+
+        let vars = compute_server_vars(&ctx).unwrap();
+        assert_eq!(vars.path_info, b"/caf\xe9");
+        assert_eq!(vars.php_self, b"/index.php/caf\xe9");
+        assert_eq!(vars.request_uri, b"/index.php/caf%E9?q=caf\xe9");
+
+        let mut info = default_request_info();
+        update_request_info(&mut ctx, &mut info);
+        // SAFETY: all three pointers were just filled from `ctx.arena`, which
+        // `ctx` still owns here. None of these values contains an interior NUL,
+        // so `CStr` reads back exactly what was written.
+        unsafe {
+            assert_eq!(
+                std::ffi::CStr::from_ptr(info.query_string).to_bytes(),
+                b"q=caf\xe9"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(info.path_translated).to_bytes(),
+                b"/var/www/caf\xe9"
+            );
+            assert_eq!(
+                std::ffi::CStr::from_ptr(info.request_uri).to_bytes(),
+                b"/index.php/caf%E9?q=caf\xe9"
+            );
+        }
     }
 
     #[test]
