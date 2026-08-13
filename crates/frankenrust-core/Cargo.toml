@@ -1,0 +1,12 @@
+[package]
+name = "frankenrust-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Safe layer: PHP thread lifecycle, request context, and the 26 go_* callbacks frankenphp.c calls into."
+
+[lib]
+name = "frankenrust_core"
+
+[dependencies]
+frankenrust-sys = { path = "../frankenrust-sys" }

@@ -1,0 +1,30 @@
+[package]
+name = "frankenrust-sys"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Raw FFI: bindgen-generated PHP types plus upstream frankenphp.c/types.c, compiled and linked as-is."
+
+[lib]
+name = "frankenrust_sys"
+
+[build-dependencies]
+bindgen = "0.72"
+cc = "1.4"
+# Unconditional rather than gated to `cfg(target_os = "macos")`: build.rs's
+# macOS branch is a runtime `match` on CARGO_CFG_TARGET_OS, not a `#[cfg]`
+# block, so it must compile on every target even though it only ever runs on
+# macOS. A `target.'cfg(...)'.build-dependencies` gate is evaluated against
+# the compile *target*, so on a linux build it would drop this crate from
+# the build-dependency set entirely and fail to resolve `pkg_config::`.
+pkg-config = "0.3"
+
+# Not a real circular dependency: frankenrust-core (normal-)depends on
+# frankenrust-sys, and this is a *dev*-dependency, used only to build this
+# crate's own tests/, never part of frankenrust-core's own build. It exists
+# because frankenphp.c's compiled object unconditionally references all 26
+# go_* symbols (see include/_cgo_export.h) -- frankenrust-sys's own test
+# binary cannot link without something defining them, and frankenrust-core
+# is the only crate that ever will (issue #7's frozen module layout).
+[dev-dependencies]
+frankenrust-core = { path = "../frankenrust-core" }

@@ -1,0 +1,10 @@
+[package]
+name = "frankenrust-server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Async side: hyper HTTP/1.1 listener and the async<->pthread bridge to the PHP thread pool."
+
+[[bin]]
+name = "frankenrust-server"
+path = "src/main.rs"
