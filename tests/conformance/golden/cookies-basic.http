@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=UTF-8
+X-Powered-By: PHP/{phpVersion}
+Content-Length: 41
+
+array (
+  'foo' => 'bar',
+  'i' => '1',
+)

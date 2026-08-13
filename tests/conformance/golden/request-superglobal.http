@@ -1,0 +1,17 @@
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=UTF-8
+X-Powered-By: PHP/{phpVersion}
+Content-Length: 150
+
+REQUEST:array (
+  'g1' => 'v1',
+  'foo' => 'bar',
+  'baz' => 'qux',
+)
+GET:array (
+  'g1' => 'v1',
+)
+POST:array (
+  'foo' => 'bar',
+  'baz' => 'qux',
+)

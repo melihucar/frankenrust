@@ -1,0 +1,14 @@
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=UTF-8
+Foo: bar
+Foo2: bar2
+I: 0
+X-Powered-By: PHP/{phpVersion}
+Content-Length: 94
+
+array (
+  'X-Powered-By' => 'PHP/{phpVersion}',
+  'Foo' => 'bar',
+  'Foo2' => 'bar2',
+  'I' => '0',
+)

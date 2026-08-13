@@ -1,0 +1,12 @@
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=UTF-8
+X-Powered-By: PHP/{phpVersion}
+Content-Length: 216
+
+SCRIPT_NAME: /server-globals.php
+SCRIPT_FILENAME: {documentRoot}/server-globals.php
+PHP_SELF: /server-globals.php
+PATH_INFO:
+DOCUMENT_ROOT: {documentRoot}
+DOCUMENT_URI: /server-globals.php
+REQUEST_URI: /server-globals.php

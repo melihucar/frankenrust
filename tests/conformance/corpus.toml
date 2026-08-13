@@ -1,0 +1,453 @@
+# Golden HTTP conformance corpus.
+#
+# Read by tests/conformance/lib/common.py. capture.sh drives every [[cases]]
+# entry against the pinned upstream container and writes
+# tests/conformance/golden/<name>.http; run.sh replays the same cases and
+# diffs the (normalised) response against that golden.
+#
+# Both capture and replay talk HTTP directly via Python's http.client, not
+# through curl. Two places below describe headers using curl's own
+# conventions ("User-Agent and Accept explicitly suppressed", "X-Empty-Header;")
+# because that is how the source material (frankenphp_test.go, this issue's
+# own body) expresses them -- they are transcribed here as the literal wire
+# headers those curl invocations would send, not as curl arguments to shell
+# out to. Reasons: curl's own default User-Agent embeds curl's version
+# (a portability hazard across machines/CI images), and curl has no way to
+# put a raw NUL byte in a header value from argv (C strings can't hold one) --
+# see the cookies-malformed case below, which hit exactly that wall.
+
+[targets.upstream]
+image = "dunglas/frankenphp@sha256:4b0713ddad6ca7eb21eb82ac6bdb7cb41de5192a930b615d89af6e15d74e82f8"
+container_port = 80
+# Mount point we choose for vendor/frankenphp/testdata inside the container.
+# Matches the image's own Caddyfile (`root .`, WORKDIR /app/public) --
+# verified empirically: DOCUMENT_ROOT comes back as /app/public when the
+# corpus is mounted there.
+document_root = "/app/public"
+# SERVER_SOFTWARE's value, per the image's frankenphp SAPI. Not exposed via
+# any response header, only inside server-all-vars-ordered.php's body, so it
+# is recorded here rather than discovered per-request.
+server_software = "FrankenPHP"
+
+[defaults]
+# Sent with every case unless the case sets headers_override = true.
+# No Accept-Encoding is ever sent (skip_accept_encoding, unconditionally, in
+# common.py) -- the official image's Caddyfile has `encode zstd br gzip`, and
+# a negotiated encoding would change body bytes and Content-Length.
+headers = [
+    ["User-Agent", "frankenrust-conformance/1"],
+    ["Accept", "*/*"],
+]
+
+# ---------------------------------------------------------------------------
+# Cases
+# ---------------------------------------------------------------------------
+
+[[cases]]
+name = "hello"
+fixture = "hello.php"
+method = "GET"
+path = "/hello.php"
+
+[[cases]]
+name = "index"
+fixture = "index.php"
+method = "GET"
+path = "/index.php"
+
+[[cases]]
+name = "echo"
+fixture = "echo.php"
+method = "POST"
+path = "/echo.php"
+body = "echo=check"
+
+[[cases]]
+name = "input-get"
+fixture = "input.php"
+method = "GET"
+path = "/input.php"
+
+[[cases]]
+name = "input-post"
+fixture = "input.php"
+method = "POST"
+path = "/input.php"
+body = "input body check"
+
+[[cases]]
+name = "read-input"
+fixture = "read-input.php"
+method = "POST"
+path = "/read-input.php"
+body = "read-input-conformance"
+
+[[cases]]
+name = "cookies-basic"
+fixture = "cookies.php"
+method = "GET"
+path = "/cookies.php"
+headers = [
+    ["Cookie", "foo=bar"],
+    ["Cookie", "i=1"],
+]
+
+[[cases]]
+name = "cookies-malformed"
+fixture = "cookies.php"
+method = "GET"
+path = "/cookies.php"
+headers = [
+    ["Cookie", "foo =bar; ===;;==;  .dot.=val  ;  ; PHPSESSID=1234"],
+    ["Cookie", "secondCookie=test; secondCookie=overwritten"],
+]
+notes = """
+Adapted from frankenphp_test.go:403-422 (TestMalformedCookie). Upstream's Go
+test feeds this header string directly to the handler function in-process
+(httptest.NewRecorder), bypassing HTTP/1.1 wire parsing entirely -- that is
+the only reason its literal '\\x00' (a real NUL byte, Go `\\x00` in a double-
+quoted string) survives as part of a header value there. Measured against the
+real container over a real TCP connection: a NUL byte inside a header value
+gets a 400 Bad Request from Go's net/http server before the request ever
+reaches PHP (net/textproto rejects the control character during header
+parsing). Since this harness replays over actual HTTP, the NUL byte is
+dropped from this case; the rest of the malformed structure (unequal-sign
+noise, leading/trailing spaces, a dot in the cookie name, a second Cookie
+header that must not overwrite the first occurrence of a repeated name) is
+kept unchanged. Expected body keeps 'foo_' => 'bar', '_dot_' => 'val  ',
+'PHPSESSID' => '1234', 'secondCookie' => 'test'.
+"""
+
+[[cases]]
+name = "headers"
+fixture = "headers.php"
+method = "GET"
+path = "/headers.php"
+query = "i=1"
+
+[[cases]]
+name = "response-headers"
+fixture = "response-headers.php"
+method = "GET"
+path = "/response-headers.php"
+query = "i=0"
+notes = """
+?i is mandatory, not cosmetic: response-headers.php:10 does
+`if ($_GET['i'] % 3) { http_response_code($_GET['i'] + 100); }`. i=0 takes the
+falsy branch and keeps status 200; i=1 or i=2 sends 1xx-range codes
+(101/102) that were observed to hang a real HTTP/1.1 client mid-response
+against this image -- confirmed by hand while building this corpus, not part
+of the corpus itself. Pin i=0.
+"""
+
+[[cases]]
+name = "custom-status-line"
+fixture = "custom-status-line.php"
+method = "GET"
+path = "/custom-status-line.php"
+
+[[cases]]
+name = "short-status-line"
+fixture = "short-status-line.php"
+method = "GET"
+path = "/short-status-line.php"
+
+[[cases]]
+name = "only-headers"
+fixture = "only-headers.php"
+method = "GET"
+path = "/only-headers.php"
+
+[[cases]]
+name = "large-response"
+fixture = "large-response.php"
+method = "GET"
+path = "/large-response.php"
+
+[[cases]]
+name = "large-request"
+fixture = "large-request.php"
+method = "POST"
+path = "/large-request.php"
+query = "i=1"
+body_repeat_char = "a"
+body_repeat_count = 10000
+
+[[cases]]
+name = "flush"
+fixture = "flush.php"
+method = "GET"
+path = "/flush.php"
+query = "i=1"
+notes = "Body is stable but chunk framing is not (flush() vs a single write). http.client.HTTPResponse.read() decodes Transfer-Encoding: chunked transparently, so comparison here is already on the decoded body, never on chunk boundaries."
+
+[[cases]]
+name = "autoloader"
+fixture = "autoloader.php"
+method = "GET"
+path = "/autoloader.php"
+query = "i=1"
+
+[[cases]]
+name = "file-upload-get"
+fixture = "file-upload.php"
+method = "GET"
+path = "/file-upload.php"
+
+[[cases]]
+name = "file-upload-post"
+fixture = "file-upload.php"
+method = "POST"
+path = "/file-upload.php"
+kind = "multipart_upload"
+multipart_field = "file"
+multipart_filename = "conformance.txt"
+multipart_content = "frankenrust conformance fixture\n"
+multipart_boundary = "----FrankenRustConformanceBoundary1"
+notes = "Boundary and filename are fixed, not client-generated, so the exact request bytes are reproducible. The response ('Upload OK') does not echo either back, so this is belt-and-braces rather than load-bearing."
+
+[[cases]]
+name = "request-superglobal"
+fixture = "request-superglobal.php"
+method = "POST"
+path = "/request-superglobal.php"
+query = "g1=v1"
+headers = [["Content-Type", "application/x-www-form-urlencoded"]]
+body = "foo=bar&baz=qux"
+
+[[cases]]
+name = "transition-regular"
+fixture = "transition-regular.php"
+method = "GET"
+path = "/transition-regular.php"
+
+[[cases]]
+name = "finish-request"
+fixture = "finish-request.php"
+method = "GET"
+path = "/finish-request.php"
+query = "i=1"
+
+[[cases]]
+name = "server-globals"
+fixture = "server-globals.php"
+method = "GET"
+path = "/server-globals.php"
+
+[[cases]]
+name = "exception"
+fixture = "exception.php"
+method = "GET"
+path = "/exception.php"
+query = "i=0"
+
+[[cases]]
+name = "server-all-vars-ordered"
+fixture = "server-all-vars-ordered.php"
+method = "POST"
+path = "/server-all-vars-ordered.php/path"
+query = "specialChars=%3E%00</>"
+headers = [
+    ["Content-Type", "application/x-www-form-urlencoded"],
+    ["Special-Chars", "<%00>"],
+    ["X-Empty-Header", ""],
+]
+auth_user = "user"
+body = "foo=bar"
+min_replays = 10
+notes = """
+Driven as upstream's own TestAllDefinedServerVars does at
+caddy/caddy_test.go:1114 (POST, Content-Type: application/x-www-form-urlencoded,
+body foo=bar, PATH_INFO via extra path info, a query string with special
+characters, a `user@` credential so REMOTE_USER is populated, plus the
+Special-Chars and X-Empty-Header request headers). Upstream's own test relies
+on a Caddyfile `rewrite` directive we don't have access to when driving the
+plain image; requesting /server-all-vars-ordered.php/path directly produces
+the same PATH_INFO split (measured against the running container) via the
+image's stock Caddyfile try_files/split_path config, so no rewrite is needed.
+`auth_user = "user"` sends `Authorization: Basic <base64("user:")>`. Omitting
+PATH_INFO, the query string, or any of the two extra headers bakes
+`Undefined array key` warnings into the golden -- measured.
+Determinism rests on Go's http.Header map iteration order (cgi.go:151) for
+every *other* dropped $_SERVER dump, but this fixture reads only from a fixed
+list of hardcoded keys (server-all-vars-ordered.php), so it never touches
+that map. min_replays = 10 to prove it (measured 5/5 identical while writing
+this corpus; the acceptance bar in issue #4 is >=10).
+"""
+
+[[cases]]
+name = "request-headers"
+fixture = "request-headers.php"
+method = "GET"
+path = "/request-headers.php"
+headers = [["X-Conformance", "1"]]
+headers_override = true
+min_replays = 10
+notes = """
+The only coverage of apache_request_headers(). request.Header is a Go map
+(cgi.go:151), and Go deliberately randomises map iteration order above one
+entry -- measured 4 distinct HTTP_* orderings in 12 runs with a 5-header
+request. A *one-element* map has exactly one possible iteration order, so
+this case is deterministic by construction as long as it stays at exactly
+one custom header -- measured 8/8 identical. headers_override = true is what
+makes that true: it suppresses [defaults] (User-Agent, Accept) entirely, and
+capture/replay never add Accept-Encoding to any case. Host is promoted to
+Go's req.Host and is never part of request.Header, so it does not count
+toward the one.
+
+INVARIANT, read before editing: adding a second header to this case turns
+the gate into a coin-flip on Go's map iteration order. Do not add one without
+re-deriving the determinism measurement in this comment.
+"""
+
+# ---------------------------------------------------------------------------
+# Excluded fixtures, with reasons. Not replayed by capture.sh or run.sh.
+# ---------------------------------------------------------------------------
+
+[[excluded]]
+fixture = "server-variable.php"
+reason = "Dumps all of $_SERVER; cgi.go:151 iterates a Go map, so HTTP_* key order is randomised per request. Coverage replaced by server-all-vars-ordered.php ($_SERVER) and request-superglobal.php ($_GET/$_POST/$_REQUEST)."
+
+[[excluded]]
+fixture = "super-globals.php"
+reason = "Same map-order non-determinism as server-variable.php; same replacement."
+
+[[excluded]]
+fixture = "phpinfo.php"
+reason = "Non-deterministic: build/env/timing details throughout."
+
+[[excluded]]
+fixture = "sleep.php"
+reason = "Non-deterministic timing; also not regular-mode-shaped for this corpus."
+
+[[excluded]]
+fixture = "timeout.php"
+reason = "Non-deterministic timing."
+
+[[excluded]]
+fixture = "worker-sleep.php"
+reason = "Worker-only, and non-deterministic timing."
+
+[[excluded]]
+fixture = "failing-worker.php"
+reason = "Worker-only; also literally rand(1,100) <= 50."
+
+[[excluded]]
+fixture = "worker-counter-persistent.php"
+reason = "Worker-only; also uses random_bytes."
+
+[[excluded]]
+fixture = "session.php"
+reason = "Random PHPSESSID per request."
+
+[[excluded]]
+fixture = "session-handler.php"
+reason = "Random PHPSESSID per request."
+
+[[excluded]]
+fixture = "session-leak.php"
+reason = "Random PHPSESSID per request."
+
+[[excluded]]
+fixture = "session_deadlock.php"
+reason = "Random PHPSESSID per request."
+
+[[excluded]]
+fixture = "worker-with-session-handler.php"
+reason = "Worker-only; random PHPSESSID per request."
+
+[[excluded]]
+fixture = "opcache_reset.php"
+reason = "Mutates process-wide opcache state; not a stable read."
+
+[[excluded]]
+fixture = "preload-check.php"
+reason = "Only meaningful with preloading enabled, which this corpus does not turn on."
+
+[[excluded]]
+fixture = "mercure-publish.php"
+reason = "Out of project scope (Mercure is explicitly unimplemented, docs/PORTING-NOTES.md)."
+
+[[excluded]]
+fixture = "dedup-match-worker.php"
+reason = "Worker-only; Prometheus metric-label regression coverage, out of scope here."
+
+[[excluded]]
+fixture = "dedup-plain-worker.php"
+reason = "Worker-only; Prometheus metric-label regression coverage, out of scope here."
+
+[[excluded]]
+fixture = "early-hints.php"
+reason = "Requires HTTP/2; out of scope (HTTP/1.1 only)."
+
+[[excluded]]
+fixture = "finish-then-read-input.php"
+reason = "Requires HTTP/2; out of scope (HTTP/1.1 only)."
+
+[[excluded]]
+fixture = "dirindex/"
+reason = "Static file / directory-index routing policy, out of scope."
+
+[[excluded]]
+fixture = "symlinks/"
+reason = "Static file routing policy, out of scope."
+
+[[excluded]]
+fixture = "files/"
+reason = "Static file routing policy, out of scope."
+
+[[excluded]]
+fixture = "hello.txt"
+reason = "Static file serving, out of scope."
+
+[[excluded]]
+fixture = "command.php"
+reason = "CLI invocation, out of scope."
+
+[[excluded]]
+fixture = "command-pcntl.php"
+reason = "CLI + pcntl, out of scope."
+
+[[excluded]]
+fixture = "persist-roundtrip.php"
+reason = "Needs a -DFRANKENPHP_TEST build."
+
+[[excluded]]
+fixture = "integration/"
+reason = "extgen Go fixtures, out of scope."
+
+[[excluded]]
+fixture = "performance/"
+reason = "k6 scripts, not HTTP conformance fixtures."
+
+[[excluded]]
+fixture = "worker*.php"
+reason = "Worker-only: runs its own frankenphp_handle_request loop and cannot serve a plain request. Worker-mode conformance is issue #14's job."
+
+[[excluded]]
+fixture = "dd.php"
+reason = "Worker-only."
+
+[[excluded]]
+fixture = "die.php"
+reason = "Worker-only."
+
+[[excluded]]
+fixture = "file-stream.php"
+reason = "Worker-only."
+
+[[excluded]]
+fixture = "message-worker.php"
+reason = "Worker-only."
+
+[[excluded]]
+fixture = "non-worker.php"
+reason = "Worker-only despite the name (drives frankenphp_handle_request itself)."
+
+[[excluded]]
+fixture = "transition-worker-1.php"
+reason = "Worker-only."
+
+[[excluded]]
+fixture = "transition-worker-2.php"
+reason = "Worker-only."

@@ -1,0 +1,6 @@
+# Golden files store a normalised representation, not raw wire bytes (see
+# lib/common.py:render_http), and are compared byte-for-byte against a fresh
+# rendering at replay time. Force LF so no git config (core.autocrlf, a
+# missing repo-root .gitattributes) can rewrite a committed CRLF to LF -- or
+# vice versa -- and silently break every golden's match against itself.
+golden/*.http text eol=lf
