@@ -437,11 +437,51 @@ def prompt_for(role: str, issue: gh.Issue, extra: str = "") -> str:
 
 
 # --- worktrees ---------------------------------------------------------------
+def preserve_branch(branch: str, tid: str) -> None:
+    """Tag anything on `branch` that main does not already have, before deletion.
+
+    make_worktree deletes the issue branch and starts again from main, which is
+    the right default -- a fresh attempt should not inherit a failed one's tree.
+    But the deletion was unconditional, and an issue branch is the ONLY copy of
+    an attempt: agents work uncommitted and merge_worktree commits for them, so
+    work that failed review exists nowhere else.
+
+    That nearly cost the project its hardest result. #11 failed review three
+    times and its branch carried 3,955 lines including `frankenrust-sys/shim.c`
+    -- the one sound answer to a Zend bailout crossing a Rust frame, arrived at
+    only after the obvious approach was implemented and rejected as UB. The next
+    claim of #11 would have deleted it, and the loop would have rediscovered the
+    unsound version first, because that is the one the issue described.
+
+    Work becomes durable here by merging. Nothing else was keeping it, and the
+    attempts most worth keeping are exactly the ones that failed.
+    """
+    rc, _ = git(["rev-parse", "--verify", "--quiet", branch])
+    if rc != 0:
+        return                                   # no such branch, nothing to keep
+    # `--is-ancestor` is the question that matters: does main already contain
+    # every commit here? Comparing tips would tag branches that are merely
+    # behind, filling the tag namespace with duplicates of main.
+    rc, _ = git(["merge-base", "--is-ancestor", branch, "main"])
+    if rc == 0:
+        return                                   # fully merged, safe to delete
+    tag = f"attempt/{tid}/{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    rc, out = git(["tag", tag, branch])
+    if rc != 0:
+        log(f"    !! could not preserve {branch} before deleting it: {out}")
+        record("preserve_failed", branch=branch, reason=out[-500:])
+        return
+    _, n = git(["rev-list", "--count", f"main..{branch}"])
+    log(f"    ~~ preserved {branch} as {tag} ({n.strip()} commit(s) not on main)")
+    record("branch_preserved", branch=branch, tag=tag, commits=int(n.strip() or 0))
+
+
 def make_worktree(tid: str) -> Path:
     wt, branch = WORKTREES / tid, f"issue/{tid}"
     if wt.exists():
         git(["worktree", "remove", "--force", str(wt)])
         shutil.rmtree(wt, ignore_errors=True)
+    preserve_branch(branch, tid)
     git(["branch", "-D", branch])
     rc, out = git(["worktree", "add", "-b", branch, str(wt), "main"])
     if rc != 0:

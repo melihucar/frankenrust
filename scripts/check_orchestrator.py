@@ -498,6 +498,70 @@ def check_pre_implementer_stages_restore() -> int:
     return bad
 
 
+def check_unmerged_work_survives_reclaim() -> int:
+    """Re-claiming an issue must not destroy the previous attempt's commits.
+
+    An issue branch is the only copy of an attempt: agents work uncommitted and
+    merge_worktree commits for them, so anything that failed review exists
+    nowhere else. make_worktree's `git branch -D` was unconditional.
+
+    #11's branch held 3,955 lines including the only sound design for a Zend
+    bailout crossing a Rust frame -- reached only after the obvious approach was
+    built and rejected as UB. Re-claiming #11 would have deleted it, and the
+    loop would have rebuilt the unsound version, because that is what the issue
+    body described.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    def sh(cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=cwd, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    real_git, real_log, real_record = loop.git, loop.log, loop.record
+    events: list[tuple[str, dict]] = []
+    loop.log = lambda msg: None
+    loop.record = lambda event, **f: events.append((event, f))
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            sh(repo, "init", "-q", "-b", "main")
+            sh(repo, "config", "user.email", "check@example.com")
+            sh(repo, "config", "user.name", "check")
+            (repo / "a.txt").write_text("base\n")
+            sh(repo, "add", "-A"); sh(repo, "commit", "-q", "-m", "base")
+
+            # an attempt that failed review: committed, never merged
+            sh(repo, "checkout", "-q", "-b", "issue/99")
+            (repo / "hard-won.c").write_text("the only copy\n")
+            sh(repo, "add", "-A"); sh(repo, "commit", "-q", "-m", "attempt")
+            sha = sh(repo, "rev-parse", "HEAD")
+            sh(repo, "checkout", "-q", "main")
+
+            loop.git = lambda args, cwd=repo: real_git(args, cwd=repo)
+            loop.preserve_branch("issue/99", "99")
+            sh(repo, "branch", "-D", "issue/99")
+
+            bad = 0
+            tags = sh(repo, "tag", "--list").split()
+            if not tags:
+                bad += fail("preserve_branch left no tag; an unmerged attempt is "
+                            "destroyed by the next claim of its issue")
+            elif sh(repo, "rev-parse", tags[0]) != sha:
+                bad += fail(f"preserved tag {tags[0]} does not point at the attempt")
+
+            # a fully-merged branch must NOT be tagged, or every reclaim litters
+            sh(repo, "checkout", "-q", "-b", "issue/98")
+            sh(repo, "checkout", "-q", "main")
+            before = len(sh(repo, "tag", "--list").split())
+            loop.preserve_branch("issue/98", "98")
+            if len(sh(repo, "tag", "--list").split()) != before:
+                bad += fail("preserve_branch tagged a branch main already contains")
+            return bad
+    finally:
+        loop.git, loop.log, loop.record = real_git, real_log, real_record
+
+
 def check_filing_contract_is_stated() -> int:
     """Every role that files an issue must be told the body format.
 
@@ -627,5 +691,6 @@ if __name__ == "__main__":
              + check_gate_targets_the_worktree() + check_no_absorbing_states()
              + check_blocked_has_a_recovery_path() + check_waiting_is_annotation_only()
              + check_silent_reviewer_is_not_a_pass() + check_pre_implementer_stages_restore()
+             + check_unmerged_work_survives_reclaim()
              + check_filing_contract_is_stated() + check_reviewer_restore()
              + check_verdict_parsing() else 0)
