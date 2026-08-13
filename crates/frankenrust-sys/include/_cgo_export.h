@@ -17,6 +17,15 @@
  * `#[unsafe(no_mangle)] pub extern "C" fn`. This issue (#7) only wires them
  * up as abort-stubs; #10, #11, #12 and #14 give them real bodies.
  *
+ * One exception, added by #11 (see issue #75): go_register_server_variables
+ * is defined in ../shim.c, in C. Everything it calls allocates through the
+ * Zend request allocator, whose out-of-memory path is zend_bailout() -- a
+ * longjmp to a zend_catch above the callback. Go tolerates that jump crossing
+ * a live cgo frame; Rust has no defined behaviour for it crossing a Rust
+ * frame, so that callback's C-ABI entry point has to be C, and Rust supplies
+ * only the half that touches no PHP API
+ * (frankenrust_collect_server_vars, frankenrust_shim.h).
+ *
  * Included by frankenphp.c after php.h, the Zend/TSRM/SAPI headers and
  * frankenphp.h (frankenphp.c:1-47), so `zend_string`, `zval`, `zend_llist`,
  * `zend_array`, `zend_long`, `sapi_request_info` and `go_string` are all

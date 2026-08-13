@@ -151,10 +151,11 @@ fn main() {
     build
         .file(vendor_dir.join("frankenphp.c"))
         .file(vendor_dir.join("types.c"))
-        // Ours, not upstream's: the zend_try/zend_catch trampolines that keep a
-        // zend_bailout()'s longjmp from ever crossing a Rust frame (issue #75).
-        // Compiled with exactly the same flags and include path as the vendored
-        // sources because it calls into them and reads EG() the same way.
+        // Ours, not upstream's: the C-side definition of
+        // go_register_server_variables, which keeps a zend_bailout()'s longjmp
+        // from ever crossing a Rust frame (issue #75). Compiled with exactly
+        // the same flags and include path as the vendored sources because it
+        // calls into them and reads EG() the same way.
         .file(manifest_dir.join("shim.c"))
         // for frankenphp.c:47 `#include "_cgo_export.h"`
         .include(&sys_include_dir)
@@ -305,21 +306,25 @@ fn main() {
         .allowlist_type("HashTable")
         .allowlist_type("zval")
         .allowlist_type("zend_long")
+        // shim.c's wire format (frankenrust_shim.h) -- see the `.file()` above.
+        // Taken from the header rather than hand-written in frankenrust-core so
+        // the two sides of the boundary cannot drift.
+        .allowlist_type("frankenrust_header_var")
+        .allowlist_type("frankenrust_server_vars_batch")
         // frankenphp.h functions this issue's acceptance test and the near-term
         // callback bodies need. frankenrust-sys/build.rs is not part of issue #7's
         // frozen module layout (docs/ARCHITECTURE.md) -- later issues extend this
         // list as they need more of frankenphp.h's / types.h's surface.
         .allowlist_function("frankenphp_get_version")
         .allowlist_function("frankenphp_get_config")
+        // The next three are called from shim.c, not from Rust (issue #75 --
+        // a zend_bailout() out of any of them must not cross a Rust frame).
+        // Issue #11 asks for them by name anyway and #12/#13 want the same
+        // corner of frankenphp.h, so they stay exposed.
         .allowlist_function("frankenphp_register_server_vars")
         .allowlist_function("frankenphp_register_known_variable")
         .allowlist_function("frankenphp_register_variable_safe")
         .allowlist_function("frankenphp_init_persistent_string")
-        // shim.c's trampolines (frankenrust_shim.h) -- see the `.file()` above.
-        .allowlist_function("frankenrust_try_register_server_vars")
-        .allowlist_function("frankenrust_try_register_known_variable")
-        .allowlist_function("frankenrust_try_register_variable_safe")
-        .allowlist_function("frankenrust_bailout")
         // The two real thread entry points (frankenphp.h:190-191): not called by
         // this issue's abort-stubs, but tests/version.rs takes their address (never
         // calls them) so the linker's --gc-sections can see a live reference into

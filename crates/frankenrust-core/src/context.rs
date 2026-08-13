@@ -593,6 +593,21 @@ pub struct RequestContext {
     completion_signal: mpsc::Sender<()>,
 
     pub arena: RequestArena,
+
+    /// Backing store for the `frankenrust_server_vars_batch` that
+    /// `frankenrust-sys/shim.c`'s `go_register_server_variables` reads --
+    /// installed by [`RequestContext::install_server_vars`], replaced on the
+    /// next request that reuses this context, and otherwise reclaimed with
+    /// the context itself.
+    ///
+    /// It lives here for the same reason [`RequestArena`] does, and it is the
+    /// same reason: the C side may `zend_bailout()` partway through reading
+    /// it, and a `longjmp` runs no Rust destructor. Anything owned by a Rust
+    /// frame at that moment is leaked; anything owned by the context is not,
+    /// because the context's reclaim point is the slot being cleared or
+    /// replaced, which the `longjmp` cannot skip past. See
+    /// [`crate::cgi::ServerVarsBatch`].
+    server_vars: Option<crate::cgi::ServerVarsBatch>,
 }
 
 impl RequestContext {
@@ -644,7 +659,24 @@ impl RequestContext {
             client_had_closed: false,
             completion_signal,
             arena: RequestArena::default(),
+            server_vars: None,
         })
+    }
+
+    /// Takes ownership of `batch` and returns the C view of the *installed*
+    /// copy, so that every pointer C receives targets memory this context
+    /// owns rather than a Rust frame that is about to disappear.
+    ///
+    /// Replaces the previous request's batch, if any -- upstream re-pins per
+    /// worker request too (`frankenphp.c:563` -> `:354`). That is safe at
+    /// this point and only at this point: the previous batch can only still
+    /// be reachable from C if a previous `go_register_server_variables` were
+    /// still running on this thread, and a thread runs one request at a time.
+    pub fn install_server_vars(
+        &mut self,
+        batch: crate::cgi::ServerVarsBatch,
+    ) -> frankenrust_sys::frankenrust_server_vars_batch {
+        self.server_vars.insert(batch).as_c_batch()
     }
 
     pub fn validate(&self) -> Result<(), RejectedRequest> {

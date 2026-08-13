@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
-use frankenrust_sys::{frankenphp_server_vars, sapi_request_info, zend_string, zval};
+use frankenrust_sys::{
+    frankenphp_server_vars, frankenrust_header_var, frankenrust_server_vars_batch,
+    sapi_request_info, zend_string,
+};
 
 use crate::context::{RequestContext, Scheme};
 
@@ -682,199 +685,158 @@ impl ComputedServerVars {
     }
 }
 
-/// Everything `go_register_server_variables` hands to PHP, copied out of the
-/// [`RequestContext`] so that the per-thread slot lock is released *before*
-/// any of it reaches C. See [`crate::context::ContextSlots`]'s "one rule for
-/// callers": a `zend_bailout()` out of any of the register calls is a
-/// `longjmp` that runs no Rust destructors, so a slot guard alive across
-/// them would be leaked and that thread's slot locked forever.
+/// The C descriptor array `shim.c` walks, held apart from the rest of
+/// [`ServerVarsBatch`] so its `Send` impl is one obvious line rather than a
+/// blanket claim over the whole struct.
 ///
-/// Releasing the slot lock is only half of it. The register calls themselves
-/// run with *this* payload owned by a live Rust frame, and
+/// `frankenrust_header_var` (`frankenrust_shim.h`) holds raw pointers, which
+/// makes it `!Send`, and [`RequestContext`] must be `Send` because
+/// [`crate::context::CONTEXT_SLOTS`] is a `static`.
+struct HeaderVars(Vec<frankenrust_header_var>);
+
+// SAFETY: every pointer in this vector targets either a heap buffer owned by
+// the same `ServerVarsBatch` (`values`, `keys` -- see `build_server_vars_batch`,
+// the only constructor) or a process-lifetime interned `zend_string` (which is
+// already `Send`+`Sync`, see `InternedZendString`). Moving the batch to another
+// thread moves `Vec` handles, never the heap bytes they point at, so every
+// pointer stays valid across the move. None of the targets has interior
+// mutability, and access is serialised anyway: the Rust side only ever reaches
+// them under the slot `Mutex`, and the C side only from the PHP thread that
+// owns that slot.
+unsafe impl Send for HeaderVars {}
+
+/// Owned backing store for one `go_register_server_variables` call: every key
+/// and value the C side hands to PHP, plus the descriptor array pointing at
+/// them.
+///
+/// ## Why this is owned by the context and not by a stack frame
+///
 /// `frankenphp_register_server_vars` / `_known_variable` / `_variable_safe`
-/// grow and populate `$_SERVER`'s `HashTable` through the Zend request
+/// grow and populate `$_SERVER`'s `HashTable` through the Zend *request*
 /// allocator, which on `memory_limit` exhaustion does not return an error --
 /// `zend_error_noreturn(E_ERROR, ...)` ends in `zend_bailout()`, a `longjmp`
-/// that skips every frame in between without running its destructors. Rust
-/// treats a `longjmp` crossing any of its frames as undefined behaviour
-/// regardless of what that frame owns, so upstream's Go arrangement (a live
-/// cgo frame under the same `zend_try`) cannot simply be inherited.
+/// to a `zend_catch` above the callback that skips every frame in between and
+/// runs no cleanup. Rust has no defined behaviour for a `longjmp` crossing one
+/// of its frames, whatever that frame owns -- and, the trap an earlier
+/// revision of this file fell into, that stays true if you catch the bailout
+/// in C and re-raise it from Rust: the re-raise jumps *out of* the Rust
+/// callback frame just the same.
 ///
-/// So none of the three C functions is called directly: each goes through the
-/// matching `frankenrust_try_*` trampoline in
-/// `crates/frankenrust-sys/shim.c`, which owns the `setjmp` in a pure C frame
-/// and converts a bailout into a `false` return. The Rust frames then unwind
-/// by ordinary returns -- every destructor runs -- and
-/// `go_register_server_variables` re-raises with `frankenrust_bailout()` only
-/// once nothing but its own argument-only `extern "C"` frame is left. PHP's
-/// control flow is unchanged (see `shim.c`'s header comment); the difference
-/// is that no Rust frame holding a destructor is ever between the `setjmp`
-/// and the `longjmp`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerVarsPayload {
-    pub known: ComputedServerVars,
-    /// Canonical header name -> its values joined with `", "` (`cgi.go:153`,
-    /// `:161`). The join is done here, under the slot lock, so that
-    /// [`add_headers_to_server`] does nothing but look up an interned key and
-    /// call C.
-    pub headers: Vec<(String, Vec<u8>)>,
+/// So `crates/frankenrust-sys/shim.c` defines `go_register_server_variables`
+/// itself and makes the entire registration a pure C frame; Rust only
+/// prepares the data and returns before the first Zend call
+/// ([`crate::callbacks::servervars::frankenrust_collect_server_vars`]).
+///
+/// That inverts the ownership question. The buffers C reads cannot live in a
+/// Rust frame, because by then there is no Rust frame; they live in the
+/// [`RequestContext`] instead, exactly like the [`crate::context::RequestArena`]
+/// backing `SG(request_info)`, and are reclaimed at the same point -- the
+/// context slot being cleared or replaced, which is upstream's `thread.Unpin()`
+/// instant. A bailout partway through the registration therefore leaks
+/// nothing: the memory has an owner that the `longjmp` cannot skip past.
+pub struct ServerVarsBatch {
+    known: ComputedServerVars,
+    /// `", "`-joined header values (`cgi.go:153`, `:161`), one per entry of
+    /// `headers`, in the same order.
+    values: Vec<Vec<u8>>,
+    /// NUL-terminated `HTTP_*` keys for the headers that miss the interned
+    /// table (`phpheaders.go:126`). Sparse -- only slow-path headers push here.
+    keys: Vec<Vec<u8>>,
+    headers: HeaderVars,
 }
 
-/// Copies out everything the `$_SERVER` population needs. `None` when there
-/// is no request, matching upstream's `if fc.request != nil` guard
-/// (`cgi.go:179`), which gates *both* the known variables and the headers.
-pub fn collect_server_vars(ctx: &RequestContext) -> Option<ServerVarsPayload> {
+/// Which of `frankenrust_header_var`'s two key forms a header resolved to,
+/// recorded during the first pass so that pointers are only taken once
+/// `values` and `keys` have stopped growing.
+enum HeaderKey {
+    /// One of the ~101 pre-interned keys -- the `frankenphp_register_known_variable`
+    /// fast path (`cgi.go:152-155`).
+    Interned(InternedZendString),
+    /// Index into `ServerVarsBatch::keys` -- the `frankenphp_register_variable_safe`
+    /// slow path (`cgi.go:158-163`).
+    Mangled(usize),
+}
+
+/// Port of `go_register_server_variables`' Rust-side half (`cgi.go:174-188`):
+/// everything up to, but not including, the calls into PHP.
+///
+/// `None` when there is no request, matching upstream's `if fc.request != nil`
+/// guard (`cgi.go:179`), which gates *both* the known variables and the
+/// headers.
+pub fn build_server_vars_batch(ctx: &RequestContext) -> Option<ServerVarsBatch> {
     let known = compute_server_vars(ctx)?;
-    let headers = ctx
-        .request
-        .as_ref()?
-        .headers
-        .iter()
-        .map(|(name, values)| (name.to_string(), join_header_values(values)))
-        .collect();
-
-    Some(ServerVarsPayload { known, headers })
-}
-
-/// A `zend_bailout()` that one of `shim.c`'s trampolines caught on our
-/// behalf. By the time this reaches Rust the Zend engine has already reported
-/// its fatal error and the request is doomed; the only correct handling is to
-/// stop making PHP calls, let every Rust frame unwind normally, and re-raise
-/// with `frankenrust_bailout()` from a frame that owns nothing.
-///
-/// Deliberately a fieldless ZST: it is returned *through* the frames a
-/// re-raised bailout will eventually jump over, so it must itself have no
-/// drop glue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Bailout;
-
-// The soundness argument in `go_register_server_variables` is that when it
-// finally re-raises, its frame holds nothing a `longjmp` could leak. The only
-// non-argument value left there is this verdict, so pin it at compile time
-// (the same `const _: () =` device `frankenrust-sys/src/layout.rs` uses for
-// the struct offsets): giving `Bailout` a payload -- an error message, a
-// `String` -- would silently reintroduce drop glue into the one frame the
-// jump is allowed to cross.
-//
-// `Result<(), Bailout>` itself is 1 byte, not 0: both variants are zero-sized
-// so the discriminant is all that is left. A byte in a register is not
-// something a `longjmp` can leak; drop glue is.
-const _: () = assert!(
-    !std::mem::needs_drop::<Result<(), Bailout>>() && std::mem::size_of::<Bailout>() == 0,
-    "Bailout must stay a zero-sized, drop-free verdict: it is returned through \
-     the frames a re-raised zend_bailout() then longjmps over"
-);
-
-/// The whole C-calling half of `go_register_server_variables`
-/// (`cgi.go:176-188`), over an already-collected payload.
-///
-/// `Err(Bailout)` means PHP bailed out partway through and the caller owes a
-/// `frankenrust_bailout()` once its own frames are gone -- see
-/// [`ServerVarsPayload`].
-///
-/// # Safety
-/// Same contract as [`register_known_server_vars`]. In addition, the caller
-/// must hold **no** [`crate::context::ContextSlots`] guard: a guard is
-/// exactly the kind of value whose destructor a bailout must not be allowed
-/// to skip, and the trampolines only protect frames *below* this one.
-pub unsafe fn register_server_vars(
-    payload: &ServerVarsPayload,
-    track_vars_array: *mut zval,
-) -> Result<(), Bailout> {
-    // SAFETY: forwarded verbatim from this function's own contract.
-    unsafe {
-        register_known_server_vars(&payload.known, track_vars_array)?;
-        add_headers_to_server(&payload.headers, track_vars_array)
-    }
-}
-
-/// Calls `frankenphp_register_server_vars` once, per `cgi.go:104` -- through
-/// `shim.c`'s `zend_try` trampoline rather than directly.
-///
-/// # Safety
-/// The caller must be on the PHP thread that owns `track_vars_array`
-/// (`$_SERVER`'s backing zval), with an active Zend request -- this is only
-/// sound to call from within `frankenphp_register_variables()`
-/// (`frankenphp.c:1371-1383`), which is where upstream calls the equivalent
-/// Go function from. That thread has necessarily run
-/// `ZEND_TSRMLS_CACHE_UPDATE()` (`frankenphp.c:1491`, `:1647`), which is what
-/// the trampoline's own `EG(bailout)` access requires.
-pub unsafe fn register_known_server_vars(
-    vars: &ComputedServerVars,
-    track_vars_array: *mut zval,
-) -> Result<(), Bailout> {
-    let ffi_vars = vars.as_ffi();
-    // SAFETY: see this function's own contract. `ffi_vars` borrows from
-    // `vars`'s buffers, which are on our caller's stack and outlive this
-    // call; frankenphp_register_server_vars copies every field into a new
-    // zval before returning (frankenphp.c:1220-1268), so it does not need
-    // to outlive this call either. The trampoline owns the `setjmp`, so a
-    // `memory_limit` bailout inside it returns `false` to this frame instead
-    // of `longjmp`ing over it.
-    let ok = unsafe {
-        frankenrust_sys::frankenrust_try_register_server_vars(track_vars_array, ffi_vars)
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(Bailout)
-    }
-}
-
-/// Port of `addHeadersToServer` (`cgi.go:150-164`), over the already-joined
-/// pairs [`collect_server_vars`] copied out of the context.
-///
-/// Stops at the first caught bailout: past that point the request heap is
-/// exhausted and the engine has already gone fatal, so every further
-/// registration would do nothing but re-report the same error.
-///
-/// # Safety
-/// Same contract as [`register_server_vars`].
-pub unsafe fn add_headers_to_server(
-    headers: &[(String, Vec<u8>)],
-    track_vars_array: *mut zval,
-) -> Result<(), Bailout> {
+    let request = ctx.request.as_ref()?;
     let interned = interned_strings();
-    for (name, joined) in headers {
-        let ok = if let Some(key) = interned.common_headers.get(name.as_str()) {
-            // SAFETY: `key.0` is a live, permanently-interned zend_string*
-            // (never freed, `IS_STR_INTERNED`); `joined` is valid for the
-            // duration of this call and frankenphp_register_known_variable
-            // copies it immediately via frankenphp_register_trusted_var
-            // (frankenphp.c:1200-1218, 1337-1342), so it does not need to
-            // outlive this call. `track_vars_array` is valid per this
-            // function's own contract, and the trampoline keeps a bailout
-            // from crossing this frame -- which matters here in particular,
-            // because `key` below is a `Vec<u8>` this frame owns.
-            unsafe {
-                frankenrust_sys::frankenrust_try_register_known_variable(
-                    key.0,
-                    joined.as_ptr() as *mut c_char,
-                    joined.len(),
-                    track_vars_array,
-                )
-            }
-        } else {
-            let mut key = uncommon_header_key(name);
-            // SAFETY: `key` is NUL-terminated (uncommon_header_key) and, like
-            // `joined`, valid for this call only -- frankenphp_register_variable_safe
-            // copies through php_register_variable_safe before returning
-            // (frankenphp.c:1344-1360).
-            unsafe {
-                frankenrust_sys::frankenrust_try_register_variable_safe(
-                    key.as_mut_ptr() as *mut c_char,
-                    joined.as_ptr() as *mut c_char,
-                    joined.len(),
-                    track_vars_array,
-                )
-            }
-        };
 
-        if !ok {
-            return Err(Bailout);
+    let mut values: Vec<Vec<u8>> = Vec::with_capacity(request.headers.name_count());
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut key_forms: Vec<HeaderKey> = Vec::with_capacity(request.headers.name_count());
+
+    for (name, header_values) in request.headers.iter() {
+        values.push(join_header_values(header_values));
+        match interned.common_headers.get(name) {
+            Some(interned_key) => key_forms.push(HeaderKey::Interned(*interned_key)),
+            None => {
+                keys.push(uncommon_header_key(name));
+                key_forms.push(HeaderKey::Mangled(keys.len() - 1));
+            }
         }
     }
-    Ok(())
+
+    // Second pass, now that neither `values` nor `keys` will be pushed to
+    // again. (Their *inner* buffers would survive further growth of the outer
+    // `Vec` anyway -- that is the same address-stability property the arena
+    // relies on -- but taking the pointers only once nothing can move is the
+    // invariant that is easy to keep true as this function is edited.)
+    let headers = key_forms
+        .iter()
+        .zip(values.iter())
+        .map(|(key_form, value)| frankenrust_header_var {
+            known_key: match key_form {
+                HeaderKey::Interned(key) => key.0,
+                HeaderKey::Mangled(_) => std::ptr::null_mut(),
+            },
+            key: match key_form {
+                HeaderKey::Interned(_) => std::ptr::null_mut(),
+                HeaderKey::Mangled(index) => keys[*index].as_ptr() as *mut c_char,
+            },
+            value: value.as_ptr() as *mut c_char,
+            value_len: value.len(),
+        })
+        .collect();
+
+    Some(ServerVarsBatch {
+        known,
+        values,
+        keys,
+        headers: HeaderVars(headers),
+    })
+}
+
+impl ServerVarsBatch {
+    /// The by-value view `shim.c` reads, per `frankenrust_shim.h`.
+    ///
+    /// Every pointer in the returned struct borrows from `self` (or from the
+    /// process-lifetime interned strings), so it is only meaningful while
+    /// `self` is alive -- which is why the only caller installs `self` into
+    /// the [`RequestContext`] first and hands C the result of calling this on
+    /// the *installed* copy.
+    pub fn as_c_batch(&self) -> frankenrust_server_vars_batch {
+        // `values` and `keys` exist to *own* what the descriptors point at:
+        // their contents are only ever read from C, through those pointers,
+        // which is why nothing in Rust reads them. Checking the shape here
+        // pins the one-descriptor-per-value invariant `build_server_vars_batch`
+        // establishes -- if a future edit pushed to one and not the other,
+        // `num_headers` below would walk off the end of the C array.
+        debug_assert_eq!(self.headers.0.len(), self.values.len());
+        debug_assert!(self.keys.len() <= self.values.len());
+
+        frankenrust_server_vars_batch {
+            vars: self.known.as_ffi(),
+            headers: self.headers.0.as_ptr(),
+            num_headers: self.headers.0.len(),
+        }
+    }
 }
 
 fn join_header_values(values: &[Vec<u8>]) -> Vec<u8> {
@@ -1428,26 +1390,286 @@ mod tests {
     fn compute_server_vars_is_none_without_a_request() {
         let ctx = test_context(None);
         assert!(compute_server_vars(&ctx).is_none());
-        assert!(collect_server_vars(&ctx).is_none());
+        assert!(build_server_vars_batch(&ctx).is_none());
+    }
+
+    // --- the filled frankenphp_server_vars (issue #11 acceptance) ------------
+    //
+    // `as_ffi()` is the field mapping itself -- 36 fields, and a transposed
+    // pair corrupts $_SERVER silently rather than crashing. The compile-time
+    // offset assertions in frankenrust-sys/src/layout.rs:93-154 pin where each
+    // field *is*; only a test on a filled struct can pin what goes *in* it.
+    //
+    // Deliberately does not call frankenphp_register_server_vars: that reads
+    // frankenphp_strings for its keys and copies main_thread_env
+    // (frankenphp.c:1223-1229), both NULL without a booted PHP main thread, so
+    // calling it here would segfault rather than fail. `as_ffi()` itself only
+    // needs frankenphp_init_persistent_string, which is a plain persistent
+    // malloc with no TSRM dependency -- see `interned_strings`.
+
+    /// Reads one of the FFI struct's `char *`/`size_t` pairs back as bytes.
+    ///
+    /// # Safety
+    /// `ptr` must be the pointer half of a pair whose backing buffer is still
+    /// alive -- i.e. the `ComputedServerVars` that `as_ffi()` borrowed from.
+    unsafe fn ffi_field(ptr: *mut c_char, len: usize) -> Vec<u8> {
+        assert!(!ptr.is_null(), "as_ffi() must never hand C a NULL pointer");
+        // SAFETY: forwarded from this helper's own contract; every caller
+        // below keeps the source `ComputedServerVars` alive across the read.
+        unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec()
     }
 
     #[test]
-    fn collect_server_vars_joins_multi_valued_headers() {
-        // The ", " join addHeadersToServer needs (cgi.go:153, :161) happens
-        // at collection time now, so that the FFI step runs with no context
-        // slot lock held.
+    fn as_ffi_puts_every_value_in_the_right_field() {
+        let mut request = Request::new("GET", "/index.php/extra", "x=1")
+            .with_header("Content-Length", b"7".to_vec());
+        request.host = "example.com:8080".to_string();
+        request.remote_addr = "1.2.3.4:5678".to_string();
+        request.proto = "HTTP/1.1".to_string();
+        let ctx = test_context(Some(request));
+
+        let vars = compute_server_vars(&ctx).unwrap();
+        let ffi = vars.as_ffi();
+
+        // SAFETY: `vars` outlives every read below, and `ffi` borrows from it.
+        unsafe {
+            assert_eq!(ffi_field(ffi.remote_addr, ffi.remote_addr_len), b"1.2.3.4");
+            assert_eq!(ffi_field(ffi.remote_host, ffi.remote_host_len), b"1.2.3.4");
+            assert_eq!(ffi_field(ffi.remote_port, ffi.remote_port_len), b"5678");
+            assert_eq!(
+                ffi_field(ffi.document_root, ffi.document_root_len),
+                b"/var/www"
+            );
+            assert_eq!(ffi_field(ffi.path_info, ffi.path_info_len), b"/extra");
+            assert_eq!(
+                ffi_field(ffi.php_self, ffi.php_self_len),
+                b"/index.php/extra",
+                "PHP_SELF is script_name + path_info (cgi.go:102)"
+            );
+            assert_eq!(
+                ffi_field(ffi.document_uri, ffi.document_uri_len),
+                b"/index.php"
+            );
+            assert_eq!(
+                ffi_field(ffi.script_filename, ffi.script_filename_len),
+                b"/var/www/index.php"
+            );
+            assert_eq!(
+                ffi_field(ffi.script_name, ffi.script_name_len),
+                b"/index.php"
+            );
+            assert_eq!(
+                ffi_field(ffi.server_name, ffi.server_name_len),
+                b"example.com",
+                "SERVER_NAME is SplitHostPort's host (cgi.go:71-76)"
+            );
+            assert_eq!(ffi_field(ffi.server_port, ffi.server_port_len), b"8080");
+            assert_eq!(
+                ffi_field(ffi.content_length, ffi.content_length_len),
+                b"7",
+                "CONTENT_LENGTH is the raw header (cgi.go:93)"
+            );
+            assert_eq!(
+                ffi_field(ffi.server_protocol, ffi.server_protocol_len),
+                b"HTTP/1.1"
+            );
+            assert_eq!(
+                ffi_field(ffi.http_host, ffi.http_host_len),
+                b"example.com:8080",
+                "HTTP_HOST keeps the port (cgi.go:136)"
+            );
+            assert_eq!(
+                ffi_field(ffi.request_uri, ffi.request_uri_len),
+                b"/index.php/extra?x=1"
+            );
+            assert_eq!(
+                ffi_field(ffi.ssl_cipher, ffi.ssl_cipher_len),
+                b"",
+                "TLS is out of scope: ssl_cipher is always empty here"
+            );
+        }
+        assert_eq!(ffi.total_num_vars, vars.total_num_vars);
+
+        // The three zend_string* fields are minted, not read from the C global
+        // frankenphp_strings (issue #11): http scheme, no HTTPS, no TLS.
+        let interned = interned_strings();
+        assert_eq!(ffi.request_scheme, interned.http_scheme.0);
+        assert_eq!(ffi.https, interned.empty.0);
+        assert_eq!(ffi.ssl_protocol, interned.empty.0);
+    }
+
+    #[test]
+    fn as_ffi_reports_https_and_the_443_port_fallback() {
+        let mut request = Request::new("GET", "/index.php", "");
+        request.host = "example.com".to_string();
+        request.scheme = Scheme::Https;
+        let ctx = test_context(Some(request));
+
+        let vars = compute_server_vars(&ctx).unwrap();
+        let ffi = vars.as_ffi();
+
+        // SAFETY: `vars` outlives the reads; `ffi` borrows from it.
+        unsafe {
+            assert_eq!(
+                ffi_field(ffi.server_port, ffi.server_port_len),
+                b"443",
+                "SERVER_PORT falls back by scheme, RFC 3875 4.1.15 (cgi.go:79-92)"
+            );
+            assert_eq!(
+                ffi_field(ffi.content_length, ffi.content_length_len),
+                b"",
+                "CONTENT_LENGTH is empty, not absent, when the header is missing"
+            );
+        }
+
+        let interned = interned_strings();
+        assert_eq!(ffi.request_scheme, interned.https_scheme.0);
+        assert_eq!(ffi.https, interned.on.0, "$_SERVER['HTTPS'] is \"on\"");
+        assert_eq!(
+            ffi.ssl_protocol, interned.empty.0,
+            "TLS is out of scope: ssl_protocol is always empty here"
+        );
+    }
+
+    #[test]
+    fn as_ffi_server_name_keeps_the_ipv6_bracket_asymmetry() {
+        // net.SplitHostPort strips brackets on success and errors when there
+        // is no port, in which case upstream assigns request.Host verbatim --
+        // brackets kept (cgi.go:71-76).
+        for (host, want_server_name, want_port) in [
+            ("example.com:8080", "example.com", "8080"),
+            ("[::1]:80", "::1", "80"),
+            ("[::1]", "[::1]", "80"),
+        ] {
+            let mut request = Request::new("GET", "/index.php", "");
+            request.host = host.to_string();
+            let ctx = test_context(Some(request));
+
+            let vars = compute_server_vars(&ctx).unwrap();
+            let ffi = vars.as_ffi();
+            // SAFETY: `vars` outlives the reads; `ffi` borrows from it.
+            unsafe {
+                assert_eq!(
+                    ffi_field(ffi.server_name, ffi.server_name_len),
+                    want_server_name.as_bytes(),
+                    "SERVER_NAME for Host: {host}"
+                );
+                assert_eq!(
+                    ffi_field(ffi.http_host, ffi.http_host_len),
+                    host.as_bytes(),
+                    "HTTP_HOST is the Host header verbatim"
+                );
+                assert_eq!(
+                    ffi_field(ffi.server_port, ffi.server_port_len),
+                    want_port.as_bytes(),
+                    "SERVER_PORT for Host: {host}"
+                );
+            }
+        }
+    }
+
+    // --- the header batch handed to shim.c -----------------------------------
+
+    /// Reads one descriptor of the C batch back into `(key, value)`, where the
+    /// key is either the interned `zend_string*` (fast path) or the mangled
+    /// NUL-terminated bytes (slow path).
+    ///
+    /// # Safety
+    /// `batch` must borrow from a `ServerVarsBatch` that is still alive.
+    unsafe fn read_header(
+        batch: &frankenrust_server_vars_batch,
+        index: usize,
+    ) -> (Option<*mut zend_string>, Option<Vec<u8>>, Vec<u8>) {
+        assert!(index < batch.num_headers);
+        // SAFETY: `headers` points at `num_headers` initialised descriptors
+        // owned by the live `ServerVarsBatch` this batch borrows from.
+        let header = unsafe { &*batch.headers.add(index) };
+        let value =
+            // SAFETY: same -- `value` points into that batch's `values`.
+            unsafe { std::slice::from_raw_parts(header.value as *const u8, header.value_len) }
+                .to_vec();
+
+        if header.known_key.is_null() {
+            assert!(!header.key.is_null(), "slow path needs a mangled key");
+            // SAFETY: `uncommon_header_key` NUL-terminates, so CStr can find
+            // the end inside the batch-owned buffer.
+            let key = unsafe { std::ffi::CStr::from_ptr(header.key) }
+                .to_bytes()
+                .to_vec();
+            (None, Some(key), value)
+        } else {
+            assert!(
+                header.key.is_null(),
+                "fast path must not also set the mangled key"
+            );
+            (Some(header.known_key), None, value)
+        }
+    }
+
+    #[test]
+    fn build_server_vars_batch_joins_multi_valued_headers_and_picks_the_right_key_path() {
         let mut request = Request::new("GET", "/index.php", "")
+            // Not in phpheaders.go -> frankenphp_register_variable_safe.
             .with_header("X-Foo", b"a".to_vec())
-            .with_header("X-Foo", b"b".to_vec());
+            .with_header("X-Foo", b"b".to_vec())
+            // In phpheaders.go -> frankenphp_register_known_variable.
+            .with_header("Accept-Encoding", b"gzip".to_vec());
         request.host = "example.com".to_string();
         let ctx = test_context(Some(request));
 
-        let payload = collect_server_vars(&ctx).unwrap();
-        assert_eq!(
-            payload.headers,
-            vec![("X-Foo".to_string(), b"a, b".to_vec())]
-        );
-        assert_eq!(payload.known.http_host, b"example.com");
+        let batch = build_server_vars_batch(&ctx).unwrap();
+        let c_batch = batch.as_c_batch();
+        assert_eq!(c_batch.num_headers, 2);
+
+        // SAFETY: `batch` outlives every read; `c_batch` borrows from it.
+        unsafe {
+            let (known, mangled, value) = read_header(&c_batch, 0);
+            assert!(known.is_none(), "X-Foo is not a pre-interned key");
+            assert_eq!(mangled.unwrap(), b"HTTP_X_FOO");
+            assert_eq!(value, b"a, b", "multi-valued headers join with \", \"");
+
+            let (known, mangled, value) = read_header(&c_batch, 1);
+            assert_eq!(
+                known,
+                Some(interned_strings().common_headers["Accept-Encoding"].0),
+                "Accept-Encoding must take the pre-interned fast path"
+            );
+            assert!(mangled.is_none());
+            assert_eq!(value, b"gzip");
+        }
+    }
+
+    #[test]
+    fn the_c_batch_borrows_from_the_context_not_from_the_collecting_frame() {
+        // The property the whole shim.c split rests on: by the time C reads
+        // these pointers, the Rust frame that produced them is gone, so they
+        // must target memory the RequestContext owns. Built here the same way
+        // `frankenrust_collect_server_vars` does -- install first, then take
+        // the C view of the *installed* copy -- and read back only after the
+        // building expression has returned.
+        let mut request =
+            Request::new("GET", "/index.php", "").with_header("X-Foo", b"bar".to_vec());
+        request.host = "example.com".to_string();
+        let mut ctx = test_context(Some(request));
+
+        let c_batch = {
+            let batch = build_server_vars_batch(&ctx).unwrap();
+            ctx.install_server_vars(batch)
+        };
+
+        // SAFETY: `ctx` is still alive and owns the installed batch, so every
+        // pointer in `c_batch` is valid -- which is exactly what this test
+        // exists to demonstrate, the local `batch` above having been moved
+        // into the context and its building frame long gone.
+        unsafe {
+            assert_eq!(
+                ffi_field(c_batch.vars.http_host, c_batch.vars.http_host_len),
+                b"example.com"
+            );
+            let (_, mangled, value) = read_header(&c_batch, 0);
+            assert_eq!(mangled.unwrap(), b"HTTP_X_FOO");
+            assert_eq!(value, b"bar");
+        }
     }
 
     // --- sapi_request_info population (issue #11 acceptance) -----------------

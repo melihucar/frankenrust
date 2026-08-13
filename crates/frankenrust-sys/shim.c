@@ -1,5 +1,5 @@
-/* Bailout trampolines: the C frames that own the `setjmp` for every PHP call
- * frankenrust-core makes while a Zend request is live.
+/* `go_register_server_variables`: the one `go_*` callback whose C-ABI entry
+ * point is written in C rather than in frankenrust-core.
  *
  * Why this file exists
  * --------------------
@@ -9,93 +9,94 @@
  * exhaustion that allocator does not return an error: it calls
  * `zend_error_noreturn(E_ERROR, "Allowed memory size ... exhausted")`, which
  * ends in `zend_bailout()` -- a `longjmp` back to the nearest enclosing
- * `zend_try`, skipping every stack frame in between without running any
- * cleanup.
+ * `zend_try` (here, `php_request_startup`'s, around `php_hash_environment()`;
+ * in worker mode `frankenphp.c:565`'s), skipping every stack frame in between
+ * without running any cleanup.
  *
  * Upstream (Go) lives with that: `go_register_server_variables` is a
- * cgo-exported Go function nested under `php_request_startup`'s own
- * `zend_try`, so the jump crosses a live Go frame. Rust's position is
- * stricter -- unwinding across its frames by any mechanism other than its own
- * panic machinery is undefined behaviour regardless of what those frames own
- * -- so the port cannot simply inherit the exposure.
+ * cgo-exported Go function nested under that `zend_try`, so the jump crosses
+ * a live Go frame. Rust's position is stricter: a `longjmp` across a Rust
+ * frame is undefined behaviour regardless of what that frame owns and
+ * regardless of whether it has destructors to run (RFC 2945 defines forced
+ * unwinding across "plain old frames"; `longjmp` is not unwinding at all on
+ * these targets, and is left undefined). So the port cannot inherit the
+ * exposure, and -- this is the part an earlier revision of this file got
+ * wrong -- it cannot be fixed by catching the bailout in C and *re-raising*
+ * it from Rust either: the re-raise is a `longjmp` from a C frame nested
+ * inside the Rust callback frame to a `setjmp` below it, which crosses that
+ * Rust frame just the same. Dropping everything first removes the leak, not
+ * the undefined behaviour.
  *
- * The fix is to move the `setjmp` *below* the Rust frames. Each wrapper here
- * establishes its own `zend_try` inside a pure C frame, calls the upstream
- * function unmodified, and converts a bailout into an ordinary `false`
- * return. frankenrust-core then unwinds its own frames by ordinary Rust
- * returns -- running every destructor -- and, once nothing but the
- * `extern "C"` callback frame is left, calls `frankenrust_bailout()` to
- * resume the unwind exactly where upstream's would have gone.
+ * The fix is structural: keep Rust off the stack entirely for the part that
+ * can bail out. `go_register_server_variables` is therefore defined here, in
+ * C, and splits into two phases:
  *
- * Net effect: PHP's control flow and error reporting are bit-for-bit
- * upstream's (the fatal error is already reported by the time we catch; the
- * bailout still lands in `php_request_startup`'s `zend_catch`, which returns
- * FAILURE, which `frankenphp.c:1512-1515` turns back into a bailout to
- * `frankenphp_php_thread`'s `zend_first_try` at `:1504`), while no Rust frame
- * holding a destructor is ever between the `setjmp` and the `longjmp`.
+ *   1. `frankenrust_collect_server_vars()` -- Rust. Reads the thread's
+ *      `RequestContext` under its slot lock, computes every key and value,
+ *      stores them in memory the context owns, and *returns*. It makes no
+ *      call into PHP, so it cannot bail out.
+ *   2. everything below -- pure C. By the time the first Zend call runs, the
+ *      Rust frame is gone and the stack from `zend_bailout()` down to
+ *      `php_request_startup`'s `zend_catch` is C the whole way. No `zend_try`
+ *      of our own is needed or wanted: the bailout propagates exactly where
+ *      upstream's does, and PHP's control flow and error reporting are
+ *      bit-for-bit upstream's.
+ *
+ * Nothing here allocates or frees: every pointer in the batch belongs to the
+ * `RequestContext`, whose lifetime already spans the request (it is reclaimed
+ * when the context slot is cleared or replaced -- see
+ * `crates/frankenrust-core/src/context.rs`). So a bailout out of any call
+ * below leaks nothing, in C or in Rust.
  *
  * See https://github.com/melihucar/frankenrust/issues/75.
  *
- * Threading: `zend_try` reads and writes `EG(bailout)`, which in a ZTS build
- * resolves through the `_tsrm_ls_cache` TLS slot. Every function here is
- * therefore callable only from a PHP thread that has already run
+ * Threading: this runs on a PHP thread that has already executed
  * `ZEND_TSRMLS_CACHE_UPDATE()` (`frankenphp.c:1491`, `:1647`) -- the same
  * precondition `frankenphp.c` itself relies on, since on non-Windows it does
- * not define the cache either and reads `EG()` throughout.
+ * not define the cache either and reads `EG()`/`SG()` throughout.
  */
 
+/* Mirrors the prefix vendor/frankenphp/frankenphp.c uses before it reaches
+ * _cgo_export.h (frankenphp.c:1-47): SAPI.h for `sapi_request_info`, which
+ * _cgo_export.h's go_update_request_info declaration names. */
 #include "frankenphp.h"
 
+#include <SAPI.h>
 #include <php.h>
 
+#include "_cgo_export.h"
 #include "frankenrust_shim.h"
 
-/* `ok` is written inside `zend_catch`, i.e. after a `longjmp` has re-entered
- * this frame, and read after `zend_end_try()`. `volatile` is what C requires
- * for a local whose value must survive that path (and is the idiom PHP's own
- * sources use around these macros). */
+/* `frankenphp.c:1379`, inside `frankenphp_register_variables()`
+ * (`sapi_module_struct.register_server_variables`). Port of
+ * `go_register_server_variables` (`cgi.go:174-188`).
+ *
+ * The prepared-environment merge (`cgi.go:185-187`) is out of scope for issue
+ * #11 -- `fc.env` is not part of its `RequestContext` -- so it has no
+ * counterpart here yet. */
+void go_register_server_variables(uintptr_t threadIndex,
+                                  zval *trackVarsArray) {
+  frankenrust_server_vars_batch batch;
 
-bool frankenrust_try_register_server_vars(zval *track_vars_array,
-                                          frankenphp_server_vars vars) {
-  volatile bool ok = true;
-
-  zend_try { frankenphp_register_server_vars(track_vars_array, vars); }
-  zend_catch { ok = false; }
-  zend_end_try();
-
-  return ok;
-}
-
-bool frankenrust_try_register_known_variable(zend_string *z_key, char *value,
-                                             size_t val_len,
-                                             zval *track_vars_array) {
-  volatile bool ok = true;
-
-  zend_try {
-    frankenphp_register_known_variable(z_key, value, val_len, track_vars_array);
+  /* Phase 1: Rust. Returns before phase 2 makes its first Zend call, which is
+   * what makes phase 2's bailout path Rust-free. */
+  if (!frankenrust_collect_server_vars(threadIndex, &batch)) {
+    return;
   }
-  zend_catch { ok = false; }
-  zend_end_try();
 
-  return ok;
-}
+  /* Phase 2: pure C. `cgi.go:104` -- one bulk call for the known variables. */
+  frankenphp_register_server_vars(trackVarsArray, batch.vars);
 
-bool frankenrust_try_register_variable_safe(char *key, char *var,
-                                            size_t val_len,
-                                            zval *track_vars_array) {
-  volatile bool ok = true;
+  /* `addHeadersToServer` (`cgi.go:150-164`). */
+  for (size_t i = 0; i < batch.num_headers; i++) {
+    const frankenrust_header_var *header = &batch.headers[i];
 
-  zend_try {
-    frankenphp_register_variable_safe(key, var, val_len, track_vars_array);
+    if (header->known_key != NULL) {
+      frankenphp_register_known_variable(header->known_key, header->value,
+                                         header->value_len, trackVarsArray);
+    } else {
+      frankenphp_register_variable_safe(header->key, header->value,
+                                        header->value_len, trackVarsArray);
+    }
   }
-  zend_catch { ok = false; }
-  zend_end_try();
-
-  return ok;
 }
-
-/* Only ever called after one of the wrappers above returned false, so
- * `EG(bailout)` is guaranteed non-NULL here: the wrapper's `zend_end_try()`
- * restored the enclosing bailout address that the engine was heading for
- * before we intercepted it. */
-void frankenrust_bailout(void) { zend_bailout(); }
