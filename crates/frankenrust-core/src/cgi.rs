@@ -516,6 +516,13 @@ fn intern(s: &str) -> InternedZendString {
     // it. `s.as_ptr()` is valid for `s.len()` bytes for the duration of this
     // call, which is all the C function needs -- it copies the bytes into
     // its own persistent allocation before returning.
+    //
+    // This is the one C call in this module that is *not* routed through a
+    // `frankenrust_try_*` trampoline, and deliberately: `persistent = 1`
+    // means it allocates with `__zend_malloc`, which on failure prints "Out
+    // of memory" and `exit(1)`s. It never reaches `zend_bailout()`, so there
+    // is no `longjmp` for a trampoline to catch. The request allocator --
+    // the one that does bail out -- is not involved.
     let ptr = unsafe {
         frankenrust_sys::frankenphp_init_persistent_string(s.as_ptr() as *const c_char, s.len())
     };
@@ -682,42 +689,27 @@ impl ComputedServerVars {
 /// `longjmp` that runs no Rust destructors, so a slot guard alive across
 /// them would be leaked and that thread's slot locked forever.
 ///
-/// Releasing the slot lock narrows the blast radius but does not make the
-/// control transfer fully sound: [`register_server_vars`] still runs with
-/// *this* payload owned by a live Rust frame while it calls into
-/// `frankenphp_register_server_vars` / `_known_variable` / `_variable_safe`.
-/// Those C functions grow and populate `$_SERVER`'s `HashTable` through the
-/// Zend request allocator, which on `memory_limit` exhaustion does not
-/// return an error -- `zend_error_noreturn(E_ERROR, ...)` ends in
-/// `zend_bailout()`, a `longjmp` back to the `zend_first_try` in
-/// `frankenphp_php_thread` (`frankenphp.c:1504`), skipping every frame in
-/// between -- Rust ones included -- without running its destructors. Rust
-/// treats a `longjmp` crossing any of its frames as undefined behavior
-/// regardless of what that frame owns, so this is a residual risk, not
-/// (yet) a closed one: fully closing it needs a C-side
-/// `zend_try`/`zend_catch` trampoline installed *inside* the C frame that
-/// makes the risky call, so no Rust frame is ever on the stack between the
-/// `setjmp` and a potential `longjmp` target. That trampoline is new C
-/// source, and this issue's `build.rs` edits are scoped to additive
-/// `.allowlist_function` lines only (no other edits, so #12's/#13's own
-/// additions to the same list keep conflicting trivially) -- and the
-/// vendored `frankenphp.c` that defines these functions is not ours to
-/// modify either. Tracked as a cross-cutting `frankenrust-sys` followup:
-/// <https://github.com/melihucar/frankenrust/issues/75>.
+/// Releasing the slot lock is only half of it. The register calls themselves
+/// run with *this* payload owned by a live Rust frame, and
+/// `frankenphp_register_server_vars` / `_known_variable` / `_variable_safe`
+/// grow and populate `$_SERVER`'s `HashTable` through the Zend request
+/// allocator, which on `memory_limit` exhaustion does not return an error --
+/// `zend_error_noreturn(E_ERROR, ...)` ends in `zend_bailout()`, a `longjmp`
+/// that skips every frame in between without running its destructors. Rust
+/// treats a `longjmp` crossing any of its frames as undefined behaviour
+/// regardless of what that frame owns, so upstream's Go arrangement (a live
+/// cgo frame under the same `zend_try`) cannot simply be inherited.
 ///
-/// What stays true in the meantime: this struct and [`ComputedServerVars`]
-/// own nothing but `Vec<u8>`/`String` buffers with trivial destructors
-/// (plain deallocation -- no lock, no file handle, no other resource with a
-/// side effect), so the worst case of a bailout here is a bounded, one-shot
-/// leak of this call's payload -- never a dangling pointer or a stuck lock
-/// -- and it happens on the exact path C already marks
-/// `thread_is_healthy = false` and abandons the request
-/// (`frankenphp.c:1567-1568`). Upstream's own Go implementation carries the
-/// structurally identical exposure: `go_register_server_variables` -- the
-/// cgo-exported function this whole call chain ports -- calls
-/// `C.frankenphp_register_server_vars` from a live Go stack frame nested
-/// under the very same `zend_first_try`, so this is not a regression
-/// relative to the oracle.
+/// So none of the three C functions is called directly: each goes through the
+/// matching `frankenrust_try_*` trampoline in
+/// `crates/frankenrust-sys/shim.c`, which owns the `setjmp` in a pure C frame
+/// and converts a bailout into a `false` return. The Rust frames then unwind
+/// by ordinary returns -- every destructor runs -- and
+/// `go_register_server_variables` re-raises with `frankenrust_bailout()` only
+/// once nothing but its own argument-only `extern "C"` frame is left. PHP's
+/// control flow is unchanged (see `shim.c`'s header comment); the difference
+/// is that no Rust frame holding a destructor is ever between the `setjmp`
+/// and the `longjmp`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerVarsPayload {
     pub known: ComputedServerVars,
@@ -744,71 +736,123 @@ pub fn collect_server_vars(ctx: &RequestContext) -> Option<ServerVarsPayload> {
     Some(ServerVarsPayload { known, headers })
 }
 
+/// A `zend_bailout()` that one of `shim.c`'s trampolines caught on our
+/// behalf. By the time this reaches Rust the Zend engine has already reported
+/// its fatal error and the request is doomed; the only correct handling is to
+/// stop making PHP calls, let every Rust frame unwind normally, and re-raise
+/// with `frankenrust_bailout()` from a frame that owns nothing.
+///
+/// Deliberately a fieldless ZST: it is returned *through* the frames a
+/// re-raised bailout will eventually jump over, so it must itself have no
+/// drop glue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bailout;
+
+// The soundness argument in `go_register_server_variables` is that when it
+// finally re-raises, its frame holds nothing a `longjmp` could leak. The only
+// non-argument value left there is this verdict, so pin it at compile time
+// (the same `const _: () =` device `frankenrust-sys/src/layout.rs` uses for
+// the struct offsets): giving `Bailout` a payload -- an error message, a
+// `String` -- would silently reintroduce drop glue into the one frame the
+// jump is allowed to cross.
+//
+// `Result<(), Bailout>` itself is 1 byte, not 0: both variants are zero-sized
+// so the discriminant is all that is left. A byte in a register is not
+// something a `longjmp` can leak; drop glue is.
+const _: () = assert!(
+    !std::mem::needs_drop::<Result<(), Bailout>>() && std::mem::size_of::<Bailout>() == 0,
+    "Bailout must stay a zero-sized, drop-free verdict: it is returned through \
+     the frames a re-raised zend_bailout() then longjmps over"
+);
+
 /// The whole C-calling half of `go_register_server_variables`
 /// (`cgi.go:176-188`), over an already-collected payload.
 ///
+/// `Err(Bailout)` means PHP bailed out partway through and the caller owes a
+/// `frankenrust_bailout()` once its own frames are gone -- see
+/// [`ServerVarsPayload`].
+///
 /// # Safety
 /// Same contract as [`register_known_server_vars`]. In addition, the caller
-/// must hold **no** [`crate::context::ContextSlots`] guard -- these calls can
-/// `zend_bailout()` past every Rust destructor on the stack.
-pub unsafe fn register_server_vars(payload: &ServerVarsPayload, track_vars_array: *mut zval) {
+/// must hold **no** [`crate::context::ContextSlots`] guard: a guard is
+/// exactly the kind of value whose destructor a bailout must not be allowed
+/// to skip, and the trampolines only protect frames *below* this one.
+pub unsafe fn register_server_vars(
+    payload: &ServerVarsPayload,
+    track_vars_array: *mut zval,
+) -> Result<(), Bailout> {
     // SAFETY: forwarded verbatim from this function's own contract.
     unsafe {
-        register_known_server_vars(&payload.known, track_vars_array);
-        add_headers_to_server(&payload.headers, track_vars_array);
+        register_known_server_vars(&payload.known, track_vars_array)?;
+        add_headers_to_server(&payload.headers, track_vars_array)
     }
 }
 
-/// Calls `frankenphp_register_server_vars` once, per `cgi.go:104`.
+/// Calls `frankenphp_register_server_vars` once, per `cgi.go:104` -- through
+/// `shim.c`'s `zend_try` trampoline rather than directly.
 ///
 /// # Safety
 /// The caller must be on the PHP thread that owns `track_vars_array`
 /// (`$_SERVER`'s backing zval), with an active Zend request -- this is only
 /// sound to call from within `frankenphp_register_variables()`
 /// (`frankenphp.c:1371-1383`), which is where upstream calls the equivalent
-/// Go function from.
-pub unsafe fn register_known_server_vars(vars: &ComputedServerVars, track_vars_array: *mut zval) {
+/// Go function from. That thread has necessarily run
+/// `ZEND_TSRMLS_CACHE_UPDATE()` (`frankenphp.c:1491`, `:1647`), which is what
+/// the trampoline's own `EG(bailout)` access requires.
+pub unsafe fn register_known_server_vars(
+    vars: &ComputedServerVars,
+    track_vars_array: *mut zval,
+) -> Result<(), Bailout> {
     let ffi_vars = vars.as_ffi();
     // SAFETY: see this function's own contract. `ffi_vars` borrows from
     // `vars`'s buffers, which are on our caller's stack and outlive this
     // call; frankenphp_register_server_vars copies every field into a new
     // zval before returning (frankenphp.c:1220-1268), so it does not need
-    // to outlive this call either.
-    //
-    // Residual risk: this call can `zend_bailout()` out from under this
-    // Rust frame on `memory_limit` exhaustion -- see [`ServerVarsPayload`]'s
-    // doc comment for the full argument for why that cannot be closed from
-    // this module alone (issue #75).
-    unsafe {
-        frankenrust_sys::frankenphp_register_server_vars(track_vars_array, ffi_vars);
+    // to outlive this call either. The trampoline owns the `setjmp`, so a
+    // `memory_limit` bailout inside it returns `false` to this frame instead
+    // of `longjmp`ing over it.
+    let ok = unsafe {
+        frankenrust_sys::frankenrust_try_register_server_vars(track_vars_array, ffi_vars)
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(Bailout)
     }
 }
 
 /// Port of `addHeadersToServer` (`cgi.go:150-164`), over the already-joined
 /// pairs [`collect_server_vars`] copied out of the context.
 ///
+/// Stops at the first caught bailout: past that point the request heap is
+/// exhausted and the engine has already gone fatal, so every further
+/// registration would do nothing but re-report the same error.
+///
 /// # Safety
-/// Same contract as [`register_server_vars`]. Same residual bailout risk as
-/// [`register_known_server_vars`] too, once per header -- see
-/// [`ServerVarsPayload`]'s doc comment (issue #75).
-pub unsafe fn add_headers_to_server(headers: &[(String, Vec<u8>)], track_vars_array: *mut zval) {
+/// Same contract as [`register_server_vars`].
+pub unsafe fn add_headers_to_server(
+    headers: &[(String, Vec<u8>)],
+    track_vars_array: *mut zval,
+) -> Result<(), Bailout> {
     let interned = interned_strings();
     for (name, joined) in headers {
-        if let Some(key) = interned.common_headers.get(name.as_str()) {
+        let ok = if let Some(key) = interned.common_headers.get(name.as_str()) {
             // SAFETY: `key.0` is a live, permanently-interned zend_string*
             // (never freed, `IS_STR_INTERNED`); `joined` is valid for the
             // duration of this call and frankenphp_register_known_variable
             // copies it immediately via frankenphp_register_trusted_var
             // (frankenphp.c:1200-1218, 1337-1342), so it does not need to
             // outlive this call. `track_vars_array` is valid per this
-            // function's own contract.
+            // function's own contract, and the trampoline keeps a bailout
+            // from crossing this frame -- which matters here in particular,
+            // because `key` below is a `Vec<u8>` this frame owns.
             unsafe {
-                frankenrust_sys::frankenphp_register_known_variable(
+                frankenrust_sys::frankenrust_try_register_known_variable(
                     key.0,
                     joined.as_ptr() as *mut c_char,
                     joined.len(),
                     track_vars_array,
-                );
+                )
             }
         } else {
             let mut key = uncommon_header_key(name);
@@ -817,15 +861,20 @@ pub unsafe fn add_headers_to_server(headers: &[(String, Vec<u8>)], track_vars_ar
             // copies through php_register_variable_safe before returning
             // (frankenphp.c:1344-1360).
             unsafe {
-                frankenrust_sys::frankenphp_register_variable_safe(
+                frankenrust_sys::frankenrust_try_register_variable_safe(
                     key.as_mut_ptr() as *mut c_char,
                     joined.as_ptr() as *mut c_char,
                     joined.len(),
                     track_vars_array,
-                );
+                )
             }
+        };
+
+        if !ok {
+            return Err(Bailout);
         }
     }
+    Ok(())
 }
 
 fn join_header_values(values: &[Vec<u8>]) -> Vec<u8> {

@@ -121,6 +121,8 @@ fn main() {
         vendor_dir.join("types.h"),
         vendor_dir.join("frankenphp_arginfo.h"),
         sys_include_dir.join("_cgo_export.h"),
+        sys_include_dir.join("frankenrust_shim.h"),
+        manifest_dir.join("shim.c"),
         wrapper_h.clone(),
     ] {
         println!("cargo:rerun-if-changed={}", path.display());
@@ -149,6 +151,11 @@ fn main() {
     build
         .file(vendor_dir.join("frankenphp.c"))
         .file(vendor_dir.join("types.c"))
+        // Ours, not upstream's: the zend_try/zend_catch trampolines that keep a
+        // zend_bailout()'s longjmp from ever crossing a Rust frame (issue #75).
+        // Compiled with exactly the same flags and include path as the vendored
+        // sources because it calls into them and reads EG() the same way.
+        .file(manifest_dir.join("shim.c"))
         // for frankenphp.c:47 `#include "_cgo_export.h"`
         .include(&sys_include_dir)
         // for _cgo_export.h's own `#include "frankenphp.h"`, and types.c/types.h's
@@ -308,6 +315,11 @@ fn main() {
         .allowlist_function("frankenphp_register_known_variable")
         .allowlist_function("frankenphp_register_variable_safe")
         .allowlist_function("frankenphp_init_persistent_string")
+        // shim.c's trampolines (frankenrust_shim.h) -- see the `.file()` above.
+        .allowlist_function("frankenrust_try_register_server_vars")
+        .allowlist_function("frankenrust_try_register_known_variable")
+        .allowlist_function("frankenrust_try_register_variable_safe")
+        .allowlist_function("frankenrust_bailout")
         // The two real thread entry points (frankenphp.h:190-191): not called by
         // this issue's abort-stubs, but tests/version.rs takes their address (never
         // calls them) so the linker's --gc-sections can see a live reference into

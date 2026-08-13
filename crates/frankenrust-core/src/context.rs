@@ -16,6 +16,7 @@
 //! `originalRequest` (`WithOriginalRequest`), the worker fields (#14), and
 //! `handlerParameters`/`handlerReturn`.
 
+use std::io::Read;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
@@ -35,13 +36,80 @@ pub enum Scheme {
     Https,
 }
 
-/// Placeholder for the request-body bridge #12's `callbacks/input.rs`
-/// (`go_read_post`) will read through. No callback this issue implements
-/// touches it; it exists only because `RequestContext` needs a slot for it
-/// (issue #11's field list: "the request itself (method, URI, query,
-/// headers, body handle)").
-#[derive(Debug, Clone, Default)]
-pub struct RequestBody;
+/// The request body, as `go_read_post` (#12's `callbacks/input.rs`) consumes
+/// it.
+///
+/// Upstream's is `fc.request.Body`, an `io.ReadCloser` that `go_read_post`
+/// reads incrementally on the PHP thread: PHP hands it a `count_bytes`-sized
+/// C buffer and it loops `fc.request.Body.Read(p[readBytes:])` until the
+/// buffer is full or a read errors (`frankenphp.go:683-694`).
+/// `Box<dyn Read + Send>` is the direct analogue -- whatever accepts the
+/// request decides what is behind it (an in-memory buffer, a socket, a
+/// channel bridging the async side), and the PHP thread only ever calls
+/// `read`.
+///
+/// `Send` but not `Sync`, matching how the context is used: it is built on
+/// one thread, installed into the slot of the PHP thread that will run the
+/// script, and read from that thread alone under the slot's `Mutex`. That is
+/// the same single-consumer discipline `net/http` documents for
+/// `Request.Body`, and it is why neither this type nor [`Request`] is
+/// `Clone`: an `io.ReadCloser` has no meaningful copy either, and silently
+/// handing out a clone with an empty body would lose a POST payload without
+/// a word.
+///
+/// The read *loop*, the idle deadline (`WithRequestBodyTimeout`) and the
+/// `isDone`/`responseWriter` guards around it (`frankenphp.go:666-681`) are
+/// #12's to port; this is only the handle they read through.
+#[derive(Default)]
+pub struct RequestBody {
+    reader: Option<Box<dyn Read + Send>>,
+}
+
+impl RequestBody {
+    /// No body at all -- Go's `http.NoBody`. Every read reports EOF.
+    pub fn empty() -> Self {
+        Self { reader: None }
+    }
+
+    /// A body already buffered in memory. Bytes, not `String`: a POST body is
+    /// arbitrary octets.
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::from_reader(std::io::Cursor::new(bytes.into()))
+    }
+
+    /// A body streamed from `reader`, read on demand by the PHP thread.
+    pub fn from_reader(reader: impl Read + Send + 'static) -> Self {
+        Self {
+            reader: Some(Box::new(reader)),
+        }
+    }
+
+    /// Whether this request came with no body at all, as opposed to one that
+    /// has merely been read to EOF. `go_read_post` does not need the
+    /// distinction (both read 0), but `go_read_post`'s caller-side logging
+    /// and `CONTENT_LENGTH` cross-checks may.
+    pub fn is_none(&self) -> bool {
+        self.reader.is_none()
+    }
+}
+
+impl Read for RequestBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match &mut self.reader {
+            Some(reader) => reader.read(buf),
+            None => Ok(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for RequestBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A body is a stream: reading it to print it would consume it.
+        f.debug_struct("RequestBody")
+            .field("present", &self.reader.is_some())
+            .finish()
+    }
+}
 
 /// A multi-valued, case-insensitively-keyed header map, canonicalising names
 /// the way Go's `net/http` does (`textproto.CanonicalMIMEHeaderKey`) on both
@@ -194,7 +262,9 @@ fn join_bytes(values: &[Vec<u8>], sep: &[u8]) -> Vec<u8> {
 /// crate-boundary section: that lives in `frankenrust-server`), so whatever
 /// hands us a `Request` is responsible for filling it from the real
 /// transport.
-#[derive(Debug, Clone)]
+/// Not `Clone`: it owns the request body, which is a stream. See
+/// [`RequestBody`].
+#[derive(Debug)]
 pub struct Request {
     pub method: String,
     /// The **decoded** request path (Go's `request.URL.Path`). This is what
@@ -273,12 +343,19 @@ impl Request {
             content_length: -1,
             scheme: Scheme::Http,
             cancelled: Arc::new(AtomicBool::new(false)),
-            body: RequestBody,
+            body: RequestBody::empty(),
         }
     }
 
     pub fn with_header(mut self, name: &str, value: impl Into<Vec<u8>>) -> Self {
         self.headers.insert(name, value);
+        self
+    }
+
+    /// Attaches the request body #12's `go_read_post` will read through.
+    /// Defaults to [`RequestBody::empty`], i.e. a bodyless request.
+    pub fn with_body(mut self, body: RequestBody) -> Self {
+        self.body = body;
         self
     }
 
@@ -963,6 +1040,92 @@ mod tests {
             weak.upgrade().is_none(),
             "dropping the RequestContext must release its arena"
         );
+    }
+
+    /// The reviewed defect this pins down: `RequestBody` was a fieldless
+    /// placeholder, so a body could not be attached to a request at all. #12
+    /// owns `go_read_post` and is explicitly forbidden from editing this
+    /// file, which left it with nothing to read -- every POST would have
+    /// reached PHP with an empty `php://input` and no parsed `$_POST`.
+    ///
+    /// This is the exact shape `go_read_post` needs (`frankenphp.go:683-694`):
+    /// reach the body from a thread index, read into a fixed-size buffer,
+    /// repeat until it is full, and see EOF as a 0. The read *loop* is #12's;
+    /// what this asserts is that the handle supports one.
+    #[test]
+    fn a_request_body_is_readable_incrementally_through_the_context_slot() {
+        let slots = ContextSlots::new();
+        slots.set(
+            3,
+            test_context(Some(
+                Request::new("POST", "/index.php", "")
+                    .with_body(RequestBody::from_bytes(b"hello world".to_vec())),
+            )),
+        );
+
+        let read_chunk = |len: usize| -> Vec<u8> {
+            slots.with_context_mut(3, |ctx| {
+                let body = &mut ctx
+                    .expect("context installed")
+                    .request
+                    .as_mut()
+                    .unwrap()
+                    .body;
+                let mut buf = vec![0u8; len];
+                let n = body.read(&mut buf).expect("in-memory body cannot fail");
+                buf.truncate(n);
+                buf
+            })
+        };
+
+        assert_eq!(read_chunk(5), b"hello");
+        assert_eq!(read_chunk(6), b" world");
+        assert_eq!(
+            read_chunk(4),
+            b"",
+            "a body read to the end reports EOF as a 0-length read, which is what \
+             ends go_read_post's loop"
+        );
+    }
+
+    #[test]
+    fn a_bodyless_request_reads_eof_immediately() {
+        // Go's http.NoBody. `Request::new` installs this, so a GET built by
+        // any of this module's tests reads 0 rather than blocking or panicking.
+        let mut request = Request::new("GET", "/index.php", "");
+        assert!(request.body.is_none());
+
+        let mut buf = [0u8; 8];
+        assert_eq!(request.body.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_streamed_request_body_is_read_on_demand() {
+        // Not every body is buffered: the transport may hand us a socket. The
+        // handle must accept any `Read + Send`, since the context is built on
+        // one thread and read on the PHP thread that owns its slot.
+        struct OneByteAtATime(std::io::Cursor<Vec<u8>>);
+        impl Read for OneByteAtATime {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                self.0.read(&mut buf[..1])
+            }
+        }
+
+        let mut body =
+            RequestBody::from_reader(OneByteAtATime(std::io::Cursor::new(b"php".to_vec())));
+        assert!(!body.is_none());
+
+        // A short read is exactly the case frankenphp.go:685-694 loops over.
+        let mut buf = [0u8; 3];
+        assert_eq!(body.read(&mut buf).unwrap(), 1);
+        assert_eq!(&buf[..1], b"p");
+
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut body, &mut rest).unwrap();
+        assert_eq!(rest, b"hp");
     }
 
     #[test]

@@ -15,3 +15,6 @@
 #include "types.h"
 
 #include "_cgo_export.h"
+
+/* Not upstream: our own zend_try/zend_catch trampolines (shim.c, issue #75). */
+#include "frankenrust_shim.h"

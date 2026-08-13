@@ -28,21 +28,43 @@ pub unsafe extern "C" fn go_register_server_variables(
     thread_index: usize,
     track_vars_array: *mut zval,
 ) {
-    register_server_variables_with(thread_index, |payload| {
+    let outcome = register_server_variables_with(thread_index, |payload| {
+        // Prepared-env merge (cgi.go:184-187, frankenphp_merge_with_prepared_env)
+        // is out of scope: `fc.env` (PreparedEnv) is not part of this
+        // issue's RequestContext -- see issue #11's "out of scope" section.
+        //
         // SAFETY: called on the PHP thread that owns `thread_index`, from
         // inside `frankenphp_register_variables()` (frankenphp.c:1371-1383)
         // while a Zend request is active, so `track_vars_array` is the live
         // $_SERVER zval PHP just passed us and `frankenphp_strings`
         // (populated at main-thread boot) is initialised. No slot guard is
         // alive here -- see `register_server_variables_with`.
-        unsafe {
-            cgi::register_server_vars(payload, track_vars_array);
-        }
-
-        // Prepared-env merge (cgi.go:184-187, frankenphp_merge_with_prepared_env)
-        // is out of scope: `fc.env` (PreparedEnv) is not part of this
-        // issue's RequestContext -- see issue #11's "out of scope" section.
+        unsafe { cgi::register_server_vars(payload, track_vars_array) }
     });
+
+    if outcome.is_err() {
+        // One of `shim.c`'s trampolines caught a `zend_bailout()` and turned
+        // it into an ordinary return so that every Rust frame between here
+        // and the C call could unwind normally. They all have: the statement
+        // above has returned, so the payload, the closure, and every guard
+        // and buffer either of them owned are dropped. What is left on the
+        // stack is this frame, holding two `Copy` arguments and one `Result`
+        // of two fieldless types -- zero drop glue, nothing to leak, no
+        // borrow to invalidate. Only now is it safe to resume the unwind PHP
+        // was in the middle of.
+        //
+        // SAFETY: `frankenrust_bailout` is `zend_bailout()`. Two
+        // preconditions, both established above: (1) we are on the PHP thread
+        // that owns `thread_index` with its TSRM cache updated (this
+        // function's own contract), so `EG(bailout)` resolves; (2) it is
+        // non-NULL, because a trampoline only reports a bailout when it
+        // intercepted one that was already heading for an enclosing
+        // `zend_try` -- `php_request_startup`'s, which returns FAILURE and
+        // sends `frankenphp.c:1512-1515` back to `frankenphp_php_thread`'s
+        // `zend_first_try` at `:1504`, exactly where upstream's uncaught
+        // bailout would have landed. It does not return.
+        unsafe { frankenrust_sys::frankenrust_bailout() };
+    }
 }
 
 /// Collects the `$_SERVER` payload under the context slot's lock, releases
@@ -59,18 +81,22 @@ pub unsafe extern "C" fn go_register_server_variables(
 /// `go_frankenphp_after_script_execution`) is clear that very slot. See
 /// [`crate::context::ContextSlots`] for the full argument.
 ///
-/// Releasing the lock closes *that* hazard; it does not make the register
-/// calls themselves immune to the same `longjmp` -- `payload` is still owned
-/// by a live Rust frame while they run. See
-/// [`crate::cgi::ServerVarsPayload`]'s doc comment for why closing that
-/// fully needs a C-side trampoline this module cannot add
-/// (<https://github.com/melihucar/frankenrust/issues/75>), and why the
-/// residual exposure is bounded to a one-shot leak rather than memory
-/// corruption.
+/// Releasing the lock closes *that* hazard; the register calls themselves are
+/// kept from `longjmp`ing over any Rust frame by `shim.c`'s
+/// `zend_try`/`zend_catch` trampolines, which turn a bailout into the
+/// `Err(cgi::Bailout)` this function propagates. See
+/// [`crate::cgi::ServerVarsPayload`]'s doc comment.
+///
+/// Returning that verdict rather than acting on it is the point: the caller
+/// re-raises only after this function has returned, i.e. after `payload` and
+/// `register` are dropped. Nothing here may swallow it -- a bailout means the
+/// engine has gone fatal and PHP is waiting to finish an unwind we
+/// intercepted. (`Result` is already `#[must_use]`, which is what makes
+/// "swallow it" a compile error rather than a convention.)
 fn register_server_variables_with(
     thread_index: usize,
-    register: impl FnOnce(&cgi::ServerVarsPayload),
-) {
+    register: impl FnOnce(&cgi::ServerVarsPayload) -> Result<(), cgi::Bailout>,
+) -> Result<(), cgi::Bailout> {
     let payload = CONTEXT_SLOTS.with_context(thread_index, |slot| {
         // Upstream dereferences `thread.frankenPHPContext()` unconditionally
         // here (cgi.go:176-177) and would itself panic on a nil context --
@@ -92,10 +118,10 @@ fn register_server_variables_with(
 
     // Both slot guards are released at the end of the statement above.
     let Some(payload) = payload else {
-        return;
+        return Ok(());
     };
 
-    register(&payload);
+    register(&payload)
 }
 
 /// `frankenphp.c:355`, inside `frankenphp_update_request_context()`, called
@@ -181,7 +207,7 @@ mod tests {
         );
 
         let mut register_ran = false;
-        register_server_variables_with(THREAD_INDEX, |payload| {
+        let outcome = register_server_variables_with(THREAD_INDEX, |payload| {
             register_ran = true;
             assert_eq!(payload.known.script_name, b"/index.php");
 
@@ -197,8 +223,10 @@ mod tests {
                  guard held here would wedge the slot permanently"
             );
             probe.join().expect("probe thread panicked");
+            Ok(())
         });
 
+        assert_eq!(outcome, Ok(()));
         assert!(
             register_ran,
             "the register step must run when a context is installed"
@@ -212,7 +240,73 @@ mod tests {
         const THREAD_INDEX: usize = 41;
 
         let mut register_ran = false;
-        register_server_variables_with(THREAD_INDEX, |_| register_ran = true);
+        let outcome = register_server_variables_with(THREAD_INDEX, |_| {
+            register_ran = true;
+            Ok(())
+        });
+        assert_eq!(outcome, Ok(()));
         assert!(!register_ran, "no context installed: nothing to register");
+    }
+
+    /// The second reviewed defect this pins down: the register calls used to
+    /// go straight into `frankenphp_register_server_vars` /
+    /// `_known_variable` / `_variable_safe`, any of which can exhaust
+    /// `memory_limit` and end in `zend_bailout()` -- a `longjmp` over every
+    /// Rust frame between the C call and `php_request_startup`'s `zend_catch`.
+    /// Rust calls that undefined behaviour whatever those frames own, and
+    /// they owned plenty: the payload, the per-header `Vec<u8>` key, the
+    /// closure.
+    ///
+    /// The fix moves the `setjmp` below every Rust frame (`shim.c`) and makes
+    /// the bailout a *value*, so the re-raise can be deferred until the stack
+    /// holds nothing that needs dropping. This test is the Rust half of that
+    /// contract: a bailout reported from inside the register step must come
+    /// back out through an ordinary `return`, with everything the step owned
+    /// already destroyed by the time the caller sees it.
+    ///
+    /// The C half -- that `zend_try`/`zend_catch` really does intercept the
+    /// `longjmp` -- is not unit-testable here: `zend_try` writes
+    /// `EG(bailout)` through the TSRM cache, so any test touching it without
+    /// a live PHP thread segfaults rather than fails (the same reason issue
+    /// #11 forbids calling `frankenphp_register_server_vars` from a test).
+    #[test]
+    fn a_caught_bailout_returns_with_the_register_step_fully_dropped() {
+        // Reserved to this test alone -- see the tests above.
+        const THREAD_INDEX: usize = 42;
+
+        let (tx, _rx) = mpsc::channel();
+        let mut request = Request::new("GET", "/index.php", "");
+        request.host = "example.com".to_string();
+        CONTEXT_SLOTS.set(
+            THREAD_INDEX,
+            RequestContext::new("/var/www".to_string(), None, Some(request), tx)
+                .expect("the default split path is valid"),
+        );
+
+        // Stands in for every droppable value that is live in the register
+        // step's frames at the moment C bails out -- the ones the old code
+        // would have let the `longjmp` skip.
+        let canary = std::sync::Arc::new(());
+        let observer = std::sync::Arc::downgrade(&canary);
+
+        let outcome = register_server_variables_with(THREAD_INDEX, move |_payload| {
+            let _live_across_the_bailout = canary;
+            Err(cgi::Bailout)
+        });
+
+        assert_eq!(
+            outcome,
+            Err(cgi::Bailout),
+            "a caught bailout must propagate to the caller, never be swallowed: \
+             PHP is mid-unwind and someone has to re-raise it"
+        );
+        assert!(
+            observer.upgrade().is_none(),
+            "everything the register step owned must be dropped before the caller \
+             re-raises with frankenrust_bailout(); anything still alive here would \
+             be leaked by the longjmp that follows"
+        );
+
+        CONTEXT_SLOTS.clear(THREAD_INDEX);
     }
 }
