@@ -10,6 +10,10 @@ The gate has already proven: it builds, clippy is clean, tests pass. So do not
 report build errors, formatting, or style. Those are solved. Report only defects
 that a green gate would not have caught.
 
+You may build repros in the worktree, and are encouraged to when a claim needs
+proof -- but the tree is the artifact under review: anything you leave behind
+in it is proposed for merge, not discarded on your behalf.
+
 ## Where the bugs actually are in this project
 
 Look hardest at these, in order:

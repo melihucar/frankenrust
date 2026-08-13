@@ -440,8 +440,57 @@ def worktree_diff(wt: Path) -> str:
     return diff
 
 
+def snapshot_worktree(wt: Path) -> str:
+    """Capture the exact tree state so scratch work can be discarded losslessly.
+
+    `git write-tree` needs the index to reflect the state we want captured, so
+    stage first -- that also picks up untracked files, which is exactly what a
+    reviewer's scratch crate would otherwise be. write-tree only writes objects
+    to the object database; it never touches the working directory, so taking
+    this snapshot does not disturb what the reviewers are about to read.
+    """
+    git(["add", "-A"], cwd=wt)
+    rc, tree = git(["write-tree"], cwd=wt)
+    if rc != 0:
+        log(f"    !! snapshot_worktree failed to write-tree in {wt}: {tree}")
+        record("snapshot_failed", worktree=str(wt), reason=tree[-500:])
+        return ""
+    return tree.strip()
+
+
+def restore_worktree(wt: Path, tree: str) -> None:
+    """Undo everything since the matching snapshot_worktree call.
+
+    Stage first so any untracked file a reviewer added enters the index --
+    `read-tree` only reconciles paths that are tracked, so without this an
+    added-but-never-`git add`ed file would be invisible to it and survive.
+    `read-tree --reset -u` then resets the index to `tree` and rewrites the
+    working tree to match: modified tracked files revert to the snapshot's
+    content, and paths that are in the (freshly staged) index but not in
+    `tree` are removed. Paths `add -A` skips because .gitignore covers them --
+    `target/`, chiefly -- are never staged in the first place, so a populated
+    build cache a reviewer leaves behind survives untouched. This is a
+    restore, not `git clean -xfd`.
+    """
+    if not tree:
+        return
+    git(["add", "-A"], cwd=wt)
+    rc, out = git(["read-tree", "--reset", "-u", tree], cwd=wt)
+    if rc != 0:
+        log(f"    !! restore_worktree failed in {wt}: {out}")
+        record("restore_failed", worktree=str(wt), reason=out[-500:])
+
+
 def review_stage(issue: gh.Issue, wt: Path, logdir: Path, tag: str) -> str | None:
-    """Two adversarial reviewers, independent contexts, diff only."""
+    """Two adversarial reviewers, independent contexts, diff only.
+
+    Reviewers run with cwd=wt and full tool access, and reviewer.md tells them
+    to investigate using the repo -- building a repro in the worktree is good
+    review work. But whatever they leave behind would otherwise be swept into
+    the *next* stage's diff by worktree_diff's `git add -A`, and from there into
+    `main` by merge_worktree's. Snapshot the tree before they run and restore it
+    unconditionally after, so reviewing can never change what gets merged.
+    """
     diff = worktree_diff(wt)
     if not diff.strip():
         return None
@@ -454,15 +503,22 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path, tag: str) -> str | Non
         _, _, text = invoke(agent, wt, p, logdir, f"review{idx}.{tag}", role="reviewer")
         results[idx] = text
 
-    # Cross-model on purpose: two instances of one model reviewing a diff behave
-    # closer to one reviewer than to two. Once codex is out of quota both become
-    # Opus, losing vendor diversity but keeping independent contexts.
-    threads = [threading.Thread(target=one, args=(1, "claude")),
-               threading.Thread(target=one, args=(2, "codex"))]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    snapshot = snapshot_worktree(wt)
+    try:
+        # Cross-model on purpose: two instances of one model reviewing a diff behave
+        # closer to one reviewer than to two. Once codex is out of quota both become
+        # Opus, losing vendor diversity but keeping independent contexts.
+        threads = [threading.Thread(target=one, args=(1, "claude")),
+                   threading.Thread(target=one, args=(2, "codex"))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        # Unconditional: the PASS path merges this worktree, and BLOCK feeds it
+        # to the fixer, then to a post-fix review_stage that stages everything
+        # again -- either way, anything reviewer-authored still here gets merged.
+        restore_worktree(wt, snapshot)
 
     found = [f"## Reviewer {i}\n{t[-8000:]}" for i, t in sorted(results.items())
              if "VERDICT: BLOCK" in t]
