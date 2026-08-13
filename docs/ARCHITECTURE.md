@@ -12,7 +12,7 @@ territory.
 
 ## Why `frankenphp.c` is compiled, not ported
 
-Upstream is three layers of very different portability (`README.md:15-19`):
+Upstream is three layers of very different portability (`./README.md:39-45`):
 
 | Layer | Upstream | Here |
 |---|---|---|
@@ -26,7 +26,7 @@ is a benchmark decision, not a taste one: the question this project asks is
 changing the SAPI *and* the host language in the same measurement, and any
 observed difference would be unattributable to either one
 (`docs/PORTING-NOTES.md:70-75`). The C is already language-neutral — it just
-calls symbols that happen to be named `go_*` (`README.md:21-24`,
+calls symbols that happen to be named `go_*` (`./README.md:47-48`,
 `docs/PORTING-NOTES.md:39-40`) — so holding it fixed and reimplementing only
 what calls into it isolates the variable the benchmark exists to measure.
 
@@ -52,7 +52,7 @@ places, and they carry different columns**:
 (One of the 26, `go_mercure_publish`
 (`docs/PORTING-NOTES.md:112`), is explicitly a stub, never a real
 reimplementation — see "What is deliberately out of scope" below — which is
-why `docs/PORTING-NOTES.md:41` and `README.md:165` count 25: this document
+why `docs/PORTING-NOTES.md:41` and `./README.md:49` count 25: this document
 counts the checklist as written, stub included.)
 
 ## The three-layer split
@@ -68,7 +68,7 @@ crates/frankenrust-server   hyper HTTP/1.1 server, async<->pthread bridge
 vendor/frankenphp/          upstream, READ-ONLY — the behavioural oracle
 ```
 
-(`README.md:161-170`.)
+(`./README.md:204-207`.)
 
 - **`frankenrust-sys`** owns the unsafe FFI surface: bindgen-generated types
   from PHP's headers, a hand-written `_cgo_export.h` replacement (cgo
