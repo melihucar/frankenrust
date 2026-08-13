@@ -6,10 +6,20 @@
 # slice does not implement TLS, so upstream must serve plaintext too.
 #
 # We are deliberately measuring the PHP request pipeline, not the TLS stack.
+#
+# num_threads must be set here too, not just in Caddyfile.matched: run.sh
+# injects FR_THREADS into every server's container regardless of $ROUTING, to
+# equalise the PHP concurrency budget against a spawn_blocking-based server
+# that can have 64+ requests in flight at -c 64. Without this directive in
+# BOTH routing configs, the default routing (which is also what --smoke and
+# the gate exercise) silently runs a fixed 8 interpreters no matter what
+# FR_THREADS says.
 {
 	auto_https off
 	admin off
-	frankenphp
+	frankenphp {
+		num_threads {$FR_THREADS:8}
+	}
 }
 
 :80 {

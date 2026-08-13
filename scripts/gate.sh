@@ -80,6 +80,8 @@ if [ "$PROFILE" = "bench" ]; then
   step "bench-smoke" bash bench/harness/run.sh --smoke
 fi
 
+step "bench-report-selftest" python3 bench/harness/report.py --selftest
+
 echo
 if [ ${#FAILED[@]} -eq 0 ]; then
   echo "GATE PASS ($PROFILE)"
