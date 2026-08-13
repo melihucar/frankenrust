@@ -36,6 +36,7 @@ boundary. scripts/check_orchestrator.py is what keeps that survivable.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -409,9 +410,30 @@ def merge_worktree(tid: str, logdir: Path, gate: str) -> bool:
 
 
 # --- stages ------------------------------------------------------------------
+def worktree_diff(wt: Path) -> str:
+    """Everything the agent changed -- committed or not, tracked or not.
+
+    `git diff main...HEAD` shows only what was committed, but agents are not
+    required to commit: merge_worktree does `add -A` for them at the end. So an
+    agent that edits files and stops leaves HEAD where it was, and the diff the
+    reviewers are handed is whatever the *previous* stage happened to commit --
+    or nothing at all. Both failures point the same way: code merges that no
+    reviewer ever read. Staging first also picks up new files, which `git diff`
+    cannot see while they are untracked and which are usually the substance of
+    the change rather than a detail of it.
+
+    Staging is safe to do repeatedly here; merge_worktree and retire_worktree
+    both stage everything again before they commit.
+    """
+    git(["add", "-A"], cwd=wt)
+    _, base = git(["merge-base", "main", "HEAD"], cwd=wt)
+    _, diff = git(["diff", "--cached", base.strip()], cwd=wt)
+    return diff
+
+
 def review_stage(issue: gh.Issue, wt: Path, logdir: Path, tag: str) -> str | None:
     """Two adversarial reviewers, independent contexts, diff only."""
-    _, diff = git(["diff", "main...HEAD"], cwd=wt)
+    diff = worktree_diff(wt)
     if not diff.strip():
         return None
     (logdir / f"diff.{tag}.patch").write_text(diff)
@@ -545,6 +567,18 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             continue
 
         log(f"    ok gate passed (#{issue.number} attempt {attempt}) — review")
+        # A gate that passes on an empty worktree says nothing: the bootstrap
+        # profile is satisfiable by changing nothing at all. Without this the
+        # run's easiest path to "merged" is to do no work -- empty diff, review
+        # skipped for want of anything to read, an --allow-empty commit, issue
+        # closed. Spend the attempt instead.
+        if not worktree_diff(wt).strip():
+            log(f"    xx #{issue.number} attempt {attempt} changed nothing")
+            record("empty_diff", issue=issue.number, attempt=attempt, agent=agent)
+            failure = ("You changed no files. The gate passing means only that you "
+                       "broke nothing; it is not evidence of work.")
+            continue
+
         blocking = review_stage(issue, wt, logdir, str(attempt))
         if blocking:
             log(f"    xx review BLOCKED #{issue.number}")
@@ -632,10 +666,27 @@ def retro_thread() -> None:
             record("retro_error", reason=str(exc))
 
 
+def _source_fingerprint() -> str:
+    h = hashlib.sha256()
+    for rel in ("orchestrator/loop.py", "orchestrator/gh.py"):
+        h.update((ROOT / rel).read_bytes())
+    return h.hexdigest()
+
+
+_source_at_start = _source_fingerprint()
+
+
 def self_update_pending() -> bool:
-    """Did anything just merged change the code this process is running?"""
-    _, out = git(["log", "-1", "--name-only", "--format=", "HEAD"])
-    return any(f in out for f in ("orchestrator/loop.py", "orchestrator/gh.py"))
+    """Does the code on disk still match the code this process is running?
+
+    Was `git log -1 --name-only HEAD`, which only sees the most recent commit.
+    A batch that merges two issues, the loop.py one first, leaves HEAD on the
+    other and the update is silently skipped -- and the same is true of a fix
+    committed to main directly while the run is live. Comparing the bytes we
+    started with against the bytes on disk asks the question that actually
+    matters and cannot miss it, whatever put them there.
+    """
+    return _source_fingerprint() != _source_at_start
 
 
 def restart_into_new_code() -> None:
