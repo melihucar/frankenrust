@@ -103,7 +103,10 @@ CODEX_LIMIT_PATTERNS = (
 _merge_lock = threading.Lock()
 _claim_lock = threading.Lock()
 _codex_lock = threading.Lock()
-_codex_disabled = False
+# Survives re-exec. A quota wall lasts days, but the flag was process-local, so
+# every self-update handed the successor a clean slate and it re-learned the
+# same wall by burning another invocation on it.
+_codex_disabled = os.environ.get("FR_CODEX_DISABLED") == "1"
 _start = time.time()
 
 
@@ -148,7 +151,13 @@ def disable_codex(reason: str) -> None:
         if _codex_disabled:
             return
         _codex_disabled = True
+    os.environ["FR_CODEX_DISABLED"] = "1"    # carried through restart_into_new_code
     log(f"!! codex disabled for the rest of this run ({reason}); falling back to claude")
+    # Cross-model review is the reason two reviewers are worth more than one
+    # reviewer run twice. Losing it is a change in what a merge means, so it
+    # belongs in the journal where the retrospective and the morning review
+    # will see it, not only in a log line nobody reads.
+    record("review_diversity_lost", reason=reason)
 
 
 def resolve(agent: str, role: str, escalate: bool = False) -> tuple[str, str | None]:
@@ -597,9 +606,15 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
 
         if merge_worktree(tid, logdir, issue.gate):
             _, sha = git(["rev-parse", "--short", "HEAD"])
+            # Say which reviewers actually ran. "Two adversarial reviews" reads
+            # as cross-model review whether or not that is what happened, and
+            # once codex is walled off it is two runs of one model -- a weaker
+            # claim that the morning reader deserves to see on the issue.
+            reviewed = ("two adversarial reviews (claude + codex)" if codex_ok()
+                        else "two adversarial reviews, both claude — codex was unavailable")
             gh.close(issue.number,
                      f"Merged as `{sha}` after {attempt} attempt(s), gate `{issue.gate}`, "
-                     f"and two adversarial reviews.")
+                     f"and {reviewed}.")
             record("merged", issue=issue.number, title=issue.title,
                    attempts=attempt, agent=agent, gate=issue.gate)
             _merge_signal.set()
