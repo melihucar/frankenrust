@@ -14,12 +14,6 @@ PROFILE="${1:-default}"
 cd "$(dirname "$0")/.." || exit 1
 FAILED=()
 
-# rustup installs cargo to ~/.cargo/bin and leaves it to an interactive shell
-# profile to put that on PATH. The orchestrator is not an interactive shell and
-# neither are the agents it spawns, so without this every cargo step fails as
-# "command not found" and the gate reports it as the agent's code being broken.
-command -v cargo >/dev/null 2>&1 || export PATH="$HOME/.cargo/bin:$PATH"
-
 step() {
   local name="$1"; shift
   echo "--- gate: $name"
@@ -48,6 +42,14 @@ step "test-suite-intact" bash -c '
 # file can never reach main.
 step "orchestrator-runnable" python3 scripts/check_orchestrator.py
 
+# scripts/dev.sh is the only route to a Rust toolchain, so a bug in which image
+# tag or which target/ volume it picks is a bug in build, fmt, clippy and test
+# at once — and it fails *green*: a worktree that reuses another worktree's
+# artifacts gets a passing gate for code that was never compiled. Nothing else
+# here can see that, so it is pinned directly. Pure shell against a stub
+# docker: no daemon, no image, runs in every profile.
+step "dev-env" bash tests/dev-env/dev-sh.test.sh
+
 # Early backlog tasks (the PHP base image, the conformance harness) legitimately
 # produce no Rust. Tolerate a missing workspace ONLY in bootstrap; in any other
 # profile a vanished Cargo.toml means someone deleted the project.
@@ -59,18 +61,18 @@ if [ ! -f Cargo.toml ]; then
     FAILED+=("build")
   fi
 else
-  # Routed through scripts/dev.sh: the host has no PHP embed SAPI and no Rust
-  # toolchain (see docker/frankenrust-dev.Dockerfile), so a bare `cargo build`
-  # here cannot link -lphp. If Docker is unavailable or the image fails to
-  # build, dev.sh exits nonzero and this step FAILS — it must never be
-  # allowed to silently skip.
-  step "build" scripts/dev.sh cargo build --workspace --all-targets
+  # Routed through scripts/dev.sh: the host has no Rust toolchain and its PHP
+  # is neither ZTS nor built with the embed SAPI this port links against, so
+  # `cargo build` cannot work outside the frankenrust-dev container. dev.sh
+  # itself fails loudly (not skips) if Docker is unavailable or the image
+  # cannot be built, and step() below turns that failure into a gate FAIL.
+  step "build" bash scripts/dev.sh cargo build --workspace --all-targets
 fi
 
 if [ "$PROFILE" != "bootstrap" ]; then
-  step "fmt"     scripts/dev.sh cargo fmt --all -- --check
-  step "clippy"  scripts/dev.sh cargo clippy --workspace --all-targets -- -D warnings
-  step "test"    scripts/dev.sh cargo test --workspace
+  step "fmt"     bash scripts/dev.sh cargo fmt --all -- --check
+  step "clippy"  bash scripts/dev.sh cargo clippy --workspace --all-targets -- -D warnings
+  step "test"    bash scripts/dev.sh cargo test --workspace
   step "conformance" bash tests/conformance/run.sh
 fi
 
