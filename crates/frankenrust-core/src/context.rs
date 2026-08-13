@@ -41,18 +41,22 @@
 //!    for why: a Zend bailout `longjmp`s past Rust destructors, so a lock
 //!    guard (or anything else) alive on the stack at that moment is never
 //!    released.
-//! 2. **Never re-enter [`CONTEXT_SLOTS`] for the same `thread_index` from
-//!    inside one** -- not through `set`, `clear`, `with_context`,
-//!    `with_context_mut`, nor anything that calls them (a completion signal
-//!    fired by [`RequestContext::close_context`] is the shape to watch for,
-//!    since `close_context` is itself reached through `with_context_mut`).
+//! 2. **Never re-enter [`CONTEXT_SLOTS`] at all from inside one** -- not
+//!    through `set`, `clear`, `with_context`, `with_context_mut`, nor
+//!    anything that calls them (a completion signal fired by
+//!    [`RequestContext::close_context`] is the shape to watch for, since
+//!    `close_context` is itself reached through `with_context_mut`) -- and
+//!    that includes a *different* `thread_index`, not just the same one.
 //!    A slot is guarded by a plain `std::sync::Mutex`, which is not
-//!    reentrant, so this deadlocks the PHP thread against itself.
-//!
-//! *Other* indices are fine, and so is growing the table from inside a
-//! closure: [`ContextSlots`] releases the table-level lock before it calls
-//! the closure specifically so that neither of those is a hazard. Rule 2 is
-//! the only re-entry that bites.
+//!    reentrant, so same-index re-entry self-deadlocks; different-index
+//!    re-entry does not self-deadlock, but it opens an ABBA hazard the first
+//!    version of this module got wrong: thread A holds slot 0's lock and
+//!    waits for slot 1, thread B holds slot 1's lock and waits for slot 0,
+//!    and there is no lock ordering between independent slots to break the
+//!    cycle. [`ContextSlots`] enforces "at most one slot lock per thread" at
+//!    runtime, so a violation panics immediately instead of deadlocking
+//!    either way -- see its doc comment for why that is the fix, not a
+//!    weaker substitute for one.
 
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -830,27 +834,53 @@ impl RequestContext {
 /// that use this table, not on the table itself; it is recorded here because
 /// this is where a reviewer will look for it.
 ///
-/// # Rule 2: never re-enter this table for the *same* index from a closure
+/// # Rule 2: never hold more than one slot lock at a time
 ///
 /// Rule 1 grants a reader licence to do any PHP-free work inside the closure,
-/// and touching this table again is PHP-free. For the *same* `thread_index`
-/// it is nonetheless a self-deadlock: the slot is a plain
-/// `std::sync::Mutex`, which is not reentrant, so `set`, `clear`,
-/// `with_context`, `with_context_mut` -- or anything reaching them, a
-/// completion signal fired from [`RequestContext::close_context`] most
-/// plausibly -- wedge the PHP thread against a lock it is holding itself.
-/// That is the same outcome rule 1 exists to prevent: the request is never
-/// answered.
+/// and touching this table again is PHP-free -- so it is tempting to think
+/// re-entering for a *different* `thread_index` is safe. It is not, and an
+/// earlier version of this module said it was safe and shipped tests
+/// asserting exactly that; a reviewer reproduced the counterexample
+/// deterministically with two threads and a barrier: thread A calls
+/// `with_context(0, ..)` and, inside that closure, `with_context(1, ..)`;
+/// thread B does the same in the opposite order (`with_context(1, ..)` then
+/// `with_context(0, ..)`). Each slot is an independent
+/// `std::sync::Mutex` with no ordering relationship between them, so A can
+/// hold 0 and wait for 1 at the same instant B holds 1 and waits for 0 --
+/// classic ABBA, and there is no way to fix it by choosing a "safe" order at
+/// each call site, because two *different* call sites choosing two
+/// *different* orders is exactly the bug.
 ///
-/// Re-entering for a *different* index, and growing the table from inside a
-/// closure, are both fine, and deliberately so: [`ContextSlots::slot`] clones
-/// the slot's `Arc` out and drops the table-level `RwLock` guard before the
-/// closure ever runs. Without that, a closure calling `set` on a not-yet-seen
-/// index would block on the write lock while its caller still held a read
-/// lock, and a nested read would deadlock against any writer already queued
-/// (std's `RwLock` is write-preferring). Only the one slot's `Mutex` is held
-/// across the closure, which is the lock that has to be held for the borrow
-/// handed to the closure to mean anything.
+/// The only deadlock-proof rule is the stricter one: a thread may hold at
+/// most one slot lock at any instant, full stop, whether the second attempt
+/// targets the same index (self-deadlock on a non-reentrant `Mutex`) or a
+/// different one (the ABBA case above). [`ContextSlots`] enforces this with
+/// [`SingleSlotGuard`], a thread-local flag `set`, `clear`, `with_context`
+/// and `with_context_mut` each raise on entry and lower on exit: a second
+/// acquisition attempt on the same thread panics *before* it ever touches a
+/// `Mutex`, so no lock is ever taken while another is held and no hold-and-
+/// wait cycle can form -- this is enforced by code, not merely documented,
+/// because documentation alone is exactly what let the ABBA case ship the
+/// first time.
+///
+/// This is a deliberate departure from [`recover_lock`]/[`recover_read`]'s
+/// philosophy of never panicking in this table (a poisoned `Option` is safe
+/// to keep serving, so recovering avoids aborting the process over an
+/// unrelated bug). A same-thread re-entry is not that kind of bug: it is a
+/// violation of this table's own contract, indistinguishable from a live
+/// deadlock to anything downstream, and a hung PHP worker thread is worse
+/// than a loud panic -- it never surfaces as a poisoned lock, it just quietly
+/// removes one thread's worth of capacity forever. Failing fast here is
+/// strictly more visible than the failure mode it replaces.
+///
+/// Growing the table from inside a closure remains fine on its own terms --
+/// [`ContextSlots::slot`] clones the slot's `Arc` out and drops the
+/// table-level `RwLock` guard before the closure ever runs, so a nested `set`
+/// on a not-yet-seen index never blocks on the write lock while the caller
+/// holds a read lock -- but it is reached through `set`, which
+/// [`SingleSlotGuard`] gates like every other entry point, so nesting it
+/// inside another slot's closure still panics. Only *non-nested* growth is
+/// exercised.
 pub struct ContextSlots {
     slots: RwLock<Vec<Arc<Mutex<Option<RequestContext>>>>>,
 }
@@ -885,6 +915,65 @@ fn recover_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+std::thread_local! {
+    /// Whether *this* OS thread currently holds a [`ContextSlots`] slot lock.
+    /// See [`SingleSlotGuard`] and [`ContextSlots`]'s "Rule 2" doc section:
+    /// this is what turns a same-thread second acquisition -- same index or
+    /// not -- into an immediate panic instead of a self-deadlock or an ABBA
+    /// deadlock against another thread.
+    static HOLDING_SLOT_LOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII enforcement of "at most one [`ContextSlots`] slot lock per thread".
+/// Every public entry point (`set`, `clear`, `with_context`,
+/// `with_context_mut`) acquires one of these *before* it locks its slot's
+/// `Mutex`, and holds it for exactly as long as that `Mutex` guard is held.
+///
+/// # Why this is a panic, not a `Result`
+///
+/// A second acquisition on the same thread is never a legitimate race --
+/// it is a caller violating this table's own contract from inside its own
+/// call stack, which no other thread can trigger and no timing can avoid.
+/// Returning a `Result` would just move the "what do I do about a bug"
+/// question to a caller with no better answer than panicking; failing here,
+/// loudly, at the exact call site that broke the rule, is more debuggable
+/// than either a hang (the bug this replaces) or a silently-skipped access
+/// (the alternative of using `try_lock` and pretending the slot was empty).
+///
+/// SAFETY-adjacent note: this is deliberately *not* a `Mutex`/`RwLock`
+/// re-entrancy check delegated to the OS lock itself (e.g. via `try_lock`)
+/// -- the panic must fire before any second `Mutex::lock` call is attempted,
+/// so that the offending thread never blocks even transiently. A
+/// thread-local flag checked-then-set ahead of the real lock is what
+/// guarantees that ordering.
+struct SingleSlotGuard;
+
+impl SingleSlotGuard {
+    fn acquire() -> Self {
+        HOLDING_SLOT_LOCK.with(|held| {
+            assert!(
+                !held.get(),
+                "ContextSlots: this thread already holds a slot lock; nesting a second \
+                 set/clear/with_context/with_context_mut call inside one -- same \
+                 thread_index or not -- is forbidden (see ContextSlots' doc comment: \
+                 different-index nesting is an ABBA deadlock waiting for a second thread \
+                 nesting in the opposite order)"
+            );
+            held.set(true);
+        });
+        Self
+    }
+}
+
+impl Drop for SingleSlotGuard {
+    fn drop(&mut self) {
+        // Runs even when unwinding past this guard (a closure that panics,
+        // as in the poisoned-slot test below), so a caught panic leaves this
+        // thread able to acquire again rather than permanently locked out.
+        HOLDING_SLOT_LOCK.with(|held| held.set(false));
+    }
+}
+
 impl ContextSlots {
     pub const fn new() -> Self {
         Self {
@@ -898,10 +987,12 @@ impl ContextSlots {
     /// Every accessor goes through here, and every one of them holds **no
     /// table-level guard** by the time it locks the slot: this returns an
     /// owned `Arc`, and both the read guard on the fast path and the write
-    /// guard on the growth path die inside this function. That is what makes
-    /// rule 2 apply only to the same index -- growing the table, or reaching
-    /// another slot, from inside a `with_context*` closure would otherwise
-    /// deadlock on the `RwLock` (see this type's doc comment).
+    /// guard on the growth path die inside this function. That keeps the
+    /// table-level `RwLock` out of the deadlock analysis entirely -- the only
+    /// lock a caller can be holding once its closure runs is the one slot's
+    /// `Mutex`, and [`SingleSlotGuard`] is what keeps that count at "at most
+    /// one" (see this type's doc comment for why a second slot, not just the
+    /// same one, must be included in that limit).
     fn slot(&self, thread_index: usize) -> Arc<Mutex<Option<RequestContext>>> {
         // Bound as its own statement so the read guard is released here, not
         // at the end of an enclosing `if let`: the write lock below would
@@ -922,24 +1013,29 @@ impl ContextSlots {
     /// releasing the arena of) whatever context previously occupied the
     /// slot, if any.
     pub fn set(&self, thread_index: usize, ctx: RequestContext) {
+        let _guard = SingleSlotGuard::acquire();
         let slot = self.slot(thread_index);
         *recover_lock(&slot) = Some(ctx);
     }
 
     /// Drops `thread_index`'s context, if any -- releasing its arena.
     pub fn clear(&self, thread_index: usize) {
+        let _guard = SingleSlotGuard::acquire();
         let slot = self.slot(thread_index);
         *recover_lock(&slot) = None;
     }
 
     /// Runs `f` with `thread_index`'s context, holding that slot's lock for
     /// the duration. `f` must not call into PHP, and must not re-enter this
-    /// table for `thread_index` -- see this type's two rules for callers.
+    /// table at all, for `thread_index` or any other -- see this type's two
+    /// rules for callers. A violation panics via [`SingleSlotGuard`] rather
+    /// than deadlocking.
     pub fn with_context<R>(
         &self,
         thread_index: usize,
         f: impl FnOnce(Option<&RequestContext>) -> R,
     ) -> R {
+        let _guard = SingleSlotGuard::acquire();
         let slot = self.slot(thread_index);
         let guard = recover_lock(&slot);
         f(guard.as_ref())
@@ -953,6 +1049,7 @@ impl ContextSlots {
         thread_index: usize,
         f: impl FnOnce(Option<&mut RequestContext>) -> R,
     ) -> R {
+        let _guard = SingleSlotGuard::acquire();
         let slot = self.slot(thread_index);
         let mut guard = recover_lock(&slot);
         f(guard.as_mut())
@@ -1227,7 +1324,7 @@ mod tests {
         let mut arena = RequestArena::default();
         let first = arena.alloc(b"hello");
 
-        // Push enough further entries to force the arena's own Vec<Arc<[u8]>>
+        // Push enough further entries to force the arena's own Vec<Box<[u8]>>
         // spine to reallocate (likely many times over).
         for i in 0..10_000 {
             arena.alloc(format!("entry-{i}").as_bytes());
@@ -1236,7 +1333,7 @@ mod tests {
         // SAFETY: `arena` is still alive and owns `first`'s backing buffer;
         // RequestArena::alloc documents that a returned pointer stays valid
         // across later `alloc` calls, because growing the spine moves the
-        // `Arc` handles, never the heap bytes they point at.
+        // `Box` handles, never the heap bytes they point at.
         let bytes = unsafe { std::ffi::CStr::from_ptr(first) };
         assert_eq!(bytes.to_bytes(), b"hello");
     }
@@ -1455,61 +1552,118 @@ mod tests {
     }
 
     #[test]
-    fn a_closure_may_reach_another_slot_and_may_grow_the_table() {
-        // Rule 2 forbids re-entering the table for the *same* thread_index.
-        // Everything else must work: the accessors drop the table-level lock
-        // before calling the closure precisely so that a PHP-free closure --
-        // which the type's rule 1 explicitly permits -- cannot wedge itself.
-        let slots = Arc::new(ContextSlots::new());
+    fn nested_access_to_a_different_slot_panics_instead_of_deadlocking() {
+        // Superseded design: an earlier version of this module claimed
+        // reaching a *different* slot from inside a with_context closure was
+        // safe (it is not -- see the ABBA case below), and shipped a test
+        // asserting exactly that nested-access pattern succeeded. That test
+        // was wrong to pass, not merely weak: it exercised a genuinely
+        // unsafe API shape. This test asserts the corrected behaviour --
+        // SingleSlotGuard turns the same call pattern into an immediate
+        // panic on this one thread, well before two threads doing it in
+        // opposite orders could ever deadlock.
+        let slots = ContextSlots::new();
         slots.set(0, test_context(None));
         slots.set(1, test_context(None));
 
-        let slots = Arc::clone(&slots);
-        run_or_fail_on_deadlock("nested access from a with_context closure", move || {
-            // Another index, while index 0's slot lock is held.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             slots.with_context(0, |ctx| {
                 assert!(ctx.is_some());
-                assert!(slots.with_context(1, |other| other.is_some()));
+                slots.with_context(1, |other| other.is_some())
             });
+        }));
+        assert!(
+            result.is_err(),
+            "nesting with_context(1, ..) inside with_context(0, ..) must panic, not succeed"
+        );
 
-            // Growth from inside a closure: `set` on a never-seen index needs
-            // the table's write lock, which a read guard held across the
-            // closure would block against forever.
+        // The panic must not leave this thread permanently locked out: both
+        // slots are independently usable again afterwards.
+        assert!(slots.with_context(0, |ctx| ctx.is_some()));
+        assert!(slots.with_context(1, |ctx| ctx.is_some()));
+    }
+
+    #[test]
+    fn nested_set_from_within_a_closure_panics_even_for_a_new_index() {
+        // Growing the table (via `set` on a never-seen index) from inside
+        // another slot's closure is the same hazard as reaching an
+        // already-populated slot: `set` goes through the same
+        // SingleSlotGuard-gated entry point, so nesting it panics too.
+        let slots = ContextSlots::new();
+        slots.set(0, test_context(None));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             slots.with_context_mut(0, |ctx| {
                 ctx.expect("slot 0 was set").arena.alloc(b"x");
                 slots.set(4096, test_context(None));
             });
-            assert!(slots.with_context(4096, |ctx| ctx.is_some()));
-        });
+        }));
+        assert!(
+            result.is_err(),
+            "nesting set(4096, ..) inside with_context_mut(0, ..) must panic, not grow the table"
+        );
+        assert!(
+            slots.with_context(4096, |ctx| ctx.is_none()),
+            "the panicked set() must not have installed a context"
+        );
     }
 
     #[test]
-    fn a_nested_read_is_not_blocked_by_a_queued_writer() {
+    fn opposite_order_cross_thread_nesting_panics_on_both_threads_rather_than_deadlocking() {
+        // The exact scenario a reviewer used to block the previous version
+        // of this module: thread A holds slot 0 and reaches for slot 1 while
+        // thread B holds slot 1 and reaches for slot 0. Wrapped in
+        // run_or_fail_on_deadlock as a safety net -- if this regresses, the
+        // test must fail loudly within 10s rather than hang the gate.
         let slots = Arc::new(ContextSlots::new());
         slots.set(0, test_context(None));
         slots.set(1, test_context(None));
 
-        let slots = Arc::clone(&slots);
-        run_or_fail_on_deadlock("nested read with a writer queued", move || {
-            slots.with_context(0, |ctx| {
-                assert!(ctx.is_some());
+        let slots_for_body = Arc::clone(&slots);
+        run_or_fail_on_deadlock("opposite-order cross-slot nesting", move || {
+            let slots = slots_for_body;
+            let barrier = Arc::new(std::sync::Barrier::new(2));
 
-                // A writer racing to grow the table. std's RwLock is
-                // write-preferring, so were this closure running under a read
-                // guard, this writer would queue behind it and the nested read
-                // below would queue behind the writer: a three-way wedge with
-                // nobody breaking any documented rule.
-                let grower = {
+            let threads: Vec<_> = [(0usize, 1usize), (1, 0)]
+                .into_iter()
+                .map(|(held, wanted)| {
                     let slots = Arc::clone(&slots);
-                    std::thread::spawn(move || slots.set(8192, test_context(None)))
-                };
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            slots.with_context(held, |_| {
+                                barrier.wait();
+                                // Give the other thread a moment to be inside
+                                // its own outer with_context call too, so both
+                                // sides are genuinely holding a lock when each
+                                // reaches for the other's.
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                slots.with_context(wanted, |_| {});
+                            });
+                        }))
+                    })
+                })
+                .collect();
 
-                assert!(slots.with_context(1, |other| other.is_some()));
-                grower.join().expect("growing thread must not panic");
-            });
-            assert!(slots.with_context(8192, |ctx| ctx.is_some()));
+            let mut panicked = 0;
+            for handle in threads {
+                if handle
+                    .join()
+                    .expect("thread must not itself panic across join")
+                    .is_err()
+                {
+                    panicked += 1;
+                }
+            }
+            assert_eq!(
+                panicked, 2,
+                "both threads must panic via SingleSlotGuard rather than deadlock"
+            );
         });
+
+        // Both slots must be usable again afterwards.
+        assert!(slots.with_context(0, |ctx| ctx.is_some()));
+        assert!(slots.with_context(1, |ctx| ctx.is_some()));
     }
 
     #[test]
@@ -1517,7 +1671,7 @@ mod tests {
         let slots = Arc::new(ContextSlots::new());
 
         // Distinct indices, hammered concurrently: exercises the growth path
-        // (ensure_len) racing across threads. If a slot were ever lost, the
+        // in `slot()` racing across threads. If a slot were ever lost, the
         // final assertion loop below would find it missing.
         let handles: Vec<_> = (0..16usize)
             .map(|i| {
