@@ -27,7 +27,9 @@
 //! - CGI path splitting (`splitCgiPath`) and document-root resolution: this
 //!   module stores `document_root`, `split_path`, `doc_uri`, `path_info`,
 //!   `script_name` and `script_filename` exactly as given; computing them is
-//!   a separate module's job.
+//!   a separate module's job. "Exactly as given" includes *not* defaulting an
+//!   absent `split_path` to `[".php"]` -- see [`RequestContext::split_path`],
+//!   where absent and explicitly-empty are different configurations.
 //! - `$_SERVER` / `frankenphp_server_vars` and every `callbacks/` body: no FFI
 //!   happens in this file at all.
 //! - `RequestBody`'s real (streaming) design: see its doc comment.
@@ -210,25 +212,42 @@ pub struct Request {
     /// the field that holds the request line's target verbatim. "Raw" here
     /// means undecoded, not "exactly as it arrived on the wire".
     ///
-    /// Go's method yields the escaped path, then `?` and the raw query
+    /// Go's method yields `URL.EscapedPath()`, then `?` and the raw query
     /// whenever there is a query *or* the client sent a bare `?`
-    /// (`URL.ForceQuery`), and `/` for an empty path. It carries **no scheme,
-    /// no authority and no fragment** -- even when the client sent an
-    /// absolute-form target, `GET http://example.com/a?b=1 HTTP/1.1`, which
-    /// RFC 9110 §7.1 allows and proxies do send. A server layer built on the
-    /// `http` crate must therefore fill this from
-    /// `uri.path_and_query().map(PathAndQuery::as_str)`, falling back to `/`
-    /// when there is none, and never from `uri` itself: `Uri`'s own string
-    /// form keeps the scheme and authority of an absolute-form target, and
-    /// this field reaches PHP as `$_SERVER['REQUEST_URI']`, where that
-    /// difference breaks every router matching on a path.
+    /// (`URL.ForceQuery`), and `/` when the escaped path is empty. It carries
+    /// **no scheme, no authority and no fragment** -- even when the client
+    /// sent an absolute-form target, `GET http://example.com/a?b=1 HTTP/1.1`,
+    /// which RFC 9110 §7.1 allows and proxies do send. So a server layer must
+    /// never fill this from a whole-URI string: that keeps the scheme and
+    /// authority of an absolute-form target, and this field reaches PHP as
+    /// `$_SERVER['REQUEST_URI']`, where the difference breaks every router
+    /// matching on a path.
     ///
-    /// Percent escapes and that bare trailing `?` survive here unmodified;
-    /// neither can be recovered from [`Request::path`] once it has been
-    /// decoded, which is why this is a field of its own. `path_and_query()`
-    /// preserves both (the `http` crate hands back the raw slice), so the
-    /// never-reconstruct invariant and the origin-form rule are satisfiable
-    /// at the same time.
+    /// **`EscapedPath()` is not simply the wire path**, and a server layer
+    /// that fills this from the raw target slice (`http`'s
+    /// `Uri::path_and_query()`, say) is *not* faithful to upstream. Go returns
+    /// the wire path verbatim only when it round-trips -- when
+    /// `validEncoded(RawPath, encodePath)` holds *and* unescaping it
+    /// reproduces `URL.Path`. Otherwise it returns `escape(URL.Path,
+    /// encodePath)`: a canonical re-encoding computed from the **decoded**
+    /// path (`$(go env GOROOT)/src/net/url/url.go`). Measured against
+    /// go1.26.4's `http.ReadRequest`, that fallback fires for any path byte
+    /// `encodePath` would escape -- raw UTF-8 (`/café` -> `/caf%C3%A9`, which
+    /// curl and most non-browser clients send unencoded), and `"` `\` `^` `|`
+    /// `{` `}`. When such a byte shares a path with an escape, the escape is
+    /// decoded too: wire `/%2f"` -> `//%22` (the `%2f` becomes a *structural*
+    /// slash) and wire `/%41"b` -> `/A%22b`.
+    ///
+    /// So: percent escapes survive unmodified (`/%2f` -> `/%2f`, `/%41` ->
+    /// `/%41`) only while the whole path passes `validEncoded`; the bare
+    /// trailing `?` survives unconditionally, since `ForceQuery` is appended
+    /// after the path either way. Neither can be recovered from
+    /// [`Request::path`] once it has been decoded, which is why this is a
+    /// field of its own -- but "not recoverable from `path`" is a weaker
+    /// property than "identical to the wire bytes", and only the first one
+    /// holds. Porting `EscapedPath()`'s round-trip check and re-escape
+    /// fallback is the server layer's job, tracked as its own issue; this
+    /// module only ever copies whatever it is handed.
     ///
     /// [`RequestContext::new`] copies this straight into `request_uri`: see
     /// that field's doc comment for why it must never be rebuilt from `path`
@@ -314,7 +333,9 @@ impl Request {
     }
 
     /// See [`Request::raw_target`]. Whatever fills a `Request` in from the
-    /// wire owns setting this to the literal request-target bytes.
+    /// wire owns computing this the way `URL.RequestURI()` does -- which is
+    /// *not* the literal request-target bytes whenever the wire path fails
+    /// `EscapedPath()`'s round-trip check.
     pub fn with_raw_target(mut self, raw_target: impl Into<Vec<u8>>) -> Self {
         self.raw_target = raw_target.into();
         self
@@ -874,7 +895,29 @@ impl RequestArena {
 /// comment for what is intentionally not ported.
 pub struct RequestContext {
     pub document_root: String,
-    pub split_path: Vec<String>,
+
+    /// The CGI split-path list (`context.go:20`), and `Option` because Go's
+    /// `[]string` is nullable and `splitCgiPath` branches on exactly that:
+    /// `if splitPath == nil { splitPath = []string{".php"} }`
+    /// (`cgi.go:195-197`) defaults **only** the nil case, while a non-nil
+    /// empty slice falls straight through to `splitPos`, whose own
+    /// `if len(splitPath) == 0 { return 0 }` (`cgi.go:239-241`) splits at
+    /// offset zero -- an empty `DOCUMENT_URI` and the whole path as
+    /// `PATH_INFO`. `WithRequestSplitPath([]string{})` reaches that state
+    /// deliberately (`requestoptions.go:86-113` stores the caller's slice
+    /// as-is, and `requestoptions_test.go:39` pins `[]` round-tripping to
+    /// `[]`), so the two are distinct configurations with different
+    /// behaviour, not two spellings of "unset".
+    ///
+    /// [`None`] is Go's nil -- unconfigured, meaning the CGI layer supplies
+    /// `[".php"]`. `Some(vec![])` is the explicit empty list. Collapsing them
+    /// into one `Vec<String>` would be unrecoverable: this struct is the only
+    /// thing the CGI layer is handed, so whichever of the two behaviours it
+    /// then picked would be wrong for the other configuration. Applying the
+    /// `[".php"]` default is *not* this module's job -- storing it here would
+    /// re-erase the distinction one field later.
+    pub split_path: Option<Vec<String>>,
+
     pub request: Option<Request>,
 
     /// Derived from [`Request::path`], and destined for `$_SERVER` /
@@ -888,11 +931,15 @@ pub struct RequestContext {
 
     /// Upstream: `fc.requestURI = r.URL.RequestURI()` (`context.go:111`).
     /// [`RequestContext::new`] sets this to [`Request::raw_target`], copied
-    /// verbatim -- **never** rebuilt from `path` + `query`. A decoded path
-    /// cannot represent a percent-escape (it has already been decoded) or a
-    /// bare trailing `?` with an empty query (`URL.ForceQuery` -- a decoded
-    /// path plus an empty query string is indistinguishable from "no query
-    /// at all"), and `URL.RequestURI()` preserves both.
+    /// verbatim -- **never** rebuilt here from `path` + `query`. A decoded
+    /// path cannot represent a percent-escape that `URL.RequestURI()` would
+    /// have kept (`/%2f` stays `/%2f` there, but decodes to `//` in `path`),
+    /// nor a bare trailing `?` with an empty query (`URL.ForceQuery` -- a
+    /// decoded path plus an empty query string is indistinguishable from "no
+    /// query at all"). Computing the value that goes in here is the job of
+    /// whoever fills [`Request::raw_target`], and that computation is
+    /// `URL.RequestURI()`'s, not a slice of the wire bytes: see that field's
+    /// doc comment for the re-escape fallback it has to reproduce.
     pub request_uri: Vec<u8>,
 
     /// Whether the request is already closed by us (`context.go:37`).
@@ -914,14 +961,16 @@ pub struct RequestContext {
 
 impl RequestContext {
     /// `document_root` and `split_path` are stored exactly as given --
-    /// resolving an empty document root, and validating/normalising
-    /// `split_path`, both belong to the module that owns CGI path splitting.
-    /// `doc_uri`, `path_info`, `script_name` and `script_filename` start
-    /// empty for the same reason: computing them from `request` is that
-    /// module's job too, not this constructor's.
+    /// resolving an empty document root, and defaulting/validating/normalising
+    /// `split_path`, all belong to the module that owns CGI path splitting.
+    /// In particular `None` is passed through as `None`: see the field's doc
+    /// comment for why substituting `[".php"]` here would be a bug and not a
+    /// convenience. `doc_uri`, `path_info`, `script_name` and
+    /// `script_filename` start empty for the same reason: computing them from
+    /// `request` is that module's job too, not this constructor's.
     pub fn new(
         document_root: String,
-        split_path: Vec<String>,
+        split_path: Option<Vec<String>>,
         request: Option<Request>,
         completion_signal: CompletionSignal,
     ) -> Self {
@@ -1270,7 +1319,7 @@ mod tests {
     use super::*;
 
     fn test_context(request: Option<Request>) -> RequestContext {
-        RequestContext::new(String::new(), Vec::new(), request, CompletionSignal::none())
+        RequestContext::new(String::new(), None, request, CompletionSignal::none())
     }
 
     /// Runs `body` on a scratch thread and fails the test if it has not
@@ -1744,6 +1793,27 @@ mod tests {
     }
 
     #[test]
+    fn request_uri_takes_raw_target_even_when_it_is_not_the_wire_bytes() {
+        // `URL.RequestURI()` is not a slice of the request line. When the
+        // wire path fails `EscapedPath()`'s round-trip check it is re-encoded
+        // from the *decoded* path, so upstream turns the wire target
+        // `/caf\xc3\xa9` into `/caf%C3%A9` and the wire target `/%2f"` into
+        // `//%22` -- verified against go1.26.4's http.ReadRequest. Producing
+        // that value belongs to whoever fills `raw_target`; this module's
+        // contract is only that it copies whatever it is handed, byte for
+        // byte, and never second-guesses it from `path` + `query`. Both cases
+        // below have a `path` that a naive reconstruction would use instead,
+        // and it differs from the answer in each direction.
+        let re_escaped = Request::new("GET", "/café".as_bytes().to_vec())
+            .with_raw_target(b"/caf%C3%A9".to_vec());
+        assert_eq!(test_context(Some(re_escaped)).request_uri, b"/caf%C3%A9");
+
+        let escape_decoded =
+            Request::new("GET", b"//\"".to_vec()).with_raw_target(b"//%22".to_vec());
+        assert_eq!(test_context(Some(escape_decoded)).request_uri, b"//%22");
+    }
+
+    #[test]
     fn request_uri_is_empty_without_a_raw_target_or_a_request() {
         let ctx = test_context(Some(Request::new("GET", b"/".to_vec())));
         assert_eq!(
@@ -1754,6 +1824,65 @@ mod tests {
 
         let no_request = test_context(None);
         assert_eq!(no_request.request_uri, b"");
+    }
+
+    #[test]
+    fn split_path_keeps_absent_and_explicitly_empty_distinguishable() {
+        // Go's []string is nullable and `splitCgiPath` branches on precisely
+        // that: `if splitPath == nil { splitPath = []string{".php"} }`
+        // (cgi.go:195-197) defaults only nil, while a non-nil empty slice
+        // reaches `splitPos`, which returns 0 (cgi.go:239-241) -- empty
+        // DOCUMENT_URI, whole path as PATH_INFO. `WithRequestSplitPath([])`
+        // reaches that state on purpose (requestoptions_test.go:39).
+        //
+        // Storing a `Vec<String>` would map both onto `vec![]`, and since
+        // this struct is all the CGI layer gets, one of the two
+        // configurations would then be unrecoverably wrong. So the
+        // constructor must round-trip all three states unchanged, and must
+        // not "helpfully" substitute the [".php"] default for `None` -- that
+        // would re-erase the distinction one field later.
+        let unconfigured = RequestContext::new(
+            String::new(),
+            None,
+            Some(Request::new("GET", b"/index.php/foo".to_vec())),
+            CompletionSignal::none(),
+        );
+        assert_eq!(
+            unconfigured.split_path, None,
+            "None is Go's nil: unconfigured, and the CGI layer -- not this \
+             constructor -- supplies [\".php\"]"
+        );
+
+        let explicitly_empty = RequestContext::new(
+            String::new(),
+            Some(Vec::new()),
+            Some(Request::new("GET", b"/index.php/foo".to_vec())),
+            CompletionSignal::none(),
+        );
+        assert_eq!(
+            explicitly_empty.split_path,
+            Some(Vec::new()),
+            "an explicit empty list is a different configuration from an \
+             absent one, and must not collapse into it"
+        );
+        assert_ne!(
+            unconfigured.split_path, explicitly_empty.split_path,
+            "the two states drive different CGI splitting behaviour for the \
+             same path, so they must remain distinguishable"
+        );
+
+        let configured = RequestContext::new(
+            String::new(),
+            Some(vec![".php".to_owned(), ".phtml".to_owned()]),
+            None,
+            CompletionSignal::none(),
+        );
+        assert_eq!(
+            configured.split_path,
+            Some(vec![".php".to_owned(), ".phtml".to_owned()]),
+            "a configured list is stored verbatim -- normalising it is \
+             WithRequestSplitPath's job, not this constructor's"
+        );
     }
 
     #[test]
@@ -1819,7 +1948,7 @@ mod tests {
         let counter = Arc::clone(&fired);
         let mut ctx = RequestContext::new(
             String::new(),
-            Vec::new(),
+            None,
             Some(Request::new("GET", b"/index.php".to_vec())),
             CompletionSignal::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -1874,7 +2003,7 @@ mod tests {
         let payload = "response ready".to_string();
         let mut ctx = RequestContext::new(
             String::new(),
-            Vec::new(),
+            None,
             Some(Request::new("GET", b"/index.php".to_vec())),
             CompletionSignal::new(move || {
                 let _ = tx.send(payload);
