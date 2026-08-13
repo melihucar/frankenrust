@@ -775,6 +775,32 @@ pub struct ContextSlots {
     slots: RwLock<Vec<Mutex<Option<RequestContext>>>>,
 }
 
+/// Both lock types here are read through these two helpers rather than
+/// `.unwrap()`, and deliberately.
+///
+/// Every caller of this table is reached from an `extern "C"` callback with
+/// no unwind guard, so a panicking `.unwrap()` on a poisoned lock does not
+/// fail that one request -- it unwinds across the FFI boundary and takes the
+/// process down. Poisoning would then be permanent and total: one panic
+/// anywhere under a slot guard (a transport-supplied `RequestBody`'s `Drop`,
+/// say) turns every later `go_register_server_variables` and
+/// `go_update_request_info` on that thread index into a hard kill of the
+/// whole server.
+///
+/// Recovering is sound here because the guarded value carries no multi-step
+/// invariant a panic could leave half-established: it is an
+/// `Option<RequestContext>`, and Rust guarantees the `Option` itself is
+/// intact whatever the panic interrupted. The worst a recovered lock can
+/// expose is a context whose arena grew by fewer buffers than intended --
+/// which is exactly the state the abandoned request is entitled to.
+fn recover_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn recover_lock<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl ContextSlots {
     pub const fn new() -> Self {
         Self {
@@ -784,10 +810,10 @@ impl ContextSlots {
 
     fn ensure_len(&self, thread_index: usize) {
         let needed = thread_index + 1;
-        if self.slots.read().unwrap().len() >= needed {
+        if recover_read(&self.slots).len() >= needed {
             return;
         }
-        let mut slots = self.slots.write().unwrap();
+        let mut slots = self.slots.write().unwrap_or_else(|e| e.into_inner());
         while slots.len() < needed {
             slots.push(Mutex::new(None));
         }
@@ -798,15 +824,15 @@ impl ContextSlots {
     /// slot, if any.
     pub fn set(&self, thread_index: usize, ctx: RequestContext) {
         self.ensure_len(thread_index);
-        let slots = self.slots.read().unwrap();
-        *slots[thread_index].lock().unwrap() = Some(ctx);
+        let slots = recover_read(&self.slots);
+        *recover_lock(&slots[thread_index]) = Some(ctx);
     }
 
     /// Drops `thread_index`'s context, if any -- releasing its arena.
     pub fn clear(&self, thread_index: usize) {
         self.ensure_len(thread_index);
-        let slots = self.slots.read().unwrap();
-        *slots[thread_index].lock().unwrap() = None;
+        let slots = recover_read(&self.slots);
+        *recover_lock(&slots[thread_index]) = None;
     }
 
     /// Runs `f` with `thread_index`'s context, holding that slot's lock for
@@ -818,8 +844,8 @@ impl ContextSlots {
         f: impl FnOnce(Option<&RequestContext>) -> R,
     ) -> R {
         self.ensure_len(thread_index);
-        let slots = self.slots.read().unwrap();
-        let guard = slots[thread_index].lock().unwrap();
+        let slots = recover_read(&self.slots);
+        let guard = recover_lock(&slots[thread_index]);
         f(guard.as_ref())
     }
 
@@ -832,8 +858,8 @@ impl ContextSlots {
         f: impl FnOnce(Option<&mut RequestContext>) -> R,
     ) -> R {
         self.ensure_len(thread_index);
-        let slots = self.slots.read().unwrap();
-        let mut guard = slots[thread_index].lock().unwrap();
+        let slots = recover_read(&self.slots);
+        let mut guard = recover_lock(&slots[thread_index]);
         f(guard.as_mut())
     }
 }
@@ -1230,6 +1256,42 @@ mod tests {
         slots.clear(0);
         assert!(slots.with_context(0, |ctx| ctx.is_none()));
         assert!(slots.with_context(5, |ctx| ctx.is_some()));
+    }
+
+    /// A poisoned slot must stay usable. Every caller of this table is
+    /// reached from an `extern "C"` callback with no unwind guard, so
+    /// `.lock().unwrap()` on a poisoned slot would not fail one request -- it
+    /// would unwind across the FFI boundary and abort the process, and it
+    /// would do so on *every* later request for that thread index. One
+    /// panic under a slot guard would become a permanent kill switch.
+    #[test]
+    fn a_poisoned_slot_is_recovered_rather_than_aborting_the_process() {
+        let slots = ContextSlots::new();
+        slots.set(3, test_context(None));
+
+        // Poison slot 3's Mutex the only way a Mutex can be poisoned: panic
+        // while holding it. The panic is contained here, in a thread, which
+        // is exactly what the real callback path cannot do.
+        let poisoner = std::thread::spawn(|| {
+            let slots = ContextSlots::new();
+            slots.set(3, test_context(None));
+            slots.with_context(3, |_| {
+                panic!("stand-in for a panicking Drop under the guard")
+            });
+        });
+        assert!(poisoner.join().is_err(), "sanity: the probe must panic");
+
+        // Same shape, in-process: poison this table's own slot.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            slots.with_context_mut(3, |_| panic!("poison slot 3"));
+        }));
+        assert!(result.is_err(), "sanity: the closure must panic");
+
+        // The poisoned slot is still readable, writable and clearable.
+        assert!(slots.with_context(3, |ctx| ctx.is_some()));
+        slots.set(3, test_context(None));
+        slots.clear(3);
+        assert!(slots.with_context(3, |ctx| ctx.is_none()));
     }
 
     #[test]

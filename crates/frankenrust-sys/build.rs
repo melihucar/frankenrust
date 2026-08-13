@@ -317,13 +317,24 @@ fn main() {
         // list as they need more of frankenphp.h's / types.h's surface.
         .allowlist_function("frankenphp_get_version")
         .allowlist_function("frankenphp_get_config")
-        // The next three are called from shim.c, not from Rust (issue #75 --
-        // a zend_bailout() out of any of them must not cross a Rust frame).
-        // Issue #11 asks for them by name anyway and #12/#13 want the same
-        // corner of frankenphp.h, so they stay exposed.
-        .allowlist_function("frankenphp_register_server_vars")
-        .allowlist_function("frankenphp_register_known_variable")
-        .allowlist_function("frankenphp_register_variable_safe")
+        // Deliberately NOT allowlisted, though issue #11 asks for them by
+        // name: frankenphp_register_server_vars,
+        // frankenphp_register_known_variable, frankenphp_register_variable_safe.
+        // #11's spec predates the finding that settled #75 -- each of the three
+        // allocates through the Zend *request* allocator, whose out-of-memory
+        // path is zend_bailout(), a longjmp for which Rust has no defined
+        // behaviour when it crosses a Rust frame. They are called from shim.c,
+        // which gets its declarations from frankenphp.h directly and needs no
+        // bindgen output. Emitting Rust bindings for them anyway would leave
+        // `frankenrust_sys::frankenphp_register_*` one keystroke away for
+        // #12/#13, with nothing but a comment saying not to. Leaving them out
+        // makes the rule mechanical: reintroducing the hazard now requires
+        // editing this file, which is a diff a reviewer sees.
+        //
+        // frankenphp_init_persistent_string is the exception and is here: it
+        // allocates with persistent=1, i.e. __zend_malloc, which exits rather
+        // than bailing out, so it is sound to call from a Rust frame -- see
+        // frankenrust-core/src/cgi.rs's `intern`.
         .allowlist_function("frankenphp_init_persistent_string")
         // The two real thread entry points (frankenphp.h:190-191): not called by
         // this issue's abort-stubs, but tests/version.rs takes their address (never
