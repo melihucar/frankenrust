@@ -907,8 +907,14 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
         blocking = review_stage(issue, wt, logdir, str(attempt))
         if blocking:
             log(f"    xx review BLOCKED #{issue.number}")
+            # Head, not tail. review_outcome puts "## Reviewer N" at the front of
+            # each finding, so a trailing slice cut off the one field that says
+            # WHICH reviewer blocked -- and the retrospective, which reads only
+            # the journal, could not tell one reviewer overruling a peer's PASS
+            # from both agreeing. Eleven of twenty-one blocks last run were the
+            # former and nothing could count them.
             record("review_block", issue=issue.number, attempt=attempt,
-                   excerpt=blocking[-1500:])
+                   phase="initial", excerpt=blocking[:1500])
             invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"), logdir,
                    f"fix.{attempt}", role="fixer")
             rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
@@ -916,8 +922,17 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             if rc != 0:
                 failure = f"Fixer broke the gate:\n{tail}"
                 continue
-            if review_stage(issue, wt, logdir, f"post{attempt}"):
-                failure = "Reviewers still blocking after the fix pass."
+            # Forward what the post-fix reviewers actually said. Calling this in
+            # boolean context threw the findings away and handed the next
+            # attempt the fixed string "Reviewers still blocking after the fix
+            # pass" -- which names no defect, so attempts 2 and 3 re-derived
+            # from scratch what attempt 1 had already been told, or guessed.
+            still_blocking = review_stage(issue, wt, logdir, f"post{attempt}")
+            if still_blocking:
+                record("review_block", issue=issue.number, attempt=attempt,
+                       phase="post-fix", excerpt=still_blocking[:1500])
+                failure = ("The fixer's changes did not satisfy the reviewers. "
+                           f"Their findings on the FIXED diff:\n\n{still_blocking}")
                 continue
 
         if merge_worktree(tid, logdir, issue.gate):
