@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import http.client
+import os
 import re
 import socket
 import subprocess
@@ -30,7 +31,28 @@ CONFORMANCE_DIR = Path(__file__).resolve().parent.parent
 GOLDEN_DIR = CONFORMANCE_DIR / "golden"
 CORPUS_PATH = CONFORMANCE_DIR / "corpus.toml"
 
-CONTAINER_NAME = "frankenrust-conformance-upstream"
+# Every container this harness starts carries this label. The container *name*
+# is unique per run (see container_name()), so nothing here may ever be reaped
+# by name; if a run is SIGKILLed hard enough to skip its `finally`, sweep the
+# strays by label instead:
+#     docker rm -f $(docker ps -aq --filter label=frankenrust.conformance)
+CONTAINER_LABEL = "frankenrust.conformance=upstream"
+
+
+def container_name(host_port: int) -> str:
+    """A container name unique to this run.
+
+    Deliberately not a constant. scripts/gate.sh runs conformance in every
+    non-bootstrap profile, and orchestrator/loop.py runs MAX_PARALLEL gates
+    concurrently from separate worktrees, so two conformance runs overlapping
+    is the normal operating mode, not an edge case. A shared name plus the
+    `docker rm -f` that used to precede `docker run` meant the second run tore
+    down the first run's still-in-use container: the first run then sat out its
+    full wait_for_server timeout and failed the gate for a reason that had
+    nothing to do with its own diff. pid distinguishes concurrent processes on
+    this host; host_port distinguishes sequential runs within one process.
+    """
+    return f"frankenrust-conformance-upstream-{os.getpid()}-{host_port}"
 
 
 def load_corpus() -> dict:
@@ -140,29 +162,42 @@ _PHP_VERSION_HEADER_RE = re.compile(r"^PHP/(\S+)$")
 def normalize(resp: Response, ctx: NormalizeContext) -> Response:
     """Apply exactly the substitutions corpus.toml documents, and nothing else.
 
-    Header values (other than X-Powered-By) and body bytes outside the
-    listed substrings are left untouched, including Content-Length -- which
-    is deliberately NOT recomputed to match the (shorter or longer)
-    normalised body text. Content-Length in the golden reflects real wire
-    bytes the server sent; the body text next to it is a normalised
-    representation for comparison. The two are allowed to disagree in byte
-    count; that is not a bug in this harness.
+    Header values other than X-Powered-By and Content-Length, and body bytes
+    outside the listed substrings, are left untouched.
+
+    Content-Length is restated as the length of the *normalised* body. Issue
+    #4 says not to normalise Content-Length, and separately says to normalise
+    the client address because "without this the goldens are machine-
+    specific"; on server-all-vars-ordered those two rules collide, because the
+    server derives Content-Length from the un-normalised body and so the
+    header re-exports the exact byte lengths of every value the body
+    substitutions just hid. Measured: that body is 882 bytes with Docker
+    Desktop's 192.168.65.1 (it appears twice, as REMOTE_ADDR and REMOTE_HOST)
+    and 878 with Linux Docker's 172.17.0.1 -- both addresses named in the
+    issue. Keeping the wire value would hard-fail the gate on every Linux
+    host, for every later issue, for a reason unrelated to that issue's work.
+    The same mechanism applies to {port} (twice in that body) and, once there
+    is a frankenrust target to compare, to {documentRoot} and {phpVersion} in
+    exception/response-headers/server-globals.
+
+    So the rule is honoured in the direction that carries signal -- the header
+    is kept, its position in the header order is kept, and a response that
+    omits it still diffs -- and relaxed only in the byte count, which is a
+    restatement of the body length rather than independent information. Note
+    that nothing is lost by this: http.client reads exactly Content-Length
+    bytes and raises IncompleteRead if the server sends fewer, so a server
+    that lies about the length surfaces as a truncated *body* in the diff.
+    check_wire_content_length() below keeps that transport guarantee explicit
+    rather than assumed.
     """
+    check_wire_content_length(resp)
+
     php_version = None
     for name, value in resp.headers:
         if name.lower() == "x-powered-by":
             m = _PHP_VERSION_HEADER_RE.match(value)
             if m:
                 php_version = m.group(1)
-
-    out_headers = []
-    for name, value in resp.headers:
-        lname = name.lower()
-        if lname in ("date", "server"):
-            continue
-        if lname == "x-powered-by" and php_version:
-            value = value.replace(f"PHP/{php_version}", "PHP/{phpVersion}")
-        out_headers.append((name, value))
 
     body_text = resp.body.decode("latin-1")
     body_text = body_text.replace(ctx.document_root, "{documentRoot}")
@@ -174,7 +209,41 @@ def normalize(resp: Response, ctx: NormalizeContext) -> Response:
     body_text = body_text.replace(ctx.server_software, "{serverSoftware}")
     out_body = body_text.encode("latin-1")
 
+    out_headers = []
+    for name, value in resp.headers:
+        lname = name.lower()
+        if lname in ("date", "server"):
+            continue
+        if lname == "x-powered-by" and php_version:
+            value = value.replace(f"PHP/{php_version}", "PHP/{phpVersion}")
+        elif lname == "content-length":
+            value = str(len(out_body))
+        out_headers.append((name, value))
+
     return Response(resp.status, resp.reason, out_headers, out_body)
+
+
+def check_wire_content_length(resp: Response) -> None:
+    """Assert the declared Content-Length matches the body actually received.
+
+    Under http.client this is close to tautological -- read() consumes exactly
+    the declared number of bytes -- which is precisely why normalize() can
+    restate the header against the normalised body without losing detection.
+    Stating it here keeps that reasoning checkable instead of assumed, and
+    would fire if the transport under this harness ever changed.
+    """
+    for name, value in resp.headers:
+        if name.lower() != "content-length":
+            continue
+        try:
+            declared = int(value)
+        except ValueError:
+            raise RuntimeError(f"non-integer Content-Length from server: {value!r}") from None
+        if declared != len(resp.body):
+            raise RuntimeError(
+                f"server declared Content-Length: {declared} but sent "
+                f"{len(resp.body)} body byte(s)"
+            )
 
 
 _REMOTE_ADDR_RE = re.compile(rb"REMOTE_ADDR:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)")
@@ -210,28 +279,57 @@ def docker_rm_f(name: str) -> None:
     )
 
 
-def start_upstream_container(image: str, host_port: int, container_port: int) -> str:
+def start_upstream_container(
+    image: str, container_port: int, attempts: int = 3
+) -> tuple[str, int]:
+    """Start the pinned upstream image; return (container name, host port).
+
+    Owns port selection as well as the container, because the two have to
+    agree and both have to be unique to this run -- see container_name(). No
+    pre-emptive `docker rm -f` here: the name belongs to this run alone, so
+    there is never anything of ours to clean up first, and removing by a name
+    we did not create is exactly the bug this shape exists to prevent.
+
+    free_port() is inherently racy (the probe socket is closed before docker
+    binds), so a concurrent run can take the port in between and `docker run`
+    fails to allocate it. That is the same spurious-concurrent-failure class,
+    so retry with a fresh port rather than red-lining someone else's gate.
+    """
     testdata_dir = CONFORMANCE_DIR.parent.parent / "vendor" / "frankenphp" / "testdata"
-    docker_rm_f(CONTAINER_NAME)
-    subprocess.run(
-        [
-            "docker",
-            "run",
-            "-d",
-            "--name",
-            CONTAINER_NAME,
-            "-e",
-            "SERVER_NAME=:80",
-            "-p",
-            f"{host_port}:{container_port}",
-            "-v",
-            f"{testdata_dir}:/app/public:ro",
-            image,
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
-    return CONTAINER_NAME
+    for attempt in range(1, attempts + 1):
+        host_port = free_port()
+        name = container_name(host_port)
+        result = subprocess.run(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--label",
+                CONTAINER_LABEL,
+                "-e",
+                "SERVER_NAME=:80",
+                "-p",
+                f"{host_port}:{container_port}",
+                "-v",
+                f"{testdata_dir}:/app/public:ro",
+                image,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return name, host_port
+        # A failed `docker run -d` can still leave the container created but
+        # not started, which would hold the name; drop ours before retrying.
+        docker_rm_f(name)
+        if attempt == attempts:
+            raise RuntimeError(
+                f"docker run failed {attempts} time(s) for {image}; "
+                f"last attempt on host port {host_port}: {result.stderr.strip()}"
+            )
+    raise AssertionError("unreachable")
 
 
 def wait_for_server(host: str, port: int, timeout: float = 30) -> None:

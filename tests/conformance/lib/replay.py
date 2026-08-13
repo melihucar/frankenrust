@@ -98,9 +98,10 @@ def run_against(target_name: str, host: str, port: int, ctx_base, corpus) -> tup
 
 def replay_upstream(corpus) -> tuple[int, list[str]]:
     target = corpus["targets"]["upstream"]
-    port = common.free_port()
+    name, port = common.start_upstream_container(
+        target["image"], target["container_port"]
+    )
     print(f"--- replaying against upstream ({target['image']}) on host port {port}")
-    common.start_upstream_container(target["image"], port, target["container_port"])
     try:
         common.wait_for_server("127.0.0.1", port)
         ctx_base = common.NormalizeContext(
@@ -110,7 +111,7 @@ def replay_upstream(corpus) -> tuple[int, list[str]]:
         )
         return run_against("upstream", "127.0.0.1", port, ctx_base, corpus)
     finally:
-        common.stop_container(common.CONTAINER_NAME)
+        common.stop_container(name)
 
 
 def main() -> int:

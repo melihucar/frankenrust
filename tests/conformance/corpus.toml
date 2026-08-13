@@ -15,6 +15,47 @@
 # (a portability hazard across machines/CI images), and curl has no way to
 # put a raw NUL byte in a header value from argv (C strings can't hold one) --
 # see the cookies-malformed case below, which hit exactly that wall.
+#
+# ---------------------------------------------------------------------------
+# Normalisation: Content-Length, and why it is restated
+# ---------------------------------------------------------------------------
+#
+# Issue #4 lists Content-Length among the things not to normalise, and
+# separately requires the client address to be normalised because "without
+# this the goldens are machine-specific". On server-all-vars-ordered those two
+# rules contradict each other, so the resolution is recorded here rather than
+# left to be rediscovered.
+#
+# The server computes Content-Length from the un-normalised body. That body
+# contains REMOTE_ADDR and REMOTE_HOST (the client address, twice), HTTP_HOST
+# and SERVER_PORT (the port, twice) and DOCUMENT_ROOT (three times). Replacing
+# them with placeholders hides the values but leaves their exact byte lengths
+# restated in the header, so the golden stays machine-specific through the
+# header even though the body is clean. Measured against the pinned container:
+# the raw body is 882 bytes with Docker Desktop's gateway 192.168.65.1, and
+# 878 with Linux Docker's 172.17.0.1 -- both addresses the issue itself names.
+# Keeping the wire value would red-line this case permanently on every Linux
+# host, i.e. on CI and on wherever frankenrust:bench eventually gets built,
+# for every later issue that runs the default gate profile.
+#
+# So common.py's normalize() restates Content-Length as the length of the
+# normalised body. What the rule is protecting is kept: the header is still
+# compared, still by name, still in wire order, and a response that omits it
+# or moves it still fails. Only the integer is restated, and it is a
+# restatement of the body length rather than independent information --
+# http.client reads exactly Content-Length bytes and raises IncompleteRead if
+# the server sends fewer, so a server that lies about the length shows up as a
+# truncated body in the diff either way. common.py's
+# check_wire_content_length() asserts that transport guarantee on every
+# response instead of assuming it, and lib/selftest.py asserts both that every
+# golden's declared length matches the body printed beneath it and that
+# normalize() is invariant under the lengths of the values it substitutes --
+# those two checks are what fail if this ever regresses.
+#
+# The same mechanism, unfired today but live later, covers {documentRoot} and
+# {phpVersion} in exception/response-headers/server-globals: those lengths are
+# fixed for the pinned upstream image and guaranteed to differ for
+# frankenrust:bench.
 
 [targets.upstream]
 image = "dunglas/frankenphp@sha256:4b0713ddad6ca7eb21eb82ac6bdb7cb41de5192a930b615d89af6e15d74e82f8"

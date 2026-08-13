@@ -50,9 +50,10 @@ def main() -> int:
     target = corpus["targets"]["upstream"]
     defaults = corpus["defaults"]["headers"]
 
-    port = common.free_port()
+    name, port = common.start_upstream_container(
+        target["image"], target["container_port"]
+    )
     print(f"--- starting {target['image']} on host port {port}")
-    common.start_upstream_container(target["image"], port, target["container_port"])
     try:
         common.wait_for_server("127.0.0.1", port)
         ctx_base = common.NormalizeContext(
@@ -73,7 +74,7 @@ def main() -> int:
         print(f"--- captured {count} cases")
         return 0
     finally:
-        common.stop_container(common.CONTAINER_NAME)
+        common.stop_container(name)
 
 
 if __name__ == "__main__":

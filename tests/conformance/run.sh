@@ -18,4 +18,10 @@ command -v docker >/dev/null 2>&1 || {
   exit 1
 }
 
-exec python3 lib/replay.py
+# lib/selftest.py exercises invariants a green replay cannot see (goldens that
+# are self-consistent rather than machine-specific, corpus/golden coverage not
+# silently shrinking, and two concurrent runs not removing each other's
+# container). It runs first because a harness that is wrong about those is not
+# in a position to judge anything else.
+python3 lib/selftest.py
+python3 lib/replay.py

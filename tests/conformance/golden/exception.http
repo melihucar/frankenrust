@@ -1,7 +1,7 @@
 HTTP/1.1 200 OK
 Content-Type: text/html; charset=UTF-8
 X-Powered-By: PHP/{phpVersion}
-Content-Length: 326
+Content-Length: 344
 
 hello<br />
 <b>Fatal error</b>:  Uncaught Exception: request 0 in {documentRoot}/exception.php:7
