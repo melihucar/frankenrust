@@ -19,10 +19,10 @@ jq -r 'select(.event=="critic_revise") | .excerpt' orchestrator/logs/events.json
 ```
 
 Events: `merged`, `blocked`, `gate_fail`, `review_block`, `critic_revise`,
-`resolved`, `resolve_failed`, `rebase_conflict`, `merge_regate_fail`,
-`agent_fallback`, `agent_timeout`, `agent_error`, `work_crash`, `reclaimed`,
-`low_disk`, `empty_diff`, `review_diversity_lost`, `retrospective`, `retro_error`, `self_restart`,
-`journal_reset`.
+`resolved`, `resolve_failed`, `unblocked`, `unblock_failed`, `rebase_conflict`,
+`merge_regate_fail`, `agent_fallback`, `agent_timeout`, `agent_error`,
+`work_crash`, `reclaimed`, `low_disk`, `empty_diff`, `review_diversity_lost`,
+`retrospective`, `retro_error`, `self_restart`, `journal_reset`.
 
 Three of those describe the loop failing rather than an agent failing, and they
 are the most important things in the file: `work_crash` is an unhandled
@@ -55,6 +55,11 @@ failures with the same error is the harness being wrong. Specifically:
   `docs/PORTING-NOTES.md` or `prompts/shared.md` so it is prevented rather than
   caught. A reviewer catching the same bug five times is a documentation bug.
 - **`agent_timeout`** → issues too large, or the timeout too low.
+- **`unblocked` with `decision=block` or `decision=none` recurring** → the
+  unblocker itself is failing to rescue issues that should be rescuable, or
+  its prompt lacks the context to decide. `decision=none` in particular means
+  the agent gave no parseable `RESOLUTION:` line at all -- that is a loop
+  defect in `prompts/unblocker.md`, not evidence the issue was unsalvageable.
 - **Nothing merged at all** → say so bluntly and diagnose why. Do not file
   busywork to look productive.
 

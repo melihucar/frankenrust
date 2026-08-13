@@ -14,8 +14,12 @@ Per issue:
                      └─ PROCEED ────────────────────────┴─► implementer
                             └─► gate ─┬─ fail ─► retry (<=3)
                                       └─ pass ─► 2 adversarial
-                                           reviewers ─┬─ BLOCK ─► fixer
+                                           reviewers ─┬─ BLOCK ─► fixer ─► retry
                                                       └─ PASS ─► merge, close
+                            (attempts exhausted) ─► unblocker ─┬─ RESCOPE ─► re-scope, requeue
+                                                                ├─ SPLIT   ─► file residue, re-scope, requeue
+                                                                ├─ CLOSE   ─► killed, with evidence
+                                                                └─ BLOCK   ─► fr:blocked (terminal)
 
 The critic stage exists because the issues are written by agents, not by a
 human who read the code. An agent that faithfully implements a wrong issue
@@ -24,6 +28,15 @@ produces work that passes the gate and looks like progress.
 The resolver exists because there is no human on call. Parking a contested
 issue as fr:questioned assumes someone will come back and re-scope it; nobody
 will, so the objection has to be adjudicated by another agent instead.
+
+The unblocker exists for the same reason, one stage later. fr:blocked used to
+be an absorbing state nothing ever moved an issue out of, so a correct BLOCK
+on a bug adjacent to the issue's actual deliverable was indistinguishable from
+work that genuinely could not be salvaged, and both dead-ended the run. It
+runs the same kind of adjudication the resolver does, against the accumulated
+review findings and the last failure instead of a critic's objection, and
+shares the resolver's Revisions:/MAX_REVISIONS cap so the two stages cannot
+hand an issue back and forth between them forever.
 
 After every merge a retrospective reads logs/events.jsonl and files its own
 fixes -- including to this file, which the loop then re-execs into at a batch
@@ -81,6 +94,7 @@ MODELS = {
     "fixer": os.environ.get("FR_MODEL_FIX", "claude-opus-5"),
     "planner": os.environ.get("FR_MODEL_PLAN", "claude-opus-5"),
     "resolver": os.environ.get("FR_MODEL_RESOLVE", "claude-opus-5"),
+    "unblocker": os.environ.get("FR_MODEL_UNBLOCK", "claude-opus-5"),
 }
 # How many times an issue may be re-scoped before the resolver must decide it
 # outright. Without a cap, critic and resolver can hand an issue back and forth
@@ -604,6 +618,64 @@ def resolve_question(issue: gh.Issue, wt: Path, logdir: Path, critique: str) -> 
     return False
 
 
+def resolve_block(issue: gh.Issue, wt: Path, logdir: Path, failure: str,
+                   review_findings: list[str]) -> None:
+    """Adjudicate an issue about to be parked as fr:blocked.
+
+    Mirrors resolve_question. fr:blocked is where a bad *implementation
+    attempt* goes to die, exactly as fr:questioned was where a bad *spec* went
+    to die before resolve_question existed -- claimable() only ever reads
+    fr:ready, and nothing else in the loop moves an issue out of fr:blocked.
+    #5 (the ZTS+embed toolchain) is what this closes: it passed the gate on
+    every one of three attempts and died on a reviewer finding that belonged
+    to an already-filed issue, and a human had to re-scope it by hand or the
+    twelve issues sitting behind it would have stalled for the rest of the
+    run. This asks an agent to make that same call.
+    """
+    rounds = issue.revisions
+    findings = ("\n\n".join(review_findings[-3:]) if review_findings else
+                "(none -- this failed on the gate or the merge, not on review.)")
+    extra = (f"\n# Why the loop is about to block this issue\n\n"
+             f"## Accumulated review findings\n{findings[-8000:]}\n\n"
+             f"## Last failure\n```\n{failure[-4000:]}\n```\n")
+    if rounds >= MAX_REVISIONS:
+        extra += (f"\nThis issue has already been re-scoped {rounds} time(s). "
+                  "RESCOPE and SPLIT are no longer available to you. Decide "
+                  "CLOSE or BLOCK, and justify it.\n")
+    _, _, out = invoke("claude", wt, prompt_for("unblocker", issue, extra),
+                       logdir, f"unblock.{rounds}", role="unblocker")
+
+    if "RESOLUTION: RESCOPE" in out and rounds < MAX_REVISIONS:
+        if gh.requeue(issue.number, rounds + 1):
+            gh.comment(issue.number, f"**Unblocked and re-scoped by an agent.**\n\n{out[-30000:]}")
+            record("unblocked", issue=issue.number, decision="rescope", round=rounds + 1)
+            return
+        record("unblock_failed", issue=issue.number, reason="requeue failed")
+    elif "RESOLUTION: SPLIT" in out and rounds < MAX_REVISIONS:
+        if gh.requeue(issue.number, rounds + 1):
+            gh.comment(issue.number,
+                       f"**Unblocked, residue split off, and re-scoped by an agent.**\n\n{out[-30000:]}")
+            record("unblocked", issue=issue.number, decision="split", round=rounds + 1)
+            return
+        record("unblock_failed", issue=issue.number, reason="requeue failed")
+    elif "RESOLUTION: CLOSE" in out:
+        gh.close(issue.number, f"**Unblocker: this should not be built.**\n\n{out[-30000:]}")
+        record("unblocked", issue=issue.number, decision="close", round=rounds)
+        return
+
+    # BLOCK, a decision the round cap forbade, or no parseable verdict at all:
+    # fr:blocked stays terminal -- this is the one path where staying blocked
+    # is correct, not a defect. Record which, so the retrospective can tell a
+    # considered BLOCK from a stage that produced nothing usable; the latter
+    # is a loop defect the way resolve_failed is for the resolver.
+    decision = "block" if "RESOLUTION: BLOCK" in out else "none"
+    record("unblocked", issue=issue.number, decision=decision, round=rounds,
+           excerpt=out[-1500:])
+    gh.block(issue.number,
+             f"Failed {MAX_ATTEMPTS} attempts. Last failure:\n\n```\n{failure}\n```\n\n"
+             f"**The unblocker considered a rescue and declined.**\n\n{out[-20000:]}")
+
+
 def work(issue: gh.Issue) -> None:
     """Process one issue. Never raises: the pool re-raises into cmd_run.
 
@@ -648,6 +720,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
         log(f"    .. #{issue.number} critic gave no verdict; proceeding")
 
     failure: str | None = None
+    review_findings: list[str] = []
     agents = ["codex", "claude"] if issue.agent == "duel" else [issue.agent]
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -687,6 +760,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             log(f"    xx review BLOCKED #{issue.number}")
             record("review_block", issue=issue.number, attempt=attempt,
                    excerpt=blocking[-1500:])
+            review_findings.append(blocking)
             invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"), logdir,
                    f"fix.{attempt}", role="fixer")
             rc, tail = run(["bash", str(GATE), issue.gate], wt, GATE_TIMEOUT,
@@ -694,7 +768,9 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             if rc != 0:
                 failure = f"Fixer broke the gate:\n{tail}"
                 continue
-            if review_stage(issue, wt, logdir, f"post{attempt}"):
+            post_blocking = review_stage(issue, wt, logdir, f"post{attempt}")
+            if post_blocking:
+                review_findings.append(post_blocking)
                 failure = "Reviewers still blocking after the fix pass."
                 continue
 
@@ -718,7 +794,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
 
     record("blocked", issue=issue.number, title=issue.title,
            attempts=MAX_ATTEMPTS, tail=(failure or "")[-1500:])
-    gh.block(issue.number, f"Failed {MAX_ATTEMPTS} attempts. Last failure:\n\n```\n{failure}\n```")
+    resolve_block(issue, wt, logdir, failure or "", review_findings)
 
 
 # --- commands ----------------------------------------------------------------
