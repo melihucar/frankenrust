@@ -741,7 +741,7 @@ impl RequestContext {
 /// re-import sits inside `frankenphp.c:565`'s). A `longjmp` runs no Rust
 /// destructors, so a guard alive across such a call is leaked and the slot
 /// is locked *forever* -- and the very next thing C does on that path
-/// (`frankenphp.c:1592` -> `go_frankenphp_after_script_execution`) is clear
+/// (`frankenphp.c:1591` -> `go_frankenphp_after_script_execution`) is clear
 /// this slot, so the PHP thread would deadlock inside its own crash-recovery
 /// path and the request would never be answered. A leaked read guard
 /// additionally pins the table's reader count, so `ensure_len` blocks

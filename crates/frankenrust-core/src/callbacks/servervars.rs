@@ -53,7 +53,7 @@ use crate::context::CONTEXT_SLOTS;
 ///    is safe *because* of that, and would not be otherwise -- see
 ///    [`crate::context::ContextSlots`]'s "one rule for callers": a leaked slot
 ///    guard wedges the thread's own crash-recovery path
-///    (`frankenphp.c:1592` -> `go_frankenphp_after_script_execution` clears
+///    (`frankenphp.c:1591` -> `go_frankenphp_after_script_execution` clears
 ///    this very slot).
 /// 2. **It returns before the registration starts,** and hands out only
 ///    pointers into memory the [`crate::context::RequestContext`] owns, so a
@@ -203,7 +203,7 @@ mod tests {
     /// `zend_error_noreturn(E_ERROR, ...)` ends in `zend_bailout()`, a
     /// `longjmp` that runs no Rust destructor. The guards would be leaked and
     /// the slot locked forever, right before C's crash-recovery path
-    /// (`frankenphp.c:1592` -> `go_frankenphp_after_script_execution`) tries
+    /// (`frankenphp.c:1591` -> `go_frankenphp_after_script_execution`) tries
     /// to clear that very slot.
     ///
     /// The registration now happens in `shim.c` *after* this function has
