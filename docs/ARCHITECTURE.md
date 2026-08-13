@@ -164,26 +164,54 @@ the ASCII sequence diagram and the channel choice, is in
 
 - The tokio side owns the socket and the request/response buffers. It never
   touches PHP state.
-- The pthread side owns PHP execution. It borrows the request, streams bytes
-  out through the output callback (`go_ub_write`), and signals completion back
-  to the async side over a channel (a oneshot, per
+- The pthread side owns PHP execution. It holds the request state for the whole
+  script run, streams bytes out through the output callback (`go_ub_write`),
+  and signals completion back to the async side over a channel (a oneshot, per
   `docs/PORTING-NOTES.md:145`).
-- **Where "completion" happens differs by handler, and the diagram in
-  `PORTING-NOTES` only draws the regular case.** For a regular thread the
-  request *is* the script run, so the oneshot fires around
-  `php_execute_script` (`frankenphp.c:1531`) — completion lines up with
-  `go_frankenphp_after_script_execution` (`frankenphp.c:1562` / `:1591`). For a
-  worker thread it does not: the worker script is executed once and stays
-  alive across many requests, calling `frankenphp_handle_request()`
+- **Completing the response and releasing the request are two different events,
+  and the release is always the later one.** PHP exposes
+  `frankenphp_finish_request()` to userland — with `fastcgi_finish_request()` as
+  an alias (`vendor/frankenphp/frankenphp_arginfo.h:58`) — and it ends the
+  response *mid-script*: it flushes output and headers and then calls
+  `go_frankenphp_finish_php_request` (`frankenphp.c:623-637`, the call at
+  `:634`), whose upstream implementation is just `fc.closeContext()`
+  (`vendor/frankenphp/threadworker.go:331-341`).
+  `closeContext` is what "sends the response to the client" — it closes
+  `fc.done`, which is what releases the waiting HTTP handler
+  (`vendor/frankenphp/context.go:135-147`). The script then keeps running on the
+  same thread with its request state still live: `go_ub_write` dereferences the
+  context on every subsequent write and only checks `fc.isDone` to decide to
+  discard the bytes (`vendor/frankenphp/frankenphp.go:430-453`), and upstream
+  pins the behaviour with a fixture whose script deliberately writes and logs
+  after finishing (`vendor/frankenphp/testdata/finish-request.php:5-15`).
+  So our oneshot can fire long before the pthread is done with the request. The
+  request state must be *owned* by the PHP side until teardown, not borrowed
+  from the async task for exactly as long as that task is awaiting; a design
+  that drops the request when the oneshot resolves frees memory the interpreter
+  still reads.
+- **Where teardown lands differs by handler, and the diagram in `PORTING-NOTES`
+  only draws the regular case.** For a regular thread it is script end:
+  `afterScriptExecution` calls `afterRequest`, which calls `closeContext` — a
+  no-op if the script already finished the request, since `closeContext` returns
+  early on `fc.isDone` (`vendor/frankenphp/context.go:137-139`) — and then
+  clears the thread's context pointer under `contextMu`
+  (`vendor/frankenphp/threadregular.go:72-75`, `:129-135`), driven from C by
+  `go_frankenphp_after_script_execution` after `php_execute_script`
+  (`frankenphp.c:1531`) and `frankenphp_free_request_context()`
+  (`frankenphp.c:1562`, or `:1591` on the bailout path). For a worker thread
+  neither event lands there: the worker script is executed once and stays alive
+  across many requests, calling `frankenphp_handle_request()`
   (`frankenphp.c:830`) in a `do ... while` loop — see any of upstream's worker
   fixtures, e.g. `vendor/frankenphp/testdata/worker-getopt.php:3-19`. Each
   request is installed by
-  `go_frankenphp_worker_handle_request_start` (`frankenphp.c:851-852`) and
-  completed by `go_frankenphp_finish_worker_request` (`frankenphp.c:911`);
-  `afterScriptExecution` runs only when the long-lived worker script finally
-  exits and the thread tears it down
-  (`vendor/frankenphp/threadworker.go:78-80`). Completing the per-request
-  oneshot at script end in worker mode would hang every worker request.
+  `go_frankenphp_worker_handle_request_start` (`frankenphp.c:851-852`) and both
+  completed and released by `go_frankenphp_finish_worker_request`
+  (`frankenphp.c:911`), which closes the context and nils the worker's context
+  fields (`vendor/frankenphp/threadworker.go:298-327`); `afterScriptExecution`
+  runs only when the long-lived worker script finally exits and the thread tears
+  it down (`vendor/frankenphp/threadworker.go:78-80`). Completing the
+  per-request oneshot at script end in worker mode would hang every worker
+  request.
 - **`spawn_blocking` is the wrong tool here.** Tokio's blocking pool is
   designed to be resized and recycled under load and to tear down idle
   threads; a PHP thread is created once by C, lives for many requests, and
@@ -284,7 +312,13 @@ not an invariant (`docs/PORTING-NOTES.md:159-166`).
    (`frankenphp.c:367-372`), i.e. not freed by C at all — ownership stays on
    the Go/Rust side for the request's lifetime. This is the scheme that needs
    an arena on our side: something that outlives one call but is reclaimed
-   deterministically at request end, not by relying on a GC-adjacent pinner.
+   deterministically, not by relying on a GC-adjacent pinner. Note *when*
+   upstream reclaims it: `thread.Unpin()` runs inside
+   `go_frankenphp_after_script_execution` (`phpthread.go:248-258`), which C calls
+   only after `frankenphp_free_request_context()` (`frankenphp.c:1561-1562`).
+   That is script end, not response end — see the async ↔ pthread boundary
+   above: a script that called `frankenphp_finish_request()` has already sent
+   its response and is still reading this memory.
 3. **libc-`malloc`'d by the callback, `free`'d by C.** `go_read_cookies`
    (called at `frankenphp.c:1195-1196`) returns a pointer C stores into
    `SG(request_info).cookie_data` and later releases with libc `free()`
