@@ -219,9 +219,41 @@ def check_reviewer_restore() -> int:
         loop.record, loop.log = real_record, real_log
 
 
+def check_gate_targets_the_worktree() -> int:
+    """The gate must run the worktree's own gate.sh, not the main checkout's.
+
+    gate.sh starts with `cd "$(dirname "$0")/.."`, so handing it the main
+    checkout's path makes it cd there and silently discard the cwd the loop
+    set. Every gate then validates main instead of the diff about to merge --
+    green, meaningless, and undetectable from the outside. It cost a whole run:
+    the first issue to create a Cargo workspace failed three times on
+    `Cargo.toml missing` while the file sat committed in its worktree.
+
+    Checked two ways because either alone rots: gate_for must resolve to the
+    worktree's copy, and no gate invocation may go back to passing str(GATE).
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    bad = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        wt = Path(tmp) / "wt"
+        (wt / "scripts").mkdir(parents=True)
+        (wt / "scripts" / "gate.sh").write_text("#!/bin/bash\n")
+        got = loop.gate_for(wt)
+        if Path(got).resolve() != (wt / "scripts" / "gate.sh").resolve():
+            bad += fail(f"gate_for() must return the worktree's gate.sh, got {got}")
+
+    src = (ROOT / "orchestrator" / "loop.py").read_text()
+    for m in re.finditer(r'run\(\["bash",\s*([^,]+),', src):
+        if "gate_for" not in m.group(1):
+            bad += fail(f"gate invoked with {m.group(1).strip()}; must be gate_for(wt)")
+    return bad
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
         sys.exit(1)
-    sys.exit(1 if check_runs() + check_prompts() + check_dep_parsing()
+    sys.exit(1 if check_runs() + check_prompts() + check_dep_parsing() + check_gate_targets_the_worktree()
              + check_reviewer_restore() else 0)

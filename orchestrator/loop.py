@@ -59,6 +59,26 @@ WORKTREES = ORCH / "worktrees"
 PROMPTS = ORCH / "prompts"
 GATE = ROOT / "scripts" / "gate.sh"
 
+
+def gate_for(wt: Path) -> str:
+    """The gate script belonging to `wt`, not the one in the main checkout.
+
+    gate.sh's second line is `cd "$(dirname "$0")/.."`, which is correct for a
+    human running it and fatal here: passing the main checkout's copy makes it
+    cd back to the main checkout and discard the cwd the loop set. Every gate
+    then validated main -- which was always healthy -- instead of the agent's
+    work, so a green gate proved nothing about the diff about to merge.
+
+    It stayed invisible for a whole run because nothing needed a file that
+    existed only in a worktree: bootstrap skips the build, and the docs and
+    corpus checks happened to pass against main's content. The first issue to
+    create a Cargo workspace failed three times on `Cargo.toml missing` with
+    the file sitting committed in its worktree, and was blocked with 1,602
+    working lines.
+    """
+    own = wt / "scripts" / "gate.sh"
+    return str(own if own.exists() else GATE)
+
 # --- knobs -------------------------------------------------------------------
 MAX_PARALLEL = int(os.environ.get("FR_PARALLEL", "3"))
 MAX_ATTEMPTS = int(os.environ.get("FR_ATTEMPTS", "3"))
@@ -405,7 +425,7 @@ def merge_worktree(tid: str, logdir: Path, gate: str) -> bool:
             log(f"    !! {tid} rebase conflict onto main")
             record("rebase_conflict", issue=tid)
             return False
-        rc, _ = run(["bash", str(GATE), gate], wt, GATE_TIMEOUT, logdir / "gate.rebase.log")
+        rc, _ = run(["bash", gate_for(wt), gate], wt, GATE_TIMEOUT, logdir / "gate.rebase.log")
         if rc != 0:
             log(f"    !! {tid} gate failed after rebase onto main")
             record("merge_regate_fail", issue=tid)
@@ -660,7 +680,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
                f"impl.{attempt}", role="implementer",
                escalate=(attempt >= MAX_ATTEMPTS))
 
-        rc, tail = run(["bash", str(GATE), issue.gate], wt, GATE_TIMEOUT,
+        rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
                        logdir / f"gate.{attempt}.log")
         if rc != 0:
             log(f"    xx gate failed (#{issue.number} attempt {attempt})")
@@ -689,7 +709,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
                    excerpt=blocking[-1500:])
             invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"), logdir,
                    f"fix.{attempt}", role="fixer")
-            rc, tail = run(["bash", str(GATE), issue.gate], wt, GATE_TIMEOUT,
+            rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
                            logdir / f"gate.fix.{attempt}.log")
             if rc != 0:
                 failure = f"Fixer broke the gate:\n{tail}"
