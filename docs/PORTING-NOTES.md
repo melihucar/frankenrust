@@ -117,7 +117,7 @@ Upstream's C calls exactly these symbols. Each becomes a Rust
 |---|---|---|
 | `//export go_foo` | `#[unsafe(no_mangle)] pub extern "C" fn go_foo` | name must match exactly |
 | `*C.char` in | `unsafe { CStr::from_ptr(p) }` | PHP strings are **arbitrary bytes**, not UTF-8. Use `.to_bytes()`, never `.to_str().unwrap()` |
-| `C.CString(s)` | `CString::new(s)?.into_raw()` | ownership crosses to C; C frees it. Document who frees, every time |
+| `C.CString(s)` | `libc::malloc` + `ptr::copy_nonoverlapping` + trailing NUL (a named helper that checks the `malloc` result for NULL) | ownership crosses to C; C frees it with libc `free()`. `CString::into_raw` allocates from Rust's **global allocator**, not libc's `malloc` — handing that pointer to C's `free()` is UB; `into_raw` is correct only for pointers that come back to Rust via `CString::from_raw`. Interior-NUL handling is per callback, not one policy — e.g. `go_read_cookies` strips NULs (`frankenphp.go:716`) where `CString::new` would instead error, so follow the callback's own rule |
 | `C.GoString` / `C.GoBytes` | `slice::from_raw_parts(p, len).to_vec()` | copy at the boundary; do not hand out borrows into PHP memory |
 | `unsafe.Pointer` thread handle | `usize` thread index into a `Vec<ThreadSlot>` | never a raw `*mut` into a Rust collection that may reallocate |
 | goroutine + `chan` | OS thread + `crossbeam_channel` / `std::sync::mpsc` | **not** tokio channels on the PHP side |
@@ -163,7 +163,7 @@ where it is established. The recurring ones:
 
 - *"Called only from `php_thread()` on the thread that owns `thread_index`."*
 - *"`zval` is valid for the duration of this call; we copy before returning."*
-- *"Pointer came from `CString::into_raw` in `go_x` and is freed by C in `y()`."*
+- *"Pointer was `libc::malloc`'d in `go_x` and is freed by C's `free()` at `frankenphp.c:NNN`."*
 
 Bun's rewrite shipped 13,365 `unsafe` blocks and Zig's creator called the result
 "unreviewed slop." That criticism lands hardest exactly where SAFETY comments
