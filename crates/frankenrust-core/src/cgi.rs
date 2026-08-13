@@ -520,12 +520,14 @@ fn intern(s: &str) -> InternedZendString {
     // call, which is all the C function needs -- it copies the bytes into
     // its own persistent allocation before returning.
     //
-    // This is the one C call in this module that is *not* routed through a
-    // `frankenrust_try_*` trampoline, and deliberately: `persistent = 1`
-    // means it allocates with `__zend_malloc`, which on failure prints "Out
-    // of memory" and `exit(1)`s. It never reaches `zend_bailout()`, so there
-    // is no `longjmp` for a trampoline to catch. The request allocator --
-    // the one that does bail out -- is not involved.
+    // This is the only call into PHP left anywhere in frankenrust-core's
+    // `$_SERVER` path -- everything that registers into `$_SERVER` moved to
+    // `frankenrust-sys/shim.c` precisely because it can bail out (see
+    // [`ServerVarsBatch`]). This one may stay on the Rust side because it
+    // cannot: `persistent = 1` allocates with `__zend_malloc`, which on
+    // failure prints "Out of memory" and `exit(1)`s. It never reaches
+    // `zend_bailout()`, so there is no `longjmp` to keep off this frame. The
+    // request allocator -- the one that does bail out -- is not involved.
     let ptr = unsafe {
         frankenrust_sys::frankenphp_init_persistent_string(s.as_ptr() as *const c_char, s.len())
     };

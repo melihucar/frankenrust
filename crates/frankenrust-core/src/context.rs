@@ -752,6 +752,25 @@ impl RequestContext {
 /// reader `frankenPHPContext()` (`threadregular.go:77-79`) takes no lock at
 /// all. `docs/PORTING-NOTES.md:126` states the rule in one line: "avoid
 /// holding across an FFI call into PHP".
+///
+/// # And releasing the guard is not enough on its own
+///
+/// The leaked guard is only the *visible* half. Rust has no defined
+/// behaviour for a `longjmp` crossing one of its frames at all -- not merely
+/// for one holding a destructor -- so a callback that calls a bail-out-capable
+/// PHP function from a Rust frame is unsound however carefully it drops
+/// things first, and catching the bailout in a C `zend_try` does not fix it
+/// either (the re-raise jumps back out across that same Rust frame).
+///
+/// The only shape that works is to keep Rust off the stack for the part that
+/// can bail out: a C entry point that calls Rust to compute, takes the
+/// result, and *then* calls PHP. `go_register_server_variables` is done that
+/// way -- `crates/frankenrust-sys/shim.c` plus
+/// [`crate::callbacks::servervars::frankenrust_collect_server_vars`] -- and
+/// any later callback that touches PHP request memory (#12's output/input
+/// callbacks, #13/#14's lifecycle) needs the same treatment or a
+/// demonstration that what it calls cannot reach `zend_bailout()`. See issue
+/// #75.
 pub struct ContextSlots {
     slots: RwLock<Vec<Mutex<Option<RequestContext>>>>,
 }

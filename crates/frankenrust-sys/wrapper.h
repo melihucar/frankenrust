@@ -16,5 +16,6 @@
 
 #include "_cgo_export.h"
 
-/* Not upstream: our own zend_try/zend_catch trampolines (shim.c, issue #75). */
+/* Not upstream: the wire format between shim.c's C-side
+ * go_register_server_variables and its Rust half (issue #75). */
 #include "frankenrust_shim.h"
