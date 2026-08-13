@@ -42,6 +42,15 @@ step "test-suite-intact" bash -c '
 # file can never reach main.
 step "orchestrator-runnable" python3 scripts/check_orchestrator.py
 
+# docs/ cites vendor/frankenphp/<file>:<line> as its evidence for every claim
+# about upstream behaviour. Those citations rot silently: a vendor bump shifts
+# line numbers, a doc edit outpaces the code it describes, and nothing short
+# of a reviewer re-reading the cited lines catches it (issue #9's reviewers
+# did, by hand). This resolves every citation against the repo and a pinned
+# ANCHORS list against upstream text, no toolchain required — runs in every
+# profile, including bootstrap, since docs rot before Cargo.toml exists too.
+step "doc-citations" python3 scripts/check_doc_citations.py
+
 # scripts/dev.sh is the only route to a Rust toolchain, so a bug in which image
 # tag or which target/ volume it picks is a bug in build, fmt, clippy and test
 # at once — and it fails *green*: a worktree that reuses another worktree's
