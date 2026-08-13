@@ -595,6 +595,48 @@ def restore_worktree(wt: Path, tree: str) -> None:
         record("restore_incomplete", worktree=str(wt), paths=left[-1000:])
 
 
+SILENT_REVIEW = (
+    "No reviewer produced a verdict. Every reviewer run failed, timed out, or "
+    "returned unreadable output, so this diff has not been reviewed by anything. "
+    "This is a harness failure rather than a finding against your work; the diff "
+    "is unchanged and the review will be retried."
+)
+
+
+def review_outcome(results: dict[int, str]) -> tuple[str | None, dict[int, str]]:
+    """What the reviewers actually said. Returns (blocking text or None, verdicts).
+
+    A reviewer must SAY it passed. Selecting on `"VERDICT: BLOCK" in t` alone
+    read silence as approval, because `"VERDICT: BLOCK" in ""` is False -- so a
+    reviewer that timed out, crashed, or hit a quota wall mid-sentence was
+    indistinguishable from one that read the diff and approved it. Two dead
+    reviewers merged code nothing had looked at, while gh.close() recorded "two
+    adversarial reviews (claude + codex)" on the issue.
+
+    Absence of a verdict is not evidence of a pass. It is evidence of nothing,
+    which is the one thing a merge gate must never treat as consent.
+
+    Split out of review_stage so it can be tested without a git worktree or a
+    live agent: the bug lived in three lines of classification wrapped in
+    sixty lines of orchestration, and nothing could reach it.
+    """
+    def verdict_of(t: str) -> str:
+        if "VERDICT: BLOCK" in t:
+            return "block"
+        if "VERDICT: PASS" in t:
+            return "pass"
+        return "silent"
+
+    verdicts = {i: verdict_of(t) for i, t in sorted(results.items())}
+    blocked = [i for i, v in verdicts.items() if v == "block"]
+    if blocked:
+        return "\n\n".join(f"## Reviewer {i}\n{results[i][-8000:]}" for i in blocked), verdicts
+    # Nobody blocked. That is only a pass if somebody actually reviewed.
+    if not any(v == "pass" for v in verdicts.values()):
+        return SILENT_REVIEW, verdicts
+    return None, verdicts
+
+
 def review_stage(issue: gh.Issue, wt: Path, logdir: Path, tag: str) -> str | None:
     """Two adversarial reviewers, independent contexts, diff only.
 
@@ -634,9 +676,17 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path, tag: str) -> str | Non
         # again -- either way, anything reviewer-authored still here gets merged.
         restore_worktree(wt, snapshot)
 
-    found = [f"## Reviewer {i}\n{t[-8000:]}" for i, t in sorted(results.items())
-             if "VERDICT: BLOCK" in t]
-    return "\n\n".join(found) if found else None
+    blocking, verdicts = review_outcome(results)
+    record("review_verdicts", issue=issue.number, tag=tag, verdicts=verdicts)
+    if blocking and not any(v == "block" for v in verdicts.values()):
+        log(f"    xx #{issue.number} no reviewer produced a verdict ({tag})")
+        record("review_silent", issue=issue.number, tag=tag, verdicts=verdicts)
+    elif not blocking and any(v == "silent" for v in verdicts.values()):
+        log(f"    !! #{issue.number} only "
+            f"{sum(v == 'pass' for v in verdicts.values())}/{len(verdicts)} "
+            f"reviewers reported ({tag})")
+        record("review_incomplete", issue=issue.number, tag=tag, verdicts=verdicts)
+    return blocking
 
 
 def resolve_question(issue: gh.Issue, wt: Path, logdir: Path, critique: str) -> bool:
@@ -697,7 +747,7 @@ def recover_blocked() -> int:
     again immediately rather than sleeping on a queue that just changed.
     """
     recovered = 0
-    for issue, waiting in gh.blocked_gating_work():
+    for issue, waiting in gh.blocked_needing_recovery():
         if issue.recoveries >= MAX_RECOVERIES:
             # Say this once. The poll that calls us re-runs every 30s while the
             # queue is waiting on dependencies, which is exactly the state a
@@ -793,19 +843,31 @@ def work(issue: gh.Issue) -> None:
 
 def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
     # --- critic: is this issue worth implementing at all?
-    used, _, critique = invoke(issue.agent, wt, prompt_for("critic", issue),
-                               logdir, "critic", role="critic")
-    if "VERDICT: REVISE" in critique:
-        log(f"    ?? #{issue.number} questioned by the critic")
-        record("critic_revise", issue=issue.number, title=issue.title,
-               excerpt=critique[-1500:])
-        gh.comment(issue.number,
-                   f"**The critic challenged this issue.**\n\n{critique[-40000:]}")
-        if not resolve_question(issue, wt, logdir, critique):
-            return
-        log(f"    -> #{issue.number} objection overruled; implementing")
-    if "VERDICT: PROCEED" not in critique:
-        log(f"    .. #{issue.number} critic gave no verdict; proceeding")
+    #
+    # Bracketed for the same reason review_stage is. The critic and the resolver
+    # both run with cwd=wt and full tool access, and both are told to research
+    # against the code -- so both can leave files behind, and anything still
+    # here rides the implementer's `git add -A` onto main. #24 fixed this for
+    # reviewers only, which read as fixing the class and did not: these two run
+    # BEFORE the implementer, so their scratch is indistinguishable from work
+    # the implementer did and no reviewer has any reason to question it.
+    critic_snapshot = snapshot_worktree(wt)
+    try:
+        used, _, critique = invoke(issue.agent, wt, prompt_for("critic", issue),
+                                   logdir, "critic", role="critic")
+        if "VERDICT: REVISE" in critique:
+            log(f"    ?? #{issue.number} questioned by the critic")
+            record("critic_revise", issue=issue.number, title=issue.title,
+                   excerpt=critique[-1500:])
+            gh.comment(issue.number,
+                       f"**The critic challenged this issue.**\n\n{critique[-40000:]}")
+            if not resolve_question(issue, wt, logdir, critique):
+                return
+            log(f"    -> #{issue.number} objection overruled; implementing")
+        if "VERDICT: PROCEED" not in critique:
+            log(f"    .. #{issue.number} critic gave no verdict; proceeding")
+    finally:
+        restore_worktree(wt, critic_snapshot)
 
     failure: str | None = None
     agents = ["codex", "claude"] if issue.agent == "duel" else [issue.agent]
@@ -1002,7 +1064,7 @@ def cmd_run() -> int:
                 log("!! wallclock limit reached, stopping")
                 break
             # Recover before claiming, so anything rescued is claimable in this
-            # same batch. Cheap when there is nothing to do -- blocked_gating_work
+            # same batch. Cheap when there is nothing to do -- blocked_needing_recovery
             # only reaches an agent for a block that other open issues wait on.
             recover_blocked()
             # Mirror the dependency filter onto the labels. Only writes on a
@@ -1088,7 +1150,7 @@ def cmd_status() -> int:
     print(f"\nclaimable now: {len(ready)}")
     for i in ready[:MAX_PARALLEL]:
         print(f"  #{i.number:<4} [{i.gate}/{i.agent}] {i.title}")
-    stuck = gh.blocked_gating_work()
+    stuck = gh.blocked_needing_recovery()
     if stuck:
         print(f"\nblocked and gating open work: {len(stuck)}")
         for i, waiting in stuck:

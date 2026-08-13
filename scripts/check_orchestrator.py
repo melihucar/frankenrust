@@ -317,18 +317,41 @@ def check_blocked_has_a_recovery_path() -> int:
     for name in ("recover_blocked",):
         if not hasattr(loop, name):
             bad += fail(f"loop.{name}() is gone; fr:blocked is absorbing again")
-    for name in ("blocked_gating_work", "unblock"):
+    for name in ("blocked_needing_recovery", "unblock"):
         if not hasattr(gh, name):
             bad += fail(f"gh.{name}() is gone; fr:blocked is absorbing again")
     if getattr(loop, "MAX_RECOVERIES", 0) < 1:
         bad += fail("MAX_RECOVERIES < 1 disables recovery entirely")
 
-    # The trigger must be dependant-driven. blocked_gating_work() returning only
-    # blocks with open dependants is what encodes that, so assert the filter.
-    src = (ROOT / "orchestrator" / "gh.py").read_text()
-    if "if x[1]" not in src.split("def blocked_gating_work")[-1].split("def ")[0]:
-        bad += fail("blocked_gating_work() no longer filters to blocks with open "
-                    "dependants; recovery would fire on starvation, which is too late")
+    # Reachability, behaviourally. The previous version of this check asserted
+    # that gh.unblock() existed and that blocked_needing_recovery() contained a
+    # `if x[1]` filter -- and both were true while fr:blocked was still
+    # absorbing for every issue nothing depended on, because that filter was
+    # what dropped them. A check that proves a code path exists says nothing
+    # about whether anything reaches it. Ask the function instead.
+    issues = [
+        gh.Issue(number=1, title="blocked, gates two", body="", labels=["fr:blocked"]),
+        gh.Issue(number=2, title="blocked leaf, nothing waits on it", body="",
+                 labels=["fr:blocked"]),
+        gh.Issue(number=3, title="waits on 1", body="Depends on: #1", labels=["fr:ready"]),
+        gh.Issue(number=4, title="waits on 1", body="Depends on: #1", labels=["fr:ready"]),
+    ]
+    real_fetch, real_closed = gh.fetch, gh.closed_numbers
+    gh.closed_numbers = lambda: set()
+    try:
+        gh.fetch = lambda label=None, state="open": (
+            [] if state == "closed"
+            else [i for i in issues if not label or label in i.labels])
+        order = [i.number for i, _ in gh.blocked_needing_recovery()]
+    finally:
+        gh.fetch, gh.closed_numbers = real_fetch, real_closed
+
+    if 2 not in order:
+        bad += fail("a blocked issue with no dependants is never offered to recovery; "
+                    "fr:blocked is absorbing for leaves, which is most of the queue")
+    if order != [1, 2]:
+        bad += fail(f"recovery order regressed: got {order}, want [1, 2] "
+                    "(most dependants first, leaves last but never dropped)")
 
     # ...and cmd_run must actually call it, before claiming.
     run_src = (ROOT / "orchestrator" / "loop.py").read_text().split("def cmd_run")[-1]
@@ -398,6 +421,80 @@ def check_waiting_is_annotation_only() -> int:
     if got != [3, 1, 4]:
         bad += fail(f"claimable() ordering regressed: got {got}, want [3, 1, 4] "
                     "(by dependant count, then housekeeping, then issue number)")
+    return bad
+
+
+def check_silent_reviewer_is_not_a_pass() -> int:
+    """A reviewer that said nothing must never count as approval.
+
+    `"VERDICT: BLOCK" in ""` is False, so selecting blockers by membership
+    alone made a reviewer that timed out, crashed, or hit a quota wall
+    indistinguishable from one that read the diff and approved it. Two dead
+    reviewers merged code nothing had looked at, and the issue was closed
+    claiming "two adversarial reviews (claude + codex)".
+
+    The empty-string and truncated-transcript cases are the ones that actually
+    happened; the "reviewer discusses the format" case is here because the
+    obvious fix -- searching for either verdict token anywhere -- reintroduces
+    exactly the prompt-echo bug that 8802753 fixed for codex.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    cases = [
+        ("both silent must block", {1: "", 2: ""}, True),
+        ("one dead, one passing must not block but is incomplete",
+         {1: "", 2: "Looks correct.\nVERDICT: PASS"}, False),
+        ("one dead, one blocking still blocks",
+         {1: "", 2: "Unsound.\nVERDICT: BLOCK"}, True),
+        ("both passing does not block",
+         {1: "VERDICT: PASS", 2: "VERDICT: PASS"}, False),
+        ("a truncated transcript is not a pass",
+         {1: "I am reading the diff now and", 2: "partial output"}, True),
+        ("prose without any verdict token is not a pass",
+         {1: "This all looks fine to me.", 2: "No concerns."}, True),
+    ]
+    bad = 0
+    for name, results, want_block in cases:
+        blocking, verdicts = loop.review_outcome(results)
+        if bool(blocking) != want_block:
+            bad += fail(f"review_outcome regressed on {name}: "
+                        f"blocking={bool(blocking)}, want {want_block} ({verdicts})")
+
+    # The silent case must be distinguishable from a real finding, or the fixer
+    # gets handed "no reviewer produced a verdict" as though it were a defect
+    # in the diff and starts editing code to satisfy it.
+    blocking, _ = loop.review_outcome({1: "", 2: ""})
+    if blocking != loop.SILENT_REVIEW:
+        bad += fail("a silent review must return SILENT_REVIEW verbatim so the "
+                    "fixer can tell a harness fault from a finding")
+    return bad
+
+
+def check_pre_implementer_stages_restore() -> int:
+    """The critic and resolver must not be able to change what gets merged.
+
+    Both run with cwd=worktree and full tool access and are told to research
+    against the code, so both can leave files behind -- and they run BEFORE the
+    implementer, so anything they leave is swept up by the implementer's diff
+    and is indistinguishable from work the implementer did. No reviewer has any
+    reason to question it.
+
+    #24 fixed this for reviewers and read as fixing the class. It did not: the
+    bracket was added to review_stage only, and _work called the critic bare
+    for another two runs.
+    """
+    src = (ROOT / "orchestrator" / "loop.py").read_text()
+    body = src.split("def _work(")[-1].split("\ndef ")[0]
+    bad = 0
+    if "snapshot_worktree" not in body or "restore_worktree" not in body:
+        bad += fail("_work() invokes the critic without a snapshot/restore bracket; "
+                    "critic and resolver scratch reaches main")
+    elif body.index("snapshot_worktree") > body.index('prompt_for("critic"'):
+        bad += fail("_work() snapshots after invoking the critic, which is too late")
+    elif "finally:" not in body.split("snapshot_worktree")[1].split('prompt_for("implementer"')[0]:
+        bad += fail("_work()'s critic bracket has no finally:, so a critic that "
+                    "raises leaves its scratch in the worktree")
     return bad
 
 
@@ -529,5 +626,6 @@ if __name__ == "__main__":
     sys.exit(1 if check_runs() + check_prompts() + check_dep_parsing()
              + check_gate_targets_the_worktree() + check_no_absorbing_states()
              + check_blocked_has_a_recovery_path() + check_waiting_is_annotation_only()
+             + check_silent_reviewer_is_not_a_pass() + check_pre_implementer_stages_restore()
              + check_filing_contract_is_stated() + check_reviewer_restore()
              + check_verdict_parsing() else 0)

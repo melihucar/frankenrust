@@ -272,21 +272,34 @@ def dependants() -> dict[int, list[int]]:
     return out
 
 
-def blocked_gating_work() -> list[tuple[Issue, list[int]]]:
-    """Blocked issues that other open issues are waiting on, worst first.
+def blocked_needing_recovery() -> list[tuple[Issue, list[int]]]:
+    """Every blocked issue, worst first, ranked by how much it holds up.
 
-    This is the queue the recovery pass drains, and the ordering is the whole
-    point. Last night #5 -- the toolchain twelve issues sat behind -- was
+    Ordering is the point. #5 -- the toolchain twelve issues sat behind -- was
     blocked at 02:30 and the run did not starve: fourteen housekeeping issues
     were claimable, so the loop stayed busy on its own exhaust while the port
     was dead. Recovery keyed on an empty queue would never have fired. What
-    makes a block urgent is what it gates, not whether there is other work.
+    makes a block urgent is what it gates.
+
+    But urgency is not eligibility, and conflating them is how this function
+    was wrong when it was written. It used to *filter* to blocks with open
+    dependants, which quietly recreated the absorbing state it exists to
+    prevent: an issue nothing depends on failed three times and was never
+    looked at again. The port graph is a chain, so most issues are leaves most
+    of the time -- #20 sat exactly there.
+
+    check_no_absorbing_states passed the whole while, because unblock() does
+    clear fr:blocked and the check only proved the code path exists. It never
+    asked whether anything reaches it. A reachability claim needs a
+    behavioural test, which check_blocked_has_a_recovery_path now carries.
     """
     waiting_on = dependants()
     done = closed_numbers()
     out = [(i, sorted(n for n in waiting_on.get(i.number, []) if n not in done))
            for i in fetch(label="fr:blocked")]
-    return sorted((x for x in out if x[1]), key=lambda x: -len(x[1]))
+    # Leaves rank last, never out. Issue number breaks ties so the order is
+    # stable across polls and the log does not churn.
+    return sorted(out, key=lambda x: (-len(x[1]), x[0].number))
 
 
 def unblock(n: int, recovery: int) -> bool:
