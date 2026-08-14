@@ -136,6 +136,11 @@ impl Headers {
     /// informational response on its own. Removes every name, not just the
     /// values under them, so a later [`Headers::get_first`] sees `None`
     /// again rather than `Some(&[])`.
+    ///
+    /// A response sink holding its header map in a `Headers` implements
+    /// [`ResponseSink::clear_headers`] with this; that trait method, not
+    /// this one, is what `go_write_headers` (#12) can actually reach, since
+    /// the map it must clear belongs to the sink.
     pub fn clear(&mut self) {
         self.entries.clear();
     }
@@ -255,6 +260,15 @@ impl RequestBody {
     /// Returns the number of bytes actually read, which is less than
     /// `buf.len()` only when the source is exhausted or erroring, never
     /// merely because one underlying `read` call happened to return early.
+    /// It is never *greater* than `buf.len()`: `Read` is a safe trait, so an
+    /// implementation returning a count larger than the buffer it was handed
+    /// is a logic error rather than UB, but this return value becomes
+    /// `go_read_post`'s `size_t` for a PHP-owned buffer, where an
+    /// over-large count is an out-of-bounds read inside PHP. `std` clamps
+    /// for the same reason (`read_to_end`'s `assert!(n <= buf.len())`), and
+    /// the source that will really back this -- a channel fed from the async
+    /// side by `frankenrust-server` -- is not in this crate for us to
+    /// inspect.
     pub fn fill(&mut self, buf: &mut [u8]) -> usize {
         let Some(source) = self.0.as_mut() else {
             return 0;
@@ -262,9 +276,10 @@ impl RequestBody {
 
         let mut filled = 0;
         while filled < buf.len() {
+            let remaining = buf.len() - filled;
             match source.read(&mut buf[filled..]) {
                 Ok(0) => break,
-                Ok(n) => filled += n,
+                Ok(n) => filled += n.min(remaining),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
@@ -1020,16 +1035,38 @@ pub trait ResponseSink {
     /// semantics: a name set more than once accumulates every value, exactly
     /// what [`Headers::insert`] already does -- a conforming implementation
     /// is expected to store what it receives in a [`Headers`] and delegate
-    /// to it rather than reinvent Go's `textproto.MIMEHeader.Add`. (Which is
-    /// also why [`Headers::clear`] exists: `go_write_headers` empties
-    /// whichever `Headers` backs this after a 1xx response,
-    /// `frankenphp.go:613-619`.)
+    /// to it rather than reinvent Go's `textproto.MIMEHeader.Add`. Which is
+    /// also what [`ResponseSink::clear_headers`] empties.
     fn add_header(&mut self, name: &str, value: &[u8]);
+
+    /// `for k := range fc.responseWriter.Header() { delete(h, k) }`
+    /// (`frankenphp.go:613-619`) -- the manual clear `go_write_headers` does
+    /// after writing a 1xx status, because Go's
+    /// `ResponseWriter.WriteHeader` deliberately does *not* clear the header
+    /// map for an informational response (`net/http/server.go:1175`, "Per
+    /// RFC 8297 we must not clear the current header map").
+    ///
+    /// This is a trait method rather than something the caller does to a
+    /// [`Headers`] it owns because the response header map lives inside the
+    /// implementation, exactly like Go's -- `RequestContext` has no response
+    /// header map of its own to reach into. Without it the early-hints
+    /// sequence (`vendor/frankenphp/testdata/early-hints.php`) cannot be
+    /// ported: the headers sent with the 103 would be appended to a second
+    /// time on the final response, so a `header_remove()` between the two
+    /// would have no effect and every surviving header would be duplicated.
+    /// An implementation backed by a [`Headers`] delegates to
+    /// [`Headers::clear`].
+    fn clear_headers(&mut self);
 
     /// `fc.responseWriter.WriteHeader(goStatus)` (`frankenphp.go:611`).
     /// `status` arrives already clamped to the range `net/http` accepts
     /// (`frankenphp.go:599-609`) -- clamping is the caller's job, not this
     /// trait's.
+    ///
+    /// Writing the status does not clear the header map even for a 1xx; the
+    /// caller does that explicitly via [`ResponseSink::clear_headers`],
+    /// mirroring the order upstream uses (`WriteHeader` first, then the
+    /// clear, `frankenphp.go:611-619`).
     fn write_status(&mut self, status: u16);
 
     /// `responseController.Flush()` (`frankenphp.go:644`). See
@@ -2541,6 +2578,35 @@ mod tests {
         assert_eq!(&buf[..2], b"hi");
     }
 
+    /// A `Read` impl that violates the trait's contract by reporting more
+    /// bytes than the buffer it was handed can hold. Safe code, so this is a
+    /// logic error rather than UB here -- but `fill`'s return value becomes
+    /// `go_read_post`'s `size_t` for a PHP-owned buffer, so a count that
+    /// escapes unbounded is an out-of-bounds read inside PHP.
+    struct LiesAboutHowMuchItRead;
+
+    impl Read for LiesAboutHowMuchItRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            buf[0] = b'x';
+            Ok(buf.len() + 100)
+        }
+    }
+
+    #[test]
+    fn request_body_fill_never_reports_more_bytes_than_the_buffer_holds() {
+        let mut body = RequestBody::new(LiesAboutHowMuchItRead);
+
+        let mut buf = [0u8; 8];
+        let n = body.fill(&mut buf);
+
+        assert_eq!(
+            n,
+            buf.len(),
+            "a source over-reporting its read must not make fill() return a \
+             count past the end of the caller's buffer"
+        );
+    }
+
     #[test]
     fn request_body_empty_reads_zero_without_a_source_to_block_on() {
         let mut body = RequestBody::empty();
@@ -2553,12 +2619,18 @@ mod tests {
     }
 
     /// Records every call it receives, one field per [`ResponseSink`]
-    /// operation.
+    /// operation. `header_adds` is the raw call log; `headers` is the
+    /// response header map a conforming sink actually maintains, so that
+    /// [`ResponseSink::clear_headers`] has something observable to empty --
+    /// the two disagree after a clear exactly as upstream's do (the writes
+    /// happened; the map that gets sent no longer holds them).
     #[derive(Default)]
     struct FakeResponseSink {
         writes: Vec<Vec<u8>>,
         header_adds: Vec<(String, Vec<u8>)>,
+        headers: Headers,
         status: Option<u16>,
+        statuses: Vec<u16>,
         flush_calls: usize,
     }
 
@@ -2570,10 +2642,16 @@ mod tests {
 
         fn add_header(&mut self, name: &str, value: &[u8]) {
             self.header_adds.push((name.to_string(), value.to_vec()));
+            self.headers.insert(name, value.to_vec());
+        }
+
+        fn clear_headers(&mut self) {
+            self.headers.clear();
         }
 
         fn write_status(&mut self, status: u16) {
             self.status = Some(status);
+            self.statuses.push(status);
         }
 
         fn flush(&mut self) -> Result<(), FlushError> {
@@ -2609,6 +2687,71 @@ mod tests {
         assert_eq!(sink.flush_calls, 2);
     }
 
+    /// The reason [`ResponseSink::clear_headers`] exists, driven as the
+    /// sequence `vendor/frankenphp/testdata/early-hints.php` produces:
+    /// `header('Link: ...'); header('Request: 7'); headers_send(103);
+    /// header_remove('Link'); echo 'Hello';`.
+    ///
+    /// `go_write_headers` (#12) runs twice -- once for the 103, once for the
+    /// final 200 -- and upstream empties the writer's header map in between
+    /// (`frankenphp.go:613-619`), because `add_header` appends. Without the
+    /// clear, `Request` would carry two values on the final response and the
+    /// removed `Link` would still be there, which is precisely what
+    /// upstream's `testEarlyHints` asserts against
+    /// (`frankenphp_test.go:604-605`).
+    #[test]
+    fn clear_headers_stops_a_1xx_leaking_its_headers_into_the_final_response() {
+        let mut sink = FakeResponseSink::default();
+
+        // First go_write_headers pass: everything PHP has set so far, 103.
+        sink.add_header("Link", b"</style.css>; rel=preload; as=style");
+        sink.add_header("Request", b"7");
+        sink.write_status(103);
+
+        assert_eq!(
+            sink.headers.get_first("Link"),
+            Some(&b"</style.css>; rel=preload; as=style"[..]),
+            "the early hint itself must carry Link"
+        );
+
+        // frankenphp.go:613-619 -- goStatus < 200, so empty the map.
+        sink.clear_headers();
+
+        assert_eq!(sink.headers.get_first("Link"), None);
+        assert_eq!(sink.headers.get_first("Request"), None);
+        assert_eq!(
+            sink.headers.iter().count(),
+            0,
+            "clear_headers must empty the map, not just the values under a name"
+        );
+
+        // Second pass: PHP re-sends what it still has after header_remove('Link').
+        sink.add_header("Request", b"7");
+        sink.write_status(200);
+
+        assert_eq!(
+            sink.headers.get_all("Request").map(<[Vec<u8>]>::len),
+            Some(1),
+            "Request must not accumulate a second value across the 1xx -- \
+             frankenphp_test.go:604 asserts Header.Get(\"Request\") == \"7\""
+        );
+        assert_eq!(
+            sink.headers.get_first("Link"),
+            None,
+            "header_remove('Link') must stick -- frankenphp_test.go:605 \
+             asserts Header.Get(\"Link\") == \"\""
+        );
+        assert_eq!(
+            sink.statuses,
+            vec![103, 200],
+            "the 1xx is written before the clear, not instead of it"
+        );
+
+        // The clear empties the map that gets sent; it does not rewrite
+        // history, so the adds that produced the early hint still happened.
+        assert_eq!(sink.header_adds.len(), 3);
+    }
+
     #[test]
     fn flush_error_distinguishes_not_a_flusher_from_a_real_io_error() {
         struct UnflushableSink;
@@ -2617,6 +2760,7 @@ mod tests {
                 Ok(buf.len())
             }
             fn add_header(&mut self, _name: &str, _value: &[u8]) {}
+            fn clear_headers(&mut self) {}
             fn write_status(&mut self, _status: u16) {}
             fn flush(&mut self) -> Result<(), FlushError> {
                 Err(FlushError::NotAFlusher)
@@ -2629,6 +2773,7 @@ mod tests {
                 Ok(buf.len())
             }
             fn add_header(&mut self, _name: &str, _value: &[u8]) {}
+            fn clear_headers(&mut self) {}
             fn write_status(&mut self, _status: u16) {}
             fn flush(&mut self) -> Result<(), FlushError> {
                 Err(FlushError::Io(io::Error::other("broken pipe")))
