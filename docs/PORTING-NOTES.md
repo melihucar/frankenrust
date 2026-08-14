@@ -109,7 +109,7 @@ Upstream's C calls exactly these symbols. Each becomes a Rust
 | `go_frankenphp_clear_force_kill_slot` | `phpthread.go:271` | clear before `ts_free_thread()` |
 | `go_init_os_env` / `go_putenv` | `env.go:13/26` | env sandboxing |
 | `go_schedule_opcache_reset` | `frankenphp.go:809` | opcache reset → thread reboot |
-| `go_mercure_publish` | `mercure.go:20` | **out of scope**: return a stub |
+| `go_mercure_publish` | `vendor/frankenphp/mercure.go:20` | **out of scope**: return a stub |
 
 ## Construct mapping
 
