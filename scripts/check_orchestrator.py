@@ -740,6 +740,69 @@ def check_retro_cycle_survives_restart() -> int:
     return bad
 
 
+def check_retro_callers_derive_the_cycle() -> int:
+    """...and the callers must actually ask for it.
+
+    The other half of check_retro_cycle_survives_restart, and it is the half
+    that matches where the bug actually lived: there was no derivation function
+    to get wrong, there was a `n = 0` local in `retro_thread()` that `execve`
+    threw away. A correct, fully tested `_next_retro_cycle()` can sit in
+    loop.py while the caller ignores it and counts for itself, and the run goes
+    back to overwriting retro-1.md with a green gate. Same reasoning as
+    check_gate_targets_the_worktree: prove the helper works, then prove nobody
+    goes around it.
+
+    This is worth an AST walk rather than a grep because retro_thread is code
+    the retrospective prompt explicitly invites an agent to edit.
+    """
+    tree = ast.parse((ROOT / "orchestrator" / "loop.py").read_text())
+
+    def cycle_arg(call: ast.Call) -> ast.expr | None:
+        if call.args:
+            return call.args[0]
+        return next((k.value for k in call.keywords if k.arg == "cycle"), None)
+
+    def calls_to_retrospective(node: ast.AST) -> list[ast.Call]:
+        return [n for n in ast.walk(node)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == "retrospective"]
+
+    def is_derived(arg: ast.expr | None) -> bool:
+        return (isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name)
+                and arg.func.id == "_next_retro_cycle")
+
+    bad = 0
+    # No numbered pass anywhere may invent its own cycle. A string literal is
+    # the deliberate exception -- retrospective("final") names itself.
+    for call in calls_to_retrospective(tree):
+        arg = cycle_arg(call)
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            continue
+        if not is_derived(arg):
+            shown = ast.unparse(arg) if arg is not None else "<no cycle argument>"
+            bad += fail(f"loop.py:{call.lineno}: retrospective({shown}) -- the cycle must "
+                        "be _next_retro_cycle(); a number the process carries in memory "
+                        "resets to 1 on every self-restart and overwrites retro-1.md")
+
+    thread = next((n for n in tree.body if isinstance(n, ast.FunctionDef)
+                   and n.name == "retro_thread"), None)
+    if thread is None:
+        return bad + fail("loop.py has no retro_thread(); this check is pointed at "
+                          "nothing and the restart regression is unguarded again")
+    if not calls_to_retrospective(thread):
+        bad += fail("retro_thread() no longer calls retrospective(); the automatic "
+                    "pass -- the one a self-restart interrupts -- is unchecked")
+    # The historical body's other half, kept as its own tripwire: `n += 1`.
+    # Redundant with the argument check today, but it is the exact shape that
+    # regressed once, and it costs three lines to make that shape unmergeable.
+    for node in ast.walk(thread):
+        if isinstance(node, ast.AugAssign):
+            bad += fail(f"loop.py:{node.lineno}: retro_thread() keeps a running counter "
+                        f"({ast.unparse(node)}); that state dies with the process on "
+                        "restart, which is the bug #39 exists to prevent")
+    return bad
+
+
 def check_retro_no_clobber() -> int:
     """A cycle whose artifacts already exist on disk must never be overwritten.
 
@@ -847,4 +910,5 @@ if __name__ == "__main__":
              + check_unmerged_work_survives_reclaim()
              + check_filing_contract_is_stated() + check_reviewer_restore()
              + check_verdict_parsing() + check_retro_cycle_survives_restart()
+             + check_retro_callers_derive_the_cycle()
              + check_retro_no_clobber() + check_retro_cycle_claim_is_atomic() else 0)
