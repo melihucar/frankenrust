@@ -967,7 +967,16 @@ def check_retro_orphaned_claim_does_not_skew_forever() -> int:
         loop.record, loop.log = real_record, real_log
 
 
-def check_rolling_pool() -> int:
+# The whole surface cmd_run resolves as a module global at call time, and so
+# the whole surface the harness below has to swap out -- and put back. Shared
+# with check_rolling_pool_abandons_safely() so the two cannot drift: a name
+# missing from one restore leaks a stub into the next check.
+_LOOP_GLOBALS = ("gh", "work", "self_update_pending", "restart_into_new_code",
+                 "record", "log", "retro_thread", "retrospective", "MAX_PARALLEL",
+                 "WALLCLOCK_LIMIT", "DRAIN_CONFIRMATIONS", "_start")
+
+
+def check_rolling_pool(join_timeout: float = 15.0) -> int:
     """A worker that finishes early must be able to take the next issue.
 
     retro-2.md Finding 1: cmd_run used to claim a batch of MAX_PARALLEL issues
@@ -989,7 +998,8 @@ def check_rolling_pool() -> int:
     loop.DRAIN_CONFIRMATIONS and loop._start -- which is what makes this
     possible without a worktree, an agent or a network call. It runs on a
     daemon thread with a join timeout: a rolling pool that deadlocks must fail
-    this check, not hang the gate.
+    this check, not hang the gate. `join_timeout` is a parameter only so
+    check_rolling_pool_abandons_safely() can reach the expiry branch cheaply.
 
     Only the two properties #40 is scoped to: a fourth issue claimed before
     the slow one finishes (the barrier this issue removes), and claims
@@ -1063,10 +1073,7 @@ def check_rolling_pool() -> int:
         return gh.Issue(number=n, title=f"issue {n}",
                         body="Gate: bootstrap\nAgent: claude\n", labels=["fr:ready"])
 
-    saved = {name: getattr(loop, name) for name in (
-        "gh", "work", "self_update_pending", "restart_into_new_code", "record",
-        "log", "retro_thread", "retrospective", "MAX_PARALLEL", "WALLCLOCK_LIMIT",
-        "DRAIN_CONFIRMATIONS", "_start")}
+    saved = {name: getattr(loop, name) for name in _LOOP_GLOBALS}
 
     def drive(fake, work, *, max_parallel: int, wallclock: float,
               join_timeout: float) -> dict:
@@ -1093,6 +1100,7 @@ def check_rolling_pool() -> int:
         return {"alive": t.is_alive(), **result}
 
     bad = 0
+    abandoned = False
     try:
         # One issue ten times slower than the rest, sized so the fixed loop's
         # own drain-confirmation sleeps (20-30s, untouched by #40 and not this
@@ -1107,11 +1115,35 @@ def check_rolling_pool() -> int:
             finishes.append((time.time(), iss.number))
 
         fake = FakeGh([issue(n) for n in dur])
-        out = drive(fake, work_, max_parallel=3, wallclock=1.5, join_timeout=15)
+        out = drive(fake, work_, max_parallel=3, wallclock=1.5,
+                    join_timeout=join_timeout)
 
         if out["alive"]:
+            # The join expired, so this thread is no longer ours to stop -- and
+            # cmd_run re-reads gh, work, record, MAX_PARALLEL and the wallclock
+            # as module globals on *every* pass. Putting the real ones back in
+            # the finally: below would hand a thread nobody controls the live
+            # orchestrator: a real gh.sync_waiting() label write, a real
+            # gh.claim() of somebody's fr:ready issue, and a real work() ->
+            # make_worktree(n), whose `git branch -D issue/<n>` destroys the
+            # unmerged attempt preserve_branch exists to keep -- then a real
+            # agent. Interpreter shutdown would then block on it: the executor
+            # is still held open by this thread, and _python_exit joins every
+            # thread in _threads_queues, which daemon status does not exempt.
+            #
+            # So leave the fakes installed. They are pure in-memory, and their
+            # WALLCLOCK_LIMIT has already expired, so the abandoned thread
+            # hits cmd_run's wallclock break on its next pass and unwinds on
+            # its own; if it is instead wedged on a lock, the only thing exit
+            # can wait on is a work_ stub that sleeps at most SLOW seconds. Nothing
+            # later in the gate reads loop's globals
+            # (check_rolling_pool_abandons_safely runs first and restores its
+            # own), so nothing downstream is owed the real ones.
+            abandoned = True
             bad += fail("rolling pool deadlocked (1 slow + 6 fast issues, "
-                        "max_parallel=3) -- did not finish within the join timeout")
+                        "max_parallel=3) -- did not finish within the join "
+                        "timeout; loop's globals left stubbed so the abandoned "
+                        "thread cannot reach real GitHub or a real agent")
             return bad   # nothing below is safe to assert with the thread still live
 
         claims = sorted(fake.claims)
@@ -1150,7 +1182,59 @@ def check_rolling_pool() -> int:
             bad += fail(f"claims outstanding peaked at {peak} > max_parallel=3: "
                         f"claims={claims} finishes={sorted(finishes)}")
     finally:
-        for name, val in saved.items():
+        if not abandoned:
+            for name, val in saved.items():
+                setattr(loop, name, val)
+
+    return bad
+
+
+def check_rolling_pool_abandons_safely() -> int:
+    """check_rolling_pool()'s deadlock branch must not rearm the orchestrator.
+
+    That check drives the real cmd_run on a daemon thread with a join timeout,
+    on the contract that a pool which deadlocks fails the gate instead of
+    hanging it. But the thread outliving the join is exactly the case where the
+    harness has lost control of it, and cmd_run resolves gh, work, record,
+    MAX_PARALLEL and the wallclock as module globals on every pass. Restoring
+    the real ones on that path gives a runaway thread real label writes, a real
+    claim, and a real work() whose make_worktree() force-removes branch
+    issue/<n> -- and since the abandoned thread still holds the executor, and
+    interpreter shutdown joins pool workers whether or not their owner is a
+    daemon, the gate then blocks on that agent rather than exiting. Worse than
+    a hang: it mutates the queue it exists to simulate.
+
+    This check runs first, so the globals it captures are the real ones, and it
+    restores them itself. #125 adds four more scenarios to this same harness,
+    each with its own join timeout, so this branch only gets more load-bearing.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    real = {name: getattr(loop, name) for name in ("cmd_run", *_LOOP_GLOBALS)}
+    release = threading.Event()
+
+    def never_returns() -> int:
+        release.wait(30)   # a cmd_run that outlives the join; bounded anyway
+        return 0
+
+    loop.cmd_run = never_returns
+    bad = 0
+    try:
+        # Its own failure message is the expected output here, not gate noise.
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = check_rolling_pool(join_timeout=0.5)
+        if rc == 0:
+            bad += fail("check_rolling_pool() passed against a cmd_run that never "
+                        "returns -- its deadlock branch no longer detects a hang")
+        if loop.gh is real["gh"] or loop.work is real["work"]:
+            bad += fail("check_rolling_pool() restored the real gh/work while the "
+                        "thread it drives was still inside cmd_run: an abandoned "
+                        "thread would claim a live fr:ready issue, delete its "
+                        "issue/<n> branch and run an unsupervised agent")
+    finally:
+        release.set()
+        for name, val in real.items():
             setattr(loop, name, val)
 
     return bad
@@ -1170,4 +1254,4 @@ if __name__ == "__main__":
              + check_retro_callers_derive_the_cycle()
              + check_retro_no_clobber() + check_retro_cycle_claim_is_atomic()
              + check_retro_orphaned_claim_does_not_skew_forever()
-             + check_rolling_pool() else 0)
+             + check_rolling_pool_abandons_safely() + check_rolling_pool() else 0)
