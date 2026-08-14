@@ -39,6 +39,7 @@
 //! and attributes without scraping process output.
 
 use std::ffi::CStr;
+use std::io::Write as _;
 use std::os::raw::{c_char, c_int};
 use std::sync::Once;
 
@@ -151,12 +152,25 @@ pub fn log(level: Level, message: impl FnOnce() -> Vec<u8>, attrs: impl FnOnce()
 /// `std::sync::Once`, declared as its own `static` alongside the call site
 /// it guards, is the whole primitive; this function only saves each call
 /// site from re-deriving the `call_once` wrapper around [`log`].
+///
+/// The [`enabled`] check runs *before* `once.call_once`, not inside it: if it
+/// ran inside, a disabled level would still consume the `Once` (`call_once`
+/// counts as "run" the moment its closure returns, whether or not [`log`]
+/// decided to emit anything), so the very first call at a disabled level
+/// would silently and permanently disarm this site -- every level is enabled
+/// today (`MIN_LEVEL` is fixed and every call site here logs at
+/// [`Level::WARN`]), so this cannot yet happen, but the day `MIN_LEVEL`
+/// becomes configurable it would turn "log once" into "never log" with no
+/// visible error.
 pub fn log_once(
     once: &Once,
     level: Level,
     message: impl FnOnce() -> Vec<u8>,
     attrs: impl FnOnce() -> Vec<Attr>,
 ) {
+    if !enabled(level) {
+        return;
+    }
     once.call_once(|| log(level, message, attrs));
 }
 
@@ -174,12 +188,64 @@ fn write_stderr(record: &Record) {
     let mut line = format!(
         "frankenrust[{:?}]: {}",
         record.level,
-        String::from_utf8_lossy(&record.message)
+        escape_for_log_line(&record.message)
     );
     for attr in &record.attrs {
-        line.push_str(&format!(" {}={}", attr.key, attr.value));
+        line.push_str(&format!(
+            " {}={}",
+            attr.key,
+            escape_for_log_line(attr.value.as_bytes())
+        ));
     }
-    eprintln!("{line}");
+    // A write failure here (closed pipe, ENOSPC, a full stderr buffer on a
+    // blocking fd) must not propagate as a panic: this runs synchronously
+    // from every `extern "C"` callback in this crate, none of which catches
+    // unwinds, so a panic here would abort the whole server -- including
+    // every in-flight request on every other thread -- over a lost log line.
+    // `eprintln!` panics on write failure; `writeln!` does not, and the
+    // `Result` is discarded deliberately, not out of laziness: there is
+    // nothing more useful to do with a broken diagnostic sink than drop the
+    // line and keep serving. Upstream's own `slog` handlers do the same --
+    // `log/slog.Logger.log` discards its handler's write error
+    // (`$GOROOT/src/log/slog/logger.go:256,276`, both `_ = l.Handler().Handle(...)`).
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// Renders `bytes` as an unambiguous, single-line-safe fragment of a stderr
+/// log line. PHP strings are arbitrary bytes with no encoding guarantee (see
+/// this module's doc comment), and a naive `String::from_utf8_lossy` plus
+/// direct interpolation has two failure modes this function exists to avoid:
+///
+/// - **Log-line forging.** A message containing its own `\n` would start a
+///   second, attacker-controlled line in the log output -- e.g. a PHP value
+///   containing `"ok\nfrankenrust[Level(8)]: forged"` would otherwise render
+///   as two lines, the second indistinguishable from a real record.
+/// - **Silent data loss.** `from_utf8_lossy` maps every invalid byte to the
+///   same replacement character (U+FFFD), so two messages that differ only
+///   in which invalid byte they contain (say `0x80` vs `0x81`) become
+///   identical in the log -- exactly the diagnostic data a log line exists
+///   to preserve.
+///
+/// Every byte outside printable, non-backslash ASCII is therefore rendered
+/// as an explicit, reversible escape (`\n`, `\t`, `\xHH`, ...) rather than
+/// written raw or replaced. This also hex-escapes valid multi-byte UTF-8
+/// (e.g. non-ASCII text renders as a run of `\xHH`s instead of the original
+/// characters); that is a deliberate trade of readability for the guarantee
+/// that no two distinct byte strings ever render identically and no message
+/// can inject a line break.
+fn escape_for_log_line(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -495,5 +561,74 @@ mod tests {
         });
 
         assert!(records.is_empty());
+    }
+
+    /// The bug two reviewers caught: `log_once` used to call `once.call_once`
+    /// unconditionally, so a disabled level still consumed the `Once` -- the
+    /// very first call at a disabled level would permanently disarm the
+    /// site, and every later call, even at an enabled level, would then
+    /// silently log nothing. Every level is enabled today (`MIN_LEVEL` is
+    /// fixed), so this could not yet manifest through any real call site;
+    /// this test drives `log_once` directly with `Level::DEBUG`, which is
+    /// below `MIN_LEVEL`, to prove the `Once` survives a disabled call.
+    #[test]
+    fn log_once_does_not_consume_the_once_on_a_disabled_level() {
+        let once = Once::new();
+
+        let (_, disabled_records) = capture::capture(|| {
+            log_once(
+                &once,
+                Level::DEBUG,
+                || panic!("message must not be formatted for a disabled level"),
+                || panic!("attrs must not be built for a disabled level"),
+            );
+        });
+        assert!(disabled_records.is_empty());
+
+        let (_, enabled_records) = capture::capture(|| {
+            log_once(&once, Level::WARN, || b"now enabled".to_vec(), Vec::new);
+        });
+        assert_eq!(
+            enabled_records.len(),
+            1,
+            "a disabled call must not have consumed the Once -- the next \
+             enabled call through the same Once must still log"
+        );
+    }
+
+    #[test]
+    fn escape_for_log_line_escapes_newlines_so_a_message_cannot_forge_a_second_line() {
+        let escaped = escape_for_log_line(b"ok\nfrankenrust[Level(8)]: forged, not a real record");
+
+        assert!(
+            !escaped.contains('\n'),
+            "an escaped line must contain no raw newline; got {escaped:?}"
+        );
+        assert_eq!(
+            escaped,
+            "ok\\nfrankenrust[Level(8)]: forged, not a real record"
+        );
+    }
+
+    #[test]
+    fn escape_for_log_line_disambiguates_distinct_invalid_utf8_bytes() {
+        // 0x80 and 0x81 are both lone UTF-8 continuation bytes -- invalid on
+        // their own, and both collapse to the same U+FFFD under
+        // `String::from_utf8_lossy`. They must not collapse here.
+        let a = escape_for_log_line(&[0x80]);
+        let b = escape_for_log_line(&[0x81]);
+
+        assert_ne!(a, b, "distinct invalid bytes must render distinctly");
+        assert_eq!(a, "\\x80");
+        assert_eq!(b, "\\x81");
+    }
+
+    #[test]
+    fn escape_for_log_line_passes_printable_ascii_through_unchanged() {
+        assert_eq!(
+            escape_for_log_line(b"caf\xC3 broken utf8"),
+            "caf\\xc3 broken utf8"
+        );
+        assert_eq!(escape_for_log_line(b"plain text 123"), "plain text 123");
     }
 }

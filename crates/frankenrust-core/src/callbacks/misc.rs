@@ -33,11 +33,19 @@ use super::log::{self, Level};
 /// Deliberately stricter than upstream:
 /// `phpThreads[threadIndex].frankenPHPContext()` is dereferenced unchecked
 /// there (`frankenphp.go:806`), which nil-panics outside a request.
-/// `thread_index` can reach here with no context installed at all --
+/// `thread_index` can reach here with no context installed for that index --
 /// extension `MINIT` output, `opcache.preload`, a module printing at
-/// startup, `php_module_shutdown()` on the main thread (see issue #97) -- and
-/// `true` is the *correct* answer for that case, not merely a safe one: the
-/// caller reads `false` as "run `php_output_end_all()`, `php_header()` and
+/// startup, `php_module_shutdown()` on the main thread (see issue #97). (In
+/// those paths `frankenphp_thread_index()` (`frankenphp.c:137-141`) actually
+/// returns the calling OS thread's thread-local `thread_index`, which
+/// defaults to `0` and so aliases PHP thread 0's slot, rather than some
+/// sentinel "no thread" value -- upstream's own indexing aliases the same
+/// way, since it is the same C function feeding both implementations. What
+/// matters here is only that slot may itself have no context installed,
+/// which is the case this function has to handle regardless of which index
+/// it is asked about.) `true` is the *correct* answer for a slot with no
+/// context installed, not merely a safe one: the caller reads `false` as
+/// "run `php_output_end_all()`, `php_header()` and
 /// `go_frankenphp_finish_php_request()`", each of which needs a live context
 /// behind it (`frankenphp.c:627-636`), while `true` makes
 /// `frankenphp_finish_request()` `RETURN_FALSE` -- "there is nothing to
@@ -55,8 +63,15 @@ pub extern "C" fn go_is_context_done(thread_index: usize) -> bool {
 /// `log.rs`'s [`log::log_once`] doc comment).
 static PUTENV_LOGGED: Once = Once::new();
 
-/// `frankenphp.c:682` (deleting a variable) and `:693` (setting one), inside
-/// `PHP_FUNCTION(frankenphp_putenv)`. Ported from `env.go:26-37`.
+/// The logging/return-value logic behind [`go_putenv`], parameterized over
+/// `once` rather than reaching for [`PUTENV_LOGGED`] directly. This is what
+/// lets the unit tests below assert "logs exactly once" against a `Once`
+/// they own: `PUTENV_LOGGED` is a process-`static`, and `cargo test` runs
+/// this crate's tests concurrently in one process, so two tests racing the
+/// same `static` could see anywhere from 0 to 1 records each -- an
+/// assertion of `<= 1` against it can never fail even if the `log_once` call
+/// below is deleted outright. A test-local `Once` makes `== 1` both correct
+/// and deterministic.
 ///
 /// Env sandboxing -- making a script's `putenv()` visible only inside this
 /// process, never to children we spawn -- is out of scope for this port.
@@ -69,15 +84,9 @@ static PUTENV_LOGGED: Once = Once::new();
 /// interpreter for every PHP script that calls `putenv()`, for no gain: the
 /// only thing actually missing is propagating the change to processes this
 /// server spawns after the call.
-#[unsafe(no_mangle)]
-pub extern "C" fn go_putenv(
-    _name: *mut c_char,
-    _name_len: c_int,
-    _val: *mut c_char,
-    _val_len: c_int,
-) -> bool {
+fn putenv_notice(once: &Once) -> bool {
     log::log_once(
-        &PUTENV_LOGGED,
+        once,
         Level::WARN,
         || {
             b"putenv() was called, but frankenrust does not sandbox the process \
@@ -90,22 +99,41 @@ pub extern "C" fn go_putenv(
     true
 }
 
+/// `frankenphp.c:682` (deleting a variable) and `:693` (setting one), inside
+/// `PHP_FUNCTION(frankenphp_putenv)`. Ported from `env.go:26-37`. See
+/// [`putenv_notice`] for the actual logic; this just supplies the real,
+/// process-global `Once`.
+#[unsafe(no_mangle)]
+pub extern "C" fn go_putenv(
+    _name: *mut c_char,
+    _name_len: c_int,
+    _val: *mut c_char,
+    _val_len: c_int,
+) -> bool {
+    putenv_notice(&PUTENV_LOGGED)
+}
+
 /// Gates [`go_schedule_opcache_reset`]'s one-time notice.
 static OPCACHE_RESET_LOGGED: Once = Once::new();
 
-/// `frankenphp.c:1008`, inside `PHP_FUNCTION(frankenphp_opcache_reset)`.
-/// Ported from `frankenphp.go:809-813`.
+/// The logic behind [`go_schedule_opcache_reset`], parameterized over `once`
+/// for the same reason as [`putenv_notice`]: a test-local `Once` is what
+/// makes an exact "logs once" assertion possible instead of a vacuous
+/// `<= 1` against the shared process-global.
 ///
 /// Upstream's own implementation is a bare `go mainThread.rebootAllThreads()`
 /// -- fire-and-forget, not awaited. Rebooting every PHP thread to pick up a
 /// fresh opcache is out of scope for this port, so this logs once and
-/// returns; it must not block, since the caller is a live PHP thread
-/// mid-request, and it does not -- there is nothing here but a `Once` check
-/// and a log call, neither of which can stall.
-#[unsafe(no_mangle)]
-pub extern "C" fn go_schedule_opcache_reset(_thread_index: usize) {
+/// returns. It must not *hang* -- the caller is a live PHP thread
+/// mid-request -- and nothing here does anything that can hang: a `Once`
+/// check and a synchronous write to stderr, the same shape as upstream's own
+/// `slog` write (which is also synchronous). That write can still *block*
+/// briefly under backpressure (a full pipe, a slow disk) exactly as
+/// upstream's can -- this is parity with upstream's blocking behaviour, not
+/// an assertion that this call is non-blocking in an absolute sense.
+fn opcache_reset_notice(once: &Once) {
     log::log_once(
-        &OPCACHE_RESET_LOGGED,
+        once,
         Level::WARN,
         || {
             b"opcache_reset() was called, but frankenrust does not implement \
@@ -117,12 +145,19 @@ pub extern "C" fn go_schedule_opcache_reset(_thread_index: usize) {
     );
 }
 
+/// `frankenphp.c:1008`, inside `PHP_FUNCTION(frankenphp_opcache_reset)`.
+/// Ported from `frankenphp.go:809-813`. See [`opcache_reset_notice`] for the
+/// actual logic; this just supplies the real, process-global `Once`.
+#[unsafe(no_mangle)]
+pub extern "C" fn go_schedule_opcache_reset(_thread_index: usize) {
+    opcache_reset_notice(&OPCACHE_RESET_LOGGED);
+}
+
 /// Gates [`go_mercure_publish`]'s one-time notice.
 static MERCURE_PUBLISH_LOGGED: Once = Once::new();
 
-/// `frankenphp.c:965`, inside `PHP_FUNCTION(mercure_publish)`. Mercure is
-/// explicitly out of scope for this port (`docs/PORTING-NOTES.md:112`,
-/// `docs/ARCHITECTURE.md`'s out-of-scope list).
+/// The logic behind [`go_mercure_publish`], parameterized over `once` for
+/// the same reason as [`putenv_notice`].
 ///
 /// `result.r1` is a status discriminant C switches on
 /// (`frankenphp.c:966-983`): `0` is success and `RETURN_STR(result.r0)`
@@ -134,18 +169,9 @@ static MERCURE_PUBLISH_LOGGED: Once = Once::new();
 /// (`vendor/frankenphp/mercure-skip.go:12-15`: `return nil, 3`), so
 /// `(NULL, 3)` here is not a fabricated stub value -- it is the oracle's own
 /// answer for "Mercure is unavailable".
-#[unsafe(no_mangle)]
-pub extern "C" fn go_mercure_publish(
-    _thread_index: usize,
-    _topics: *mut zval,
-    _data: *mut zend_string,
-    _private: c_uchar,
-    _id: *mut zend_string,
-    _typ: *mut zend_string,
-    _retry: c_ulonglong,
-) -> go_mercure_publish_return {
+fn mercure_publish_notice(once: &Once) -> go_mercure_publish_return {
     log::log_once(
-        &MERCURE_PUBLISH_LOGGED,
+        once,
         Level::WARN,
         || {
             b"mercure_publish() was called, but frankenrust is not built with Mercure support"
@@ -158,6 +184,23 @@ pub extern "C" fn go_mercure_publish(
         r0: std::ptr::null_mut(),
         r1: 3,
     }
+}
+
+/// `frankenphp.c:965`, inside `PHP_FUNCTION(mercure_publish)`. Mercure is
+/// explicitly out of scope for this port (`docs/PORTING-NOTES.md:112`,
+/// `docs/ARCHITECTURE.md`'s out-of-scope list). See [`mercure_publish_notice`]
+/// for the actual logic; this just supplies the real, process-global `Once`.
+#[unsafe(no_mangle)]
+pub extern "C" fn go_mercure_publish(
+    _thread_index: usize,
+    _topics: *mut zval,
+    _data: *mut zend_string,
+    _private: c_uchar,
+    _id: *mut zend_string,
+    _typ: *mut zend_string,
+    _retry: c_ulonglong,
+) -> go_mercure_publish_return {
+    mercure_publish_notice(&MERCURE_PUBLISH_LOGGED)
 }
 
 /// Test-only seam onto [`super::abort_stub`]. `tests/abort_stub.rs` is a
@@ -240,39 +283,61 @@ mod tests {
     }
 
     #[test]
-    fn go_putenv_returns_true_and_logs_at_most_once() {
+    fn go_putenv_returns_true() {
+        // A smoke test of the real extern fn's wiring; the logging behaviour
+        // is tested against a test-owned `Once` below, not this one, because
+        // `PUTENV_LOGGED` is a process-`static` shared with every other test
+        // in this binary (see `putenv_notice`'s doc comment).
+        assert!(go_putenv(ptr::null_mut(), 0, ptr::null_mut(), 0));
+    }
+
+    #[test]
+    fn putenv_notice_logs_exactly_once_across_repeated_calls() {
+        let once = Once::new();
         let (results, records) = log::capture::capture(|| {
             [
-                go_putenv(ptr::null_mut(), 0, ptr::null_mut(), 0),
-                go_putenv(ptr::null_mut(), 0, ptr::null_mut(), 0),
-                go_putenv(ptr::null_mut(), 0, ptr::null_mut(), 0),
+                putenv_notice(&once),
+                putenv_notice(&once),
+                putenv_notice(&once),
             ]
         });
 
         assert_eq!(results, [true, true, true]);
-        assert!(
-            records.len() <= 1,
-            "go_putenv must log at most once regardless of call count, got {records:?}"
+        assert_eq!(
+            records.len(),
+            1,
+            "putenv_notice must log exactly once across repeated calls through \
+             the same Once, got {records:?}"
         );
+        assert_eq!(records[0].level, Level::WARN);
     }
 
     #[test]
-    fn go_schedule_opcache_reset_returns_promptly_and_logs_at_most_once() {
+    fn go_schedule_opcache_reset_returns_promptly() {
         let start = Instant::now();
-        let (_, records) = log::capture::capture(|| {
-            for _ in 0..3 {
-                go_schedule_opcache_reset(0);
-            }
-        });
-
+        go_schedule_opcache_reset(0);
         assert!(
             start.elapsed() < Duration::from_secs(1),
             "go_schedule_opcache_reset must not block the calling PHP thread"
         );
-        assert!(
-            records.len() <= 1,
-            "go_schedule_opcache_reset must log at most once regardless of call count, got {records:?}"
+    }
+
+    #[test]
+    fn opcache_reset_notice_logs_exactly_once_across_repeated_calls() {
+        let once = Once::new();
+        let (_, records) = log::capture::capture(|| {
+            for _ in 0..3 {
+                opcache_reset_notice(&once);
+            }
+        });
+
+        assert_eq!(
+            records.len(),
+            1,
+            "opcache_reset_notice must log exactly once across repeated calls \
+             through the same Once, got {records:?}"
         );
+        assert_eq!(records[0].level, Level::WARN);
     }
 
     #[test]
@@ -299,25 +364,27 @@ mod tests {
     }
 
     #[test]
-    fn go_mercure_publish_logs_at_most_once() {
-        let (_, records) = log::capture::capture(|| {
-            for _ in 0..3 {
-                go_mercure_publish(
-                    0,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    0,
-                );
-            }
+    fn mercure_publish_notice_logs_exactly_once_across_repeated_calls() {
+        let once = Once::new();
+        let (results, records) = log::capture::capture(|| {
+            [
+                mercure_publish_notice(&once),
+                mercure_publish_notice(&once),
+                mercure_publish_notice(&once),
+            ]
         });
 
-        assert!(
-            records.len() <= 1,
-            "go_mercure_publish must log at most once regardless of call count, got {records:?}"
+        for result in &results {
+            assert!(result.r0.is_null());
+            assert_eq!(result.r1, 3);
+        }
+        assert_eq!(
+            records.len(),
+            1,
+            "mercure_publish_notice must log exactly once across repeated \
+             calls through the same Once, got {records:?}"
         );
+        assert_eq!(records[0].level, Level::WARN);
     }
 
     #[test]
