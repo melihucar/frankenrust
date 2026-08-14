@@ -32,7 +32,13 @@
 //!   where absent and explicitly-empty are different configurations.
 //! - `$_SERVER` / `frankenphp_server_vars` and every `callbacks/` body: no FFI
 //!   happens in this file at all.
-//! - `RequestBody`'s real (streaming) design: see its doc comment.
+//! - The *concrete* body source and response sink: this module defines the
+//!   [`RequestBody`] and [`ResponseSink`] shapes #12's callbacks read and
+//!   write through, and the only implementations here are test fakes. The
+//!   real streaming body and the real HTTP sink are #13's
+//!   (`frankenrust-server`'s) job. Request-body timeouts / read deadlines
+//!   (`fc.requestBodyTimeout`, `frankenphp.go:670-681`) are out of scope
+//!   entirely -- no deadline API exists here.
 //!
 //! # The two rules for [`ContextSlots`] callers
 //!
@@ -60,6 +66,7 @@
 //!    either way -- see its doc comment for why that is the fix, not a
 //!    weaker substitute for one.
 
+use std::io::{self, Read};
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -122,6 +129,16 @@ impl Headers {
             .iter()
             .map(|(name, values)| (name.as_str(), values.as_slice()))
     }
+
+    /// `for k := range h { delete(h, k) }` (`frankenphp.go:616-618`) --
+    /// `go_write_headers`'s manual clear after a 1xx response, since Go's
+    /// `ResponseWriter.WriteHeader` does not clear headers for an
+    /// informational response on its own. Removes every name, not just the
+    /// values under them, so a later [`Headers::get_first`] sees `None`
+    /// again rather than `Some(&[])`.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 /// Port of `net/textproto`'s `validHeaderFieldByte`: the RFC 9110 §5.6.2
@@ -178,21 +195,83 @@ fn canonical_header_name(name: &str) -> String {
     out
 }
 
-/// The request body handle #12's `go_read_post` (`callbacks/input.rs`) will
-/// eventually read through.
+/// The request body handle `go_read_post` (`callbacks/input.rs`, #12) reads
+/// through -- our analogue of Go's `io.ReadCloser`, `fc.request.Body`
+/// (`frankenphp.go:692`).
 ///
-/// This is intentionally inert. `RequestBody`'s real design -- almost
-/// certainly a streaming handle read incrementally on the PHP thread, the way
-/// `go_read_post` reads `fc.request.Body` upstream (`frankenphp.go:683-694`)
-/// -- belongs to a later issue, not this one. Building it out here would mean
-/// guessing at a shape that issue is free to reject. `Request` derives
-/// `Clone`/`Debug` today only because this placeholder is trivially both; a
-/// real streaming body is neither (an `io::Read` handle has no meaningful
-/// copy), so whichever issue replaces this will have to drop one or both of
-/// those derives from `Request` in the same diff. Keeping this field's name
-/// and position stable is what keeps that diff small.
-#[derive(Debug, Clone, Default)]
-pub struct RequestBody;
+/// Wraps any blocking byte source behind `std::io::Read` rather than a
+/// bespoke trait: that already *is* Go's `io.Reader` contract translated to
+/// Rust -- a single call may return fewer bytes than asked for while more
+/// remain (a short read is not end-of-body), and `Ok(0)` means the source is
+/// exhausted for good -- so reusing it costs nothing and buys every existing
+/// `Read` adapter for free. `Send` because this value lives inside a
+/// [`Request`] inside a [`RequestContext`], which must itself be `Send` (it
+/// sits behind [`ContextSlots`]' per-thread `Mutex`, accessed from whichever
+/// PHP pthread owns that `thread_index`).
+///
+/// The concrete source this wraps in production is not this crate's to
+/// build. `docs/ARCHITECTURE.md`'s async/pthread bridge section is explicit
+/// that the request producer lives on the tokio side while
+/// [`RequestBody::fill`] runs on the PHP pthread inside `go_read_post`, so
+/// the real implementation is a `Read` impl that blocks on a channel
+/// (`std::sync::mpsc` / `crossbeam_channel` -- `docs/PORTING-NOTES.md`'s
+/// construct table, **not** a tokio channel) fed by `frankenrust-server`.
+/// Nothing here needs to know that: any blocking `Read + Send` source
+/// satisfies the contract, which is exactly why a plain in-memory fake is
+/// enough to exercise it in this module's own tests.
+pub struct RequestBody(Option<Box<dyn Read + Send>>);
+
+impl RequestBody {
+    /// Wraps a blocking byte source. Blocking here is expected, not a bug:
+    /// every call to [`RequestBody::fill`] happens on the PHP pthread inside
+    /// `go_read_post`, which upstream itself blocks on
+    /// `fc.request.Body.Read` (`frankenphp.go:692`).
+    pub fn new(source: impl Read + Send + 'static) -> Self {
+        Self(Some(Box::new(source)))
+    }
+
+    /// A request with no body. [`RequestBody::fill`] returns `0`
+    /// immediately rather than blocking -- there is nothing to wait for.
+    pub fn empty() -> Self {
+        Self(None)
+    }
+
+    /// Fills `buf` completely, looping over the underlying source the way
+    /// `go_read_post` loops over `fc.request.Body.Read`
+    /// (`frankenphp.go:683-694`): PHP must never see a short read that was
+    /// merely a partial network read, so one call returning fewer bytes than
+    /// are still available on the wire must not be mistaken for the body
+    /// ending. The loop stops only when `buf` is full, the source reports it
+    /// is exhausted (`Ok(0)`), or a read errors.
+    ///
+    /// A read `Err` ends the loop rather than propagating: `go_read_post`'s C
+    /// signature returns only a byte count, so upstream itself only uses its
+    /// error to end the loop (`frankenphp.go:685`) and never surfaces it
+    /// further. `io::ErrorKind::Interrupted` is retried rather than treated
+    /// as either case -- Go's runtime already retries `EINTR` below the
+    /// level upstream's loop ever sees it, and skipping the retry here would
+    /// make a signal delivered mid-upload look identical to end-of-body.
+    ///
+    /// Returns the number of bytes actually read, which is less than
+    /// `buf.len()` only when the source is exhausted or erroring, never
+    /// merely because one underlying `read` call happened to return early.
+    pub fn fill(&mut self, buf: &mut [u8]) -> usize {
+        let Some(source) = self.0.as_mut() else {
+            return 0;
+        };
+
+        let mut filled = 0;
+        while filled < buf.len() {
+            match source.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        filled
+    }
+}
 
 /// The inbound request. Carries exactly the fields the request-context and
 /// CGI layers need (`context.go:23`'s `request *http.Request`, narrowed to
@@ -201,7 +280,11 @@ pub struct RequestBody;
 /// (`docs/ARCHITECTURE.md`'s crate-boundary section puts that in
 /// `frankenrust-server`), so whatever hands us a `Request` is responsible for
 /// filling it in from the real transport.
-#[derive(Debug, Clone)]
+///
+/// Carries no `Debug`/`Clone`: [`RequestBody`] holds a `Box<dyn Read + Send>`,
+/// which is neither (a live read handle has no meaningful copy, and printing
+/// it would print nothing useful). Nothing in-tree needs either derive on
+/// `Request` outside tests, and nothing there needs it either.
 pub struct Request {
     pub method: String,
 
@@ -304,6 +387,8 @@ pub struct Request {
     /// issue's `go_is_context_done` callback will too.
     pub cancelled: Arc<AtomicBool>,
 
+    /// See [`RequestBody`] for the read contract. [`RequestBody::empty`] is
+    /// a request with no body, not an unconfigured field.
     pub body: RequestBody,
 }
 
@@ -323,7 +408,7 @@ impl Request {
             proto_major: 1,
             proto_minor: 1,
             cancelled: Arc::new(AtomicBool::new(false)),
-            body: RequestBody,
+            body: RequestBody::empty(),
         }
     }
 
@@ -891,6 +976,68 @@ impl RequestArena {
     }
 }
 
+/// Why [`ResponseSink::flush`] could not actually flush.
+///
+/// Upstream logs the two causes at different levels: WARN when the
+/// underlying writer cannot flush at all (`errors.Is(err,
+/// http.ErrNotSupported)`, usually a misconfigured deployment worth
+/// surfacing), DEBUG for an ordinary I/O error (`frankenphp.go:648-655`).
+/// Collapsing both into a single `io::Error` would erase the distinction the
+/// caller needs to pick a log level, which is the whole reason
+/// `go_sapi_flush` calls `errors.Is` instead of just testing `err != nil`.
+#[derive(Debug)]
+pub enum FlushError {
+    /// This sink is not backed by anything that can flush at all -- Go's
+    /// `http.ErrNotSupported`.
+    NotAFlusher,
+    /// Any other error `responseController.Flush()` (`frankenphp.go:644`)
+    /// returned.
+    Io(io::Error),
+}
+
+/// The transport-neutral half of Go's `http.ResponseWriter` (plus the one
+/// `http.ResponseController` method upstream uses, `Flush` --
+/// `frankenphp.go:640-644`) that [`RequestContext`] is missing: the
+/// operations `go_ub_write`, `go_write_headers` and `go_sapi_flush` (#12)
+/// need from whatever is actually sending bytes to the client.
+///
+/// `frankenrust-core` has no hyper/http dependency (`docs/ARCHITECTURE.md`'s
+/// crate-boundary section puts that in `frankenrust-server`), so this is a
+/// trait, not a concrete writer: the only implementations in this diff are
+/// test fakes, and the real one -- wrapping hyper's response body -- is
+/// #13's job.
+pub trait ResponseSink {
+    /// Go's `Write` (`frankenphp.go:466`, inside `go_ub_write`). Returns the
+    /// number of bytes actually written *and* an error, matching
+    /// `io.Writer.Write`'s `(n int, err error)` -- a short write is
+    /// meaningful to PHP (upstream returns exactly what `Write` reported,
+    /// `frankenphp.go:487`), so collapsing it to `()` would silently hide a
+    /// partial write from the caller.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize>;
+
+    /// `fc.responseWriter.Header().Add(key, val)`, upstream's `addHeader`
+    /// (`frankenphp.go:529-539`), called once per header PHP set. Append
+    /// semantics: a name set more than once accumulates every value, exactly
+    /// what [`Headers::insert`] already does -- a conforming implementation
+    /// is expected to store what it receives in a [`Headers`] and delegate
+    /// to it rather than reinvent Go's `textproto.MIMEHeader.Add`. (Which is
+    /// also why [`Headers::clear`] exists: `go_write_headers` empties
+    /// whichever `Headers` backs this after a 1xx response,
+    /// `frankenphp.go:613-619`.)
+    fn add_header(&mut self, name: &str, value: &[u8]);
+
+    /// `fc.responseWriter.WriteHeader(goStatus)` (`frankenphp.go:611`).
+    /// `status` arrives already clamped to the range `net/http` accepts
+    /// (`frankenphp.go:599-609`) -- clamping is the caller's job, not this
+    /// trait's.
+    fn write_status(&mut self, status: u16);
+
+    /// `responseController.Flush()` (`frankenphp.go:644`). See
+    /// [`FlushError`] for why "not a flusher" and "a real I/O error" are
+    /// distinct outcomes rather than one.
+    fn flush(&mut self) -> Result<(), FlushError>;
+}
+
 /// Port of `frankenPHPContext` (`context.go:16-54`). See this module's doc
 /// comment for what is intentionally not ported.
 pub struct RequestContext {
@@ -954,6 +1101,20 @@ pub struct RequestContext {
     /// `fastcgi_finish_request()`, not just a real client abort.
     pub client_had_closed: bool,
 
+    /// The response sink -- upstream's `fc.responseWriter` (`context.go:47`).
+    ///
+    /// `None` is not a state to guard against; it is Go's own `nil`, and
+    /// upstream branches on exactly that in five separate callbacks, three
+    /// of which give it a specific, load-bearing behaviour rather than an
+    /// error: worker-bootstrap output is logged instead of written
+    /// (`go_ub_write`, `frankenphp.go:454-460`), headers are "written"
+    /// without a writer so PHP still goes on to call `ub_write`
+    /// (`go_write_headers`, `frankenphp.go:584-587`), and flush reports
+    /// nothing to flush (`go_sapi_flush`, `frankenphp.go:632-634`). This
+    /// module's job is only to make that state representable, not to
+    /// implement any of the five callbacks -- that is #12's.
+    pub response_sink: Option<Box<dyn ResponseSink + Send>>,
+
     completion_signal: CompletionSignal,
 
     pub arena: RequestArena,
@@ -1006,6 +1167,7 @@ impl RequestContext {
             request_uri,
             is_done: false,
             client_had_closed: false,
+            response_sink: None,
             completion_signal,
             arena: RequestArena::default(),
             server_vars: None,
@@ -2314,5 +2476,190 @@ mod tests {
             handle.join().expect("worker thread must not panic");
         }
         assert!(slots.with_context(9, |ctx| ctx.is_some()));
+    }
+
+    #[test]
+    fn headers_clear_empties_a_map_with_multiple_names_and_values() {
+        let mut headers = Headers::default();
+        headers.insert("A", b"1".to_vec());
+        headers.insert("A", b"2".to_vec());
+        headers.insert("B", b"3".to_vec());
+
+        headers.clear();
+
+        assert_eq!(
+            headers.get_first("A"),
+            None,
+            "clear must remove the name, not just empty its value list"
+        );
+        assert_eq!(headers.get_all("A"), None);
+        assert_eq!(headers.get_first("B"), None);
+    }
+
+    /// A source that hands back exactly one byte per `read` call, however
+    /// large the caller's buffer is -- the shape a real partial network read
+    /// takes.
+    struct OneByteAtATime(std::collections::VecDeque<u8>);
+
+    impl Read for OneByteAtATime {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.pop_front() {
+                Some(byte) => {
+                    buf[0] = byte;
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn request_body_fill_loops_a_one_byte_source_until_the_buffer_is_full() {
+        let source = OneByteAtATime(b"hello world".iter().copied().collect());
+        let mut body = RequestBody::new(source);
+
+        let mut buf = [0u8; 11];
+        let n = body.fill(&mut buf);
+
+        assert_eq!(
+            n,
+            buf.len(),
+            "a source that yields one byte per read must still fill the whole \
+             buffer in a single fill() call -- the loop, not one chunk"
+        );
+        assert_eq!(&buf, b"hello world");
+    }
+
+    #[test]
+    fn request_body_fill_stops_when_the_source_is_exhausted_short_of_the_buffer() {
+        let mut body = RequestBody::new(&b"hi"[..]);
+
+        let mut buf = [0xffu8; 8];
+        let n = body.fill(&mut buf);
+
+        assert_eq!(n, 2, "must not spin once the source reports Ok(0)");
+        assert_eq!(&buf[..2], b"hi");
+    }
+
+    #[test]
+    fn request_body_empty_reads_zero_without_a_source_to_block_on() {
+        let mut body = RequestBody::empty();
+        let mut buf = [0xffu8; 8];
+        assert_eq!(
+            body.fill(&mut buf),
+            0,
+            "a request with no body has nothing to wait for"
+        );
+    }
+
+    /// Records every call it receives, one field per [`ResponseSink`]
+    /// operation.
+    #[derive(Default)]
+    struct FakeResponseSink {
+        writes: Vec<Vec<u8>>,
+        header_adds: Vec<(String, Vec<u8>)>,
+        status: Option<u16>,
+        flush_calls: usize,
+    }
+
+    impl ResponseSink for FakeResponseSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn add_header(&mut self, name: &str, value: &[u8]) {
+            self.header_adds.push((name.to_string(), value.to_vec()));
+        }
+
+        fn write_status(&mut self, status: u16) {
+            self.status = Some(status);
+        }
+
+        fn flush(&mut self) -> Result<(), FlushError> {
+            self.flush_calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fake_response_sink_records_writes_header_adds_status_and_flush() {
+        let mut sink = FakeResponseSink::default();
+
+        assert_eq!(sink.write(b"hello").unwrap(), 5);
+        assert_eq!(sink.write(b" world").unwrap(), 6);
+        sink.add_header("Content-Type", b"text/plain");
+        sink.add_header("X-Multi", b"a");
+        sink.add_header("X-Multi", b"b");
+        sink.write_status(200);
+        assert!(sink.flush().is_ok());
+        assert!(sink.flush().is_ok());
+
+        assert_eq!(sink.writes, vec![b"hello".to_vec(), b" world".to_vec()]);
+        assert_eq!(
+            sink.header_adds,
+            vec![
+                ("Content-Type".to_string(), b"text/plain".to_vec()),
+                ("X-Multi".to_string(), b"a".to_vec()),
+                ("X-Multi".to_string(), b"b".to_vec()),
+            ],
+            "add_header must accumulate, not overwrite, repeated names"
+        );
+        assert_eq!(sink.status, Some(200));
+        assert_eq!(sink.flush_calls, 2);
+    }
+
+    #[test]
+    fn flush_error_distinguishes_not_a_flusher_from_a_real_io_error() {
+        struct UnflushableSink;
+        impl ResponseSink for UnflushableSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn add_header(&mut self, _name: &str, _value: &[u8]) {}
+            fn write_status(&mut self, _status: u16) {}
+            fn flush(&mut self) -> Result<(), FlushError> {
+                Err(FlushError::NotAFlusher)
+            }
+        }
+
+        struct ErroringSink;
+        impl ResponseSink for ErroringSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn add_header(&mut self, _name: &str, _value: &[u8]) {}
+            fn write_status(&mut self, _status: u16) {}
+            fn flush(&mut self) -> Result<(), FlushError> {
+                Err(FlushError::Io(io::Error::other("broken pipe")))
+            }
+        }
+
+        assert!(matches!(
+            UnflushableSink.flush(),
+            Err(FlushError::NotAFlusher)
+        ));
+        assert!(matches!(ErroringSink.flush(), Err(FlushError::Io(_))));
+    }
+
+    #[test]
+    fn request_context_with_no_sink_is_constructible_and_distinguishable() {
+        let mut ctx = test_context(None);
+        assert!(
+            ctx.response_sink.is_none(),
+            "no sink installed by default -- constructible and distinguishable \
+             from an installed one, without a panic or an unwrap"
+        );
+
+        ctx.response_sink = Some(Box::new(FakeResponseSink::default()));
+        assert!(
+            ctx.response_sink.is_some(),
+            "installing a sink must be a distinguishable state from None"
+        );
+
+        // And the boxed trait object genuinely dispatches, not just type-checks.
+        let sink = ctx.response_sink.as_deref_mut().expect("just installed");
+        sink.write_status(204);
+        assert_eq!(sink.write(b"ok").unwrap(), 2);
     }
 }
