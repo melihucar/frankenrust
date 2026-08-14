@@ -1036,10 +1036,84 @@ def cmd_seed() -> int:
     return 0 if issues else 1
 
 
+def _next_retro_cycle() -> int:
+    """The count of `retrospective` events already in JOURNAL, plus one.
+
+    Not a local counter: `retro_thread()` used to keep `n` as a plain variable,
+    which lives only in that thread's memory. `restart_into_new_code()` stops
+    the thread and then `os.execve`s the process away to adopt a merged change
+    to this file, so the successor's `retro_thread` started `n` back at 0 and
+    relabelled its first retrospective "1" -- overwriting a complete, different
+    retrospective that already owned that name. JOURNAL is a file, so it
+    survives the restart, and re-deriving the count from it every time means a
+    fresh process reads back the same number the old one would have used next.
+    """
+    if not JOURNAL.exists():
+        return 1
+    n = 0
+    with JOURNAL.open() as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("event") == "retrospective":
+                n += 1
+    return n + 1
+
+
+def _retro_artifacts(cycle: int) -> list[Path]:
+    return [
+        LOGS / f"retro-{cycle}.md",
+        LOGS / "retro" / f"prompt.r{cycle}.md",
+        LOGS / "retro" / f"claude.r{cycle}.log",
+        LOGS / "retro" / f"claude.r{cycle}.final.txt",
+    ]
+
+
+def _claim_retro_cycle(wanted: int) -> int:
+    """Reserve a free cycle number, deciding ties by the filesystem rather than by timing.
+
+    `_next_retro_cycle()` can hand the same `wanted` to two callers that run
+    close together -- `retro_thread()`'s automatic pass and a manual `loop.py
+    retro` -- and "the number was free when I checked" is not still true by the
+    time either of them writes. `O_CREAT | O_EXCL` makes the report path itself
+    the tiebreaker: only one creator can succeed on a given path, so the loser
+    observes `FileExistsError` and moves on to the next number instead of
+    overwriting what the winner is about to produce.
+
+    A cycle also counts as taken if any of its *other* three artifacts already
+    exist even though the report does not -- the case worth catching is a run
+    that crashed after `invoke()` wrote the prompt/log/transcript but before the
+    agent produced its report, leaving evidence of a retrospective with no
+    findings attached to it.
+    """
+    cycle = wanted
+    while True:
+        report, *siblings = _retro_artifacts(cycle)
+        try:
+            fd = os.open(str(report), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            cycle += 1
+            continue
+        os.close(fd)
+        if any(p.exists() for p in siblings):
+            report.unlink(missing_ok=True)   # give back the claim; it was stale
+            cycle += 1
+            continue
+        break
+    if cycle != wanted:
+        log(f"    ~~ retro cycle {wanted} already has artifacts on disk; using {cycle} instead")
+        record("retro_clobber_avoided", wanted=wanted, used=cycle)
+    return cycle
+
+
 def retrospective(cycle: int | str) -> None:
     """Diagnose the loop, not the issues, and file fixes for itself."""
     if not JOURNAL.exists():
         return
+    if isinstance(cycle, int):
+        cycle = _claim_retro_cycle(cycle)
     log(f"== retrospective ({cycle})")
     p = "\n".join([(PROMPTS / "shared.md").read_text(),
                     (PROMPTS / "retrospective.md").read_text(),
@@ -1050,7 +1124,7 @@ def retrospective(cycle: int | str) -> None:
 
 
 def cmd_retro() -> int:
-    retrospective(int(os.environ.get("FR_CYCLE", "0")))
+    retrospective(_next_retro_cycle())
     return 0
 
 
@@ -1063,14 +1137,12 @@ _retro_stop = threading.Event()
 
 
 def retro_thread() -> None:
-    n = 0
     while not _retro_stop.is_set():
         if not _merge_signal.wait(timeout=5):
             continue
         _merge_signal.clear()          # cleared before the run, so merges that
-        n += 1                         # land during it trigger another pass
-        try:
-            retrospective(n)
+        try:                            # land during it trigger another pass
+            retrospective(_next_retro_cycle())
         except Exception as exc:       # never let the retro kill the run
             log(f"!! retrospective failed: {exc}")
             record("retro_error", reason=str(exc))

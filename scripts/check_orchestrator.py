@@ -12,10 +12,12 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import json
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -683,6 +685,157 @@ def check_verdict_parsing() -> int:
     return bad
 
 
+def check_retro_cycle_survives_restart() -> int:
+    """The retrospective's cycle number must be re-derivable, not remembered.
+
+    `retro_thread()` used to keep the cycle in a plain Python local, `n`, which
+    lives only in that thread's memory. A self-restart -- the loop's designed
+    way of adopting a merged change to itself -- stops that thread and then
+    `os.execve`s the process away, so the successor's `retro_thread` started
+    `n` back at 0 and relabelled its first retrospective "1", overwriting a
+    complete, different retrospective that already owned that name.
+
+    JOURNAL is a file, so it survives the restart; the fix is to derive the
+    cycle from it every time instead. This is checked with a real subprocess
+    reading a journal it never wrote a line of itself -- the only way to prove
+    the number does not depend on anything the process remembers.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    bad = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        journal = Path(tmp) / "events.jsonl"
+        journal.write_text("\n".join(json.dumps(r) for r in [
+            {"ts": "t", "event": "merged", "issue": 1},
+            {"ts": "t", "event": "retrospective", "cycle": 1},
+            {"ts": "t", "event": "gate_fail", "issue": 2},
+            {"ts": "t", "event": "retrospective", "cycle": 2},
+        ]) + "\n")
+
+        real_journal = loop.JOURNAL
+        loop.JOURNAL = journal
+        try:
+            got = loop._next_retro_cycle()
+        finally:
+            loop.JOURNAL = real_journal
+        if got != 3:
+            bad += fail(f"_next_retro_cycle() read a journal with two "
+                        f"retrospective events and returned {got}, want 3")
+
+        script = (
+            f"import sys; sys.path.insert(0, {str(ROOT / 'orchestrator')!r})\n"
+            "from pathlib import Path\n"
+            "import loop\n"
+            f"loop.JOURNAL = Path({str(journal)!r})\n"
+            "print(loop._next_retro_cycle())\n"
+        )
+        p = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                           text=True, timeout=30, cwd=ROOT)
+        out = p.stdout.strip()
+        if out != "3":
+            bad += fail(f"a fresh process reading the same journal got "
+                        f"{out!r} (stderr: {p.stderr.strip()[-300:]}), want '3' "
+                        "-- the cycle number came from somewhere other than the journal")
+    return bad
+
+
+def check_retro_no_clobber() -> int:
+    """A cycle whose artifacts already exist on disk must never be overwritten.
+
+    `_next_retro_cycle()` counts JOURNAL events, but a journal that disagrees
+    with what is actually on disk -- a hand-moved file, a manual `loop.py
+    retro`, two processes racing -- is exactly the situation #39 exists to
+    make survivable. Finding `retro-3.md` already written when about to write
+    `retro-3.md` must roll forward to the next free number, leave the existing
+    file byte-for-byte untouched, and say so in the journal.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    events: list[tuple[str, dict]] = []
+    real_record, real_log = loop.record, loop.log
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            existing = logs / "retro-3.md"
+            existing.write_text("the real retrospective 3\n")
+            before = existing.read_bytes()
+
+            real_logs = loop.LOGS
+            loop.LOGS = logs
+            try:
+                used = loop._claim_retro_cycle(3)
+            finally:
+                loop.LOGS = real_logs
+
+            bad = 0
+            if used == 3:
+                bad += fail("_claim_retro_cycle(3) returned 3 with retro-3.md "
+                            "already on disk; the existing report would be overwritten")
+            if existing.read_bytes() != before:
+                bad += fail("_claim_retro_cycle mutated an existing retro-N.md "
+                            "instead of leaving it untouched")
+            claimed = logs / f"retro-{used}.md"
+            if not claimed.exists():
+                bad += fail(f"_claim_retro_cycle({used}) did not reserve {claimed}")
+            if ("retro_clobber_avoided", {"wanted": 3, "used": used}) not in events:
+                bad += fail(f"_claim_retro_cycle did not record retro_clobber_avoided "
+                            f"(wanted=3, used={used}); recorded {events}")
+            return bad
+    finally:
+        loop.record, loop.log = real_record, real_log
+
+
+def check_retro_cycle_claim_is_atomic() -> int:
+    """Two simultaneous claims of the same cycle must not both win it.
+
+    A previous version of this fix checked "does retro-N.md exist?" and then
+    created it as two separate steps -- `retro_thread()`'s automatic pass and a
+    manual `loop.py retro` can both observe cycle N free and both write it,
+    since nothing stops a second check from running in the gap before the
+    first write lands. `_claim_retro_cycle` has to decide the tie with
+    `O_CREAT | O_EXCL`, which the filesystem makes atomic; this drives two
+    threads at the identical cycle number to prove the race is actually closed,
+    not just unlikely to lose in a quick test run.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    real_log, real_record = loop.log, loop.record
+    loop.log = lambda msg: None
+    loop.record = lambda event, **f: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            real_logs = loop.LOGS
+            loop.LOGS = Path(tmp)
+            try:
+                results: list[int] = []
+                lock = threading.Lock()
+
+                def claim() -> None:
+                    got = loop._claim_retro_cycle(7)
+                    with lock:
+                        results.append(got)
+
+                threads = [threading.Thread(target=claim) for _ in range(2)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+            finally:
+                loop.LOGS = real_logs
+
+            if len(results) != 2 or results[0] == results[1]:
+                return fail(f"two concurrent _claim_retro_cycle(7) calls returned "
+                            f"{results}; both claimed the same report path")
+            return 0
+    finally:
+        loop.log, loop.record = real_log, real_record
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
@@ -693,4 +846,5 @@ if __name__ == "__main__":
              + check_silent_reviewer_is_not_a_pass() + check_pre_implementer_stages_restore()
              + check_unmerged_work_survives_reclaim()
              + check_filing_contract_is_stated() + check_reviewer_restore()
-             + check_verdict_parsing() else 0)
+             + check_verdict_parsing() + check_retro_cycle_survives_restart()
+             + check_retro_no_clobber() + check_retro_cycle_claim_is_atomic() else 0)
