@@ -1089,13 +1089,11 @@ pub(crate) fn remove_test_main(main: &Arc<PhpMainThread>) {
 mod tests {
     use super::*;
     use crossbeam_channel::TryRecvError;
-    use std::os::unix::process::ExitStatusExt;
     use std::process::Command;
     use std::sync::mpsc;
 
     const LIFECYCLE_TEST: &str =
-        "thread::tests::one_shot_real_boot_and_drain_reaches_the_known_output_stub";
-    const SIGABRT: i32 = 6;
+        "thread::tests::one_shot_real_boot_and_drain_completes_without_aborting";
 
     struct StandInLauncher;
 
@@ -1413,8 +1411,29 @@ mod tests {
         );
     }
 
+    // Originally `..._reaches_the_known_output_stub`: before #12, every real
+    // end-to-end boot+drain died in an abort-stub `go_write_headers`, reached
+    // unconditionally from `php_module_shutdown()`'s `sapi_flush()`
+    // (`main/main.c:2511`) even when zero PHP scripts ever ran (see #97's
+    // gdb backtrace and the "Why this cost #10 three attempts" section of
+    // that issue). This test pinned that abort as a known-good signal so it
+    // would fail loudly, not silently pass, once the stub was replaced.
+    //
+    // #12 replaced the stub with `go_write_headers`/`go_sapi_flush` bodies
+    // that tolerate a null request context exactly the way upstream's own
+    // `fc == nil` checks do (`frankenphp.go:576-578`, `:630-632`) -- the one
+    // lever #97 found that lets this cycle complete instead of aborting. That
+    // makes the SIGABRT this test used to assert factually wrong, so per this
+    // repo's rule 1 ("if a test is genuinely wrong, fix it and say so loudly")
+    // this test now asserts the single-cycle positive outcome instead: renamed
+    // and rewritten by #12, said so in its final message. #12 does not own
+    // `thread.rs` and did not touch anything else in this file. #97 (which
+    // depends on #12 and was already scoped to "replace it with the positive
+    // assertion") still owns turning this into its required three-cycle,
+    // repeatable-in-one-binary-run version -- this only fixes the now-false
+    // single-cycle assertion, it does not attempt that larger rewrite.
     #[test]
-    fn one_shot_real_boot_and_drain_reaches_the_known_output_stub() {
+    fn one_shot_real_boot_and_drain_completes_without_aborting() {
         if std::env::var_os(LIFECYCLE_CHILD_MARKER).is_some() {
             run_real_lifecycle_child();
             return;
@@ -1434,6 +1453,7 @@ mod tests {
             "PHP_THREADS_INACTIVE",
             "PHP_THREADS_RESERVED",
             "MAIN_READY_CALLBACK_RETURNING",
+            "DRAIN_RETURNED",
         ] {
             assert!(
                 stdout.contains(marker),
@@ -1441,19 +1461,11 @@ mod tests {
                 output.status
             );
         }
-        assert_eq!(
-            output.status.signal(),
-            Some(SIGABRT),
-            "the child must currently die in #12's output stub; status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        assert!(
+            output.status.success(),
+            "the child must now survive tsrm_shutdown instead of dying in the \
+             old go_write_headers abort-stub; status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
             output.status
-        );
-        assert!(
-            stderr.contains("go_write_headers"),
-            "the child died somewhere other than the named output stub:\n{stderr}"
-        );
-        assert!(
-            !stdout.contains("UNEXPECTED_DRAIN_RETURN"),
-            "the test must fail loudly once the abort stub stops firing"
         );
     }
 
@@ -1474,11 +1486,11 @@ mod tests {
 
         drain_php_threads();
 
-        // #12 replacing go_write_headers makes this reachable. This issue's
-        // subprocess assertion intentionally fails then; #97 owns the positive
-        // post-tsrm_shutdown lifecycle.
+        // #12's null-context tolerance in go_write_headers/go_sapi_flush is
+        // what lets this return instead of aborting inside
+        // php_module_shutdown() -- see this test's doc comment above.
         assert_eq!(main.state(), State::Reserved);
-        write_test_marker("UNEXPECTED_DRAIN_RETURN");
+        write_test_marker("DRAIN_RETURNED");
     }
 
     // #103: max_threads=auto resolution (phpmainthread.go:250-278). Pure
