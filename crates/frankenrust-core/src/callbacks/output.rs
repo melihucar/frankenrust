@@ -1,6 +1,6 @@
 //! `go_ub_write`, `go_write_headers`, `go_sapi_flush` -- the SAPI module's
 //! unbuffered-write / send-headers / flush hooks
-//! (`vendor/frankenphp/frankenphp.c:1409-1410`). Real bodies for issue #12,
+//! (`vendor/frankenphp/frankenphp.c:1409-1410` and `:1417`). Real bodies for issue #12,
 //! ported from `vendor/frankenphp/frankenphp.go:430-660`, over #73's
 //! [`crate::context::ResponseSink`] and #106's logging facade
 //! ([`super::log`]).
@@ -34,8 +34,9 @@ use crate::context::{FlushError, CONTEXT_SLOTS};
 
 use super::log::{self, Attr, Level};
 
-/// Mirrors PHP's `sapi_header_struct` (`main/SAPI.h`: `{ char *header;
-/// size_t header_len; }`). Not one of `frankenrust-sys`'s bindgen types --
+/// Mirrors PHP's `sapi_header_struct` (`main/SAPI.h:44-47`, in the include
+/// directory `php-config --include-dir` names: `{ char *header; size_t
+/// header_len; }`). Not one of `frankenrust-sys`'s bindgen types --
 /// `crates/frankenrust-sys/build.rs`'s allowlist does not include it, and
 /// this issue does not own that file (see the top-level agent instructions'
 /// "stay in your lane" rule) -- so it is reproduced here by hand. Two
@@ -70,7 +71,7 @@ pub extern "C" fn go_ub_write(
         &[]
     } else {
         // SAFETY: `c_buf`/`length` are PHP's own `str`/`str_length`
-        // (`frankenphp.c:1132-1146`, `frankenphp_ub_write`), valid for reads
+        // (`frankenphp.c:1133-1148`, `frankenphp_ub_write`), valid for reads
         // of exactly `length` bytes for the duration of this call and
         // unmodified by us. PHP strings are arbitrary bytes, so this reads
         // `u8`, never assumes UTF-8 or a NUL terminator.
@@ -166,12 +167,12 @@ fn split_header(raw: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((key, &raw[value_start..]))
 }
 
-/// `frankenphp.go:598-609`: the status PHP handed C, clamped to the range
+/// `frankenphp.go:599-609`: the status PHP handed C, clamped to the range
 /// Go's `net/http` accepts (`WriteHeader` panics outside `100..=999`).
 /// Returns the value to actually send, and whether clamping happened, so the
 /// caller can log the *discarded* raw value before it is replaced
-/// (`frankenphp.go:601`: `slog.Int("status_code", goStatus)` runs before the
-/// `goStatus = 500` assignment).
+/// (`frankenphp.go:605`'s `slog.Int("status_code", goStatus)` runs before the
+/// `goStatus = 500` assignment at `:608`).
 fn clamp_status(raw: c_int) -> (u16, bool) {
     if (100..=999).contains(&raw) {
         (raw as u16, false)
@@ -189,7 +190,7 @@ fn clamp_status(raw: c_int) -> (u16, bool) {
 /// `head`/`next` chain is well-formed and, for every node, whose `data`
 /// holds an inline `sapi_header_struct` -- exactly what `sapi_headers->
 /// headers` is for the duration of `frankenphp_send_headers`
-/// (`frankenphp.c:1148-1174`), this function's sole caller.
+/// (`frankenphp.c:1150-1176`), this function's sole caller.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn go_write_headers(
     thread_index: usize,
@@ -199,7 +200,7 @@ pub unsafe extern "C" fn go_write_headers(
     CONTEXT_SLOTS.with_context_mut(thread_index, |ctx| {
         let Some(ctx) = ctx else {
             // Deliberately *different* from upstream's own `fc == nil`
-            // check (frankenphp.go:582-585), which returns false there: see
+            // check (frankenphp.go:576-578), which returns false there: see
             // this module's doc comment. No context and no sink both mean
             // "not currently producing a real HTTP response", and the
             // no-sink branch below already has a specific, correct answer
@@ -211,7 +212,7 @@ pub unsafe extern "C" fn go_write_headers(
         };
 
         if ctx.is_done {
-            // frankenphp.go:578-580.
+            // frankenphp.go:580-582.
             return false;
         }
 
@@ -222,7 +223,7 @@ pub unsafe extern "C" fn go_write_headers(
         };
 
         // SAFETY: `headers` is `&sapi_headers->headers`
-        // (`frankenphp_send_headers`, `frankenphp.c:1148-1174`), a field of
+        // (`frankenphp_send_headers`, `frankenphp.c:1150-1176`), a field of
         // a struct PHP keeps alive for the whole call -- taking a field's
         // address is always non-null, so `headers` itself needs no null
         // check here (unlike a context/sink, which upstream and this port
@@ -232,15 +233,35 @@ pub unsafe extern "C" fn go_write_headers(
             // SAFETY: `current` is non-null (loop guard) and, on every
             // iteration, either `(*headers).head` or a previous node's
             // `next` -- both owned by the same live `zend_llist` for the
-            // duration of this call. `data`'s first `size_of::<
-            // SapiHeaderStruct>()` bytes are exactly the `sapi_header_struct`
-            // PHP wrote there (`frankenphp.go:589-595` does the identical
-            // reinterpretation in Go: `(*C.sapi_header_struct)(unsafe.
-            // Pointer(&(current.data)))`); `data` is declared `[c_char; 1]`
-            // (the pre-C99 flexible-array-member trick, `docs/PORTING-NOTES.md`),
-            // so its *address*, not its own 1-byte extent, is what matters --
-            // C allocates each node with room for the real payload past that
-            // declared byte.
+            // duration of this call.
+            //
+            // `data` is bindgen's `[c_char; 1]` because PHP declares it
+            // `char data[1]; /* Needs to always be last in the struct */`
+            // (`Zend/zend_llist.h:25-29`, in `php-config --include-dir`) --
+            // the pre-C99 flexible-array-member idiom, so its *address*, not
+            // its declared 1-byte extent, is what the payload lives at. Two
+            // facts establish that the payload really is a whole
+            // `sapi_header_struct` and that reading one out is in-bounds:
+            //
+            // - php-src's `zend_llist_add_element` (`Zend/zend_llist.c`)
+            //   allocates each node as `pemalloc(sizeof(zend_llist_element) +
+            //   l->size - 1)` and `memcpy`s `l->size` bytes into `tmp->data`,
+            //   so a node carries exactly `l->size` payload bytes from
+            //   `data` onward;
+            // - php-src's `main/SAPI.c` initialises this particular list with
+            //   `zend_llist_init(&SG(sapi_headers).headers,
+            //   sizeof(sapi_header_struct), ...)`, so `l->size ==
+            //   sizeof(sapi_header_struct) == size_of::<SapiHeaderStruct>()`
+            //   (`main/SAPI.h:44-47`, and `SapiHeaderStruct`'s doc comment
+            //   for why the layouts match).
+            //
+            // Alignment holds because `data` sits at offset 16 in an
+            // `emalloc`'d node (`emalloc` returns at least 8-byte-aligned
+            // storage) and `align_of::<SapiHeaderStruct>() == 8`.
+            //
+            // Upstream performs the identical reinterpretation on the
+            // identical pointer (`frankenphp.go:589-595`:
+            // `(*C.sapi_header_struct)(unsafe.Pointer(&(current.data)))`).
             let header = unsafe { &*(&raw const (*current).data).cast::<SapiHeaderStruct>() };
 
             let raw: &[u8] = if header.header_len == 0 {
@@ -268,7 +289,8 @@ pub unsafe extern "C" fn go_write_headers(
                     sink.add_header(&name, value);
                 }
                 None => {
-                    // frankenphp.go:519-527. Raw bytes go straight into the
+                    // frankenphp.go:531-537 (`addHeader`'s empty-key arm).
+                    // Raw bytes go straight into the
                     // log *message* (not an attribute -- the facade's `Attr`
                     // is `String`-valued, i.e. UTF-8, and this preserves an
                     // invalid header byte-for-byte instead of lossily
@@ -317,24 +339,24 @@ pub unsafe extern "C" fn go_write_headers(
 ///
 /// Returns whether the client has disconnected, **not** whether the flush
 /// succeeded -- C calls `php_handle_aborted_connection()` when this is true
-/// (`frankenphp.c:1177-1188`).
+/// (`frankenphp.c:1178-1189`).
 #[unsafe(no_mangle)]
 pub extern "C" fn go_sapi_flush(thread_index: usize) -> c_uchar {
     CONTEXT_SLOTS.with_context_mut(thread_index, |ctx| {
         let Some(ctx) = ctx else {
-            // frankenphp.go:630-632 (`fc == nil`), and this module's doc
+            // frankenphp.go:628-630 (`fc == nil`), and this module's doc
             // comment -- already matches upstream's own nil check here, no
             // divergence needed.
             return false as c_uchar;
         };
 
         if ctx.response_sink.is_none() {
-            // frankenphp.go:634-636: nothing to flush.
+            // frankenphp.go:632-634: nothing to flush.
             return false as c_uchar;
         }
 
         if ctx.client_has_closed() && !ctx.is_done {
-            // frankenphp.go:638-640: skip the flush attempt entirely.
+            // frankenphp.go:636-638: skip the flush attempt entirely.
             return true as c_uchar;
         }
 
@@ -403,6 +425,9 @@ mod tests {
     const IDX_FLUSH_CALLS: usize = 111;
     const IDX_FLUSH_CLOSED_NOT_DONE: usize = 112;
     const IDX_FLUSH_CLOSED_DONE: usize = 113;
+    const IDX_UB_WRITE_ERROR: usize = 114;
+    const IDX_FLUSH_NOT_A_FLUSHER: usize = 115;
+    const IDX_FLUSH_IO_ERROR: usize = 116;
 
     fn fresh_context() -> RequestContext {
         RequestContext::new(String::new(), None, None, CompletionSignal::none())
@@ -582,12 +607,58 @@ mod tests {
         CONTEXT_SLOTS.set(idx, fresh_context());
 
         let mut payload = b"worker output".to_vec();
-        let result = go_ub_write(idx, payload.as_mut_ptr().cast(), payload.len());
+        let (result, records) =
+            log::capture::capture(|| go_ub_write(idx, payload.as_mut_ptr().cast(), payload.len()));
 
         CONTEXT_SLOTS.clear(idx);
 
         assert_eq!(result.r0, payload.len());
         assert!(!result.r1);
+        // frankenphp.go:475-485: the *whole* observable effect of the no-sink
+        // branch is that the discarded output reaches the log at INFO. With
+        // no assertion on the record, a body that dropped the bytes on the
+        // floor would pass.
+        assert_eq!(records.len(), 1, "got {records:?}");
+        assert_eq!(records[0].level, Level::INFO);
+        assert_eq!(records[0].message, b"worker output");
+    }
+
+    #[test]
+    fn go_ub_write_reports_zero_and_does_not_abort_on_a_write_error() {
+        let idx = IDX_UB_WRITE_ERROR;
+        let mut ctx = context_with_request();
+        let (mut sink, state) = FakeSink::new();
+        sink.next_write = Some(Err(io::Error::other("broken pipe")));
+        ctx.response_sink = Some(Box::new(sink));
+        CONTEXT_SLOTS.set(idx, ctx);
+
+        let mut payload = b"hello world".to_vec();
+        let (result, records) =
+            log::capture::capture(|| go_ub_write(idx, payload.as_mut_ptr().cast(), payload.len()));
+
+        CONTEXT_SLOTS.clear(idx);
+
+        assert_eq!(
+            state.lock().unwrap().writes,
+            vec![payload],
+            "the write must still have been attempted"
+        );
+        assert_eq!(
+            result.r0, 0,
+            "a write error carries no partial count, so nothing was written"
+        );
+        assert!(
+            !result.r1,
+            "frankenphp.go:467-473: a write error is not a client abort -- \
+             reporting one here would make C call \
+             php_handle_aborted_connection() and bail out the script"
+        );
+        assert!(
+            records.is_empty(),
+            "the write error is logged at DEBUG, which is below MIN_LEVEL and \
+             so emits nothing; anything captured here means it took a louder \
+             branch. got {records:?}"
+        );
     }
 
     #[test]
@@ -807,16 +878,25 @@ mod tests {
     fn go_write_headers_returns_false_when_the_request_is_already_done() {
         let idx = IDX_WRITE_HEADERS_DONE;
         let mut ctx = context_with_request();
-        ctx.response_sink = Some(Box::new(FakeSink::new().0));
+        let (sink, state) = FakeSink::new();
+        ctx.response_sink = Some(Box::new(sink));
         ctx.close_context();
         CONTEXT_SLOTS.set(idx, ctx);
 
-        let (_nodes, mut list) = build_llist(&[]);
+        let (_nodes, mut list) = build_llist(&[b"X-Foo: bar"]);
         // SAFETY: see the identical justification above.
         let result = unsafe { go_write_headers(idx, 200, &mut list) };
         CONTEXT_SLOTS.clear(idx);
 
         assert!(!result);
+        let state = state.lock().unwrap();
+        assert!(
+            state.header_adds.is_empty() && state.statuses.is_empty(),
+            "returning false must mean nothing reached the sink, not just an \
+             unlucky return value: got {:?} / {:?}",
+            state.header_adds,
+            state.statuses
+        );
     }
 
     #[test]
@@ -896,13 +976,75 @@ mod tests {
     fn go_sapi_flush_calls_the_sinks_flush_and_returns_false_on_success() {
         let idx = IDX_FLUSH_CALLS;
         let mut ctx = context_with_request();
-        ctx.response_sink = Some(Box::new(FakeSink::new().0));
+        let (sink, state) = FakeSink::new();
+        ctx.response_sink = Some(Box::new(sink));
         CONTEXT_SLOTS.set(idx, ctx);
 
         let result = go_sapi_flush(idx);
         CONTEXT_SLOTS.clear(idx);
 
         assert_eq!(result, 0);
+        // Flushing is the entire point of this callback, and the return value
+        // deliberately does not report it (it reports client disconnection).
+        // Without this assertion a body that never touched the sink at all
+        // would pass, which is exactly what a reviewer proved by stubbing the
+        // `sink.flush()` call out and watching the suite stay green.
+        assert_eq!(
+            state.lock().unwrap().flush_calls,
+            1,
+            "the sink's flush must actually have been called"
+        );
+    }
+
+    #[test]
+    fn go_sapi_flush_warns_when_the_sink_is_not_a_flusher_and_still_returns_false() {
+        // frankenphp.go:651-654: `http.ErrNotSupported` is the one flush error
+        // upstream considers loud enough for WARN.
+        let idx = IDX_FLUSH_NOT_A_FLUSHER;
+        let mut ctx = context_with_request();
+        let (mut sink, state) = FakeSink::new();
+        sink.next_flush = Some(Err(FlushError::NotAFlusher));
+        ctx.response_sink = Some(Box::new(sink));
+        CONTEXT_SLOTS.set(idx, ctx);
+
+        let (result, records) = log::capture::capture(|| go_sapi_flush(idx));
+        CONTEXT_SLOTS.clear(idx);
+
+        assert_eq!(state.lock().unwrap().flush_calls, 1);
+        assert_eq!(result, 0, "a flush error is not a client disconnect");
+        assert_eq!(records.len(), 1, "got {records:?}");
+        assert_eq!(records[0].level, Level::WARN);
+        assert!(
+            records[0]
+                .message
+                .starts_with(b"the current responseWriter is not a flusher"),
+            "got {:?}",
+            String::from_utf8_lossy(&records[0].message)
+        );
+    }
+
+    #[test]
+    fn go_sapi_flush_does_not_warn_for_an_ordinary_io_error_and_still_returns_false() {
+        // frankenphp.go:655-657: every other flush error is DEBUG, not WARN --
+        // a client that hung up mid-response must not produce an operator-
+        // visible "please report this issue" line on every request.
+        let idx = IDX_FLUSH_IO_ERROR;
+        let mut ctx = context_with_request();
+        let (mut sink, state) = FakeSink::new();
+        sink.next_flush = Some(Err(FlushError::Io(io::Error::other("broken pipe"))));
+        ctx.response_sink = Some(Box::new(sink));
+        CONTEXT_SLOTS.set(idx, ctx);
+
+        let (result, records) = log::capture::capture(|| go_sapi_flush(idx));
+        CONTEXT_SLOTS.clear(idx);
+
+        assert_eq!(state.lock().unwrap().flush_calls, 1);
+        assert_eq!(result, 0, "a flush error is not a client disconnect");
+        assert!(
+            records.is_empty(),
+            "DEBUG is below MIN_LEVEL, so this arm must emit nothing; a record \
+             here means the error took the NotAFlusher WARN arm. got {records:?}"
+        );
     }
 
     #[test]
@@ -914,7 +1056,8 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut ctx =
             RequestContext::new(String::new(), None, Some(request), CompletionSignal::none());
-        ctx.response_sink = Some(Box::new(FakeSink::new().0));
+        let (sink, state) = FakeSink::new();
+        ctx.response_sink = Some(Box::new(sink));
         CONTEXT_SLOTS.set(idx, ctx);
 
         let result = go_sapi_flush(idx);
@@ -923,6 +1066,12 @@ mod tests {
         assert_eq!(
             result, 1,
             "closed and not done must report true (client disconnected)"
+        );
+        assert_eq!(
+            state.lock().unwrap().flush_calls,
+            0,
+            "frankenphp.go:636-638 returns before flushing -- the sink must not \
+             be touched once the client is known to be gone"
         );
     }
 
@@ -935,7 +1084,8 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let mut ctx =
             RequestContext::new(String::new(), None, Some(request), CompletionSignal::none());
-        ctx.response_sink = Some(Box::new(FakeSink::new().0));
+        let (sink, state) = FakeSink::new();
+        ctx.response_sink = Some(Box::new(sink));
         ctx.close_context();
         CONTEXT_SLOTS.set(idx, ctx);
 
@@ -943,5 +1093,10 @@ mod tests {
         CONTEXT_SLOTS.clear(idx);
 
         assert_eq!(result, 0, "a done request must not report a fresh abort");
+        assert_eq!(
+            state.lock().unwrap().flush_calls,
+            1,
+            "an already-done request still falls through to the real flush"
+        );
     }
 }
