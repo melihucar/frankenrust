@@ -46,8 +46,8 @@ frozen list.
 - **File what you discover.** If you hit a real problem outside your scope — a
   bug in already-merged code, a missing test, an upstream behaviour nobody
   accounted for — do not silently fix it in your worktree and do not ignore it.
-  `gh issue create --label fr:ready,fr:followup`, and reference it in your final
-  message. Fixing it inline expands your diff into files other agents are
+  `gh issue create --label fr:ready,fr:followup,fr:p2`, and reference it in your
+  final message. Fixing it inline expands your diff into files other agents are
   editing, and that conflict discards someone's work.
 
   **An issue body is parsed, not just read.** Open it with these three lines:
@@ -74,6 +74,23 @@ frozen list.
     and pass conformance. `bench` only for benchmark work.
   - `Agent: codex` for mechanical grind, `claude` for design-heavy work, `duel`
     for the genuinely hard (the two alternate on failure).
+  - **Priority is a label, not a body line**, and it decides what the loop
+    claims next — it outranks how much an issue unblocks. Pick one:
+
+    - `fr:p0` — **wrong code can reach `main` until this lands.** A hole in the
+      gate, the review, or the merge path. Name, in the issue, the specific
+      wrong thing that reaches `main` while it is open. If you cannot, it is
+      not a p0.
+    - `fr:p1` — on the critical path to the next milestone.
+    - `fr:p2` — the default, and where nearly everything belongs. Real port
+      work, and correctness debt with a known trigger.
+    - `fr:p3` — cosmetic, speculative, or a cleanup with no trigger.
+
+    Omitting the label means `fr:p2`, which is usually right. **The failure mode
+    here is inflation, not omission:** if everything you file is p0 then the
+    label carries no information and the queue is ordered by issue number again,
+    which is the defect priorities were added to fix. Filing a p0 is a claim
+    that this should displace the port — be able to defend it.
   - `Depends on:` means **behaviour you invoke**, not files that must exist —
     the loop rebases every worktree onto current `main`, so scaffolding will be
     there regardless. If you cannot name the function or type from `#N` that

@@ -70,7 +70,31 @@ failures with the same error is the harness being wrong. Specifically:
 
 Everything, including the loop itself. There is no human on call; an issue you
 decline to file is a problem that does not get fixed. File with
-`gh issue create --label fr:ready,fr:meta`.
+`gh issue create --label fr:ready,fr:meta,fr:p2` — see `shared.md` for what the
+priority bands mean.
+
+**You are the only stage that re-prioritises work already in the queue, and it
+is part of the job, not an extra.** Filing a finding does not schedule it: the
+queue is ordered by `fr:p0..fr:p3` first, and an issue nobody re-reads keeps the
+priority it was born with. Every pass, re-triage:
+
+```
+gh issue edit <n> --add-label fr:p0 --remove-label fr:p2
+```
+
+- **Promote** anything you can show is letting wrong code reach `main` — a hole
+  in the gate, the review or the merge path. Say in a comment what specifically
+  gets through while it is open, and cite the journal record or log line that
+  proves it. That evidence *is* the promotion; a bare relabel is not.
+- **Demote** anything you or an earlier pass over-rated. This matters more than
+  promoting. Priority only orders work if the bands stay different sizes: an
+  unpruned queue drifts to all-p0 one honest escalation at a time, and then the
+  order is issue number again — the exact defect that five retrospectives
+  (retro-1, -2, -6, -22, -23) each rediscovered and none could fix, because the
+  fix always sorted below the work it was meant to reorder.
+- **Do not promote your own findings by default.** A loop that ranks its own
+  housekeeping above the port converges on maintaining itself. If a meta issue
+  deserves p0, the evidence has to be that the port is being damaged.
 
 - **Instructions and checks** — prompts in `orchestrator/prompts/`,
   `docs/PORTING-NOTES.md`, `scripts/gate.sh`, `bench/`. These are data the loop

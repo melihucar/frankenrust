@@ -2008,6 +2008,78 @@ def check_rolling_pool_abandons_safely() -> int:
     return bad
 
 
+def check_priority_leads_the_queue() -> int:
+    """A priority label must outrank dependants, not merely break ties.
+
+    The queue order was a closure inside claimable(), so the only way to observe
+    it was to call GitHub, and no check ever did. That is why five separate
+    retrospectives (retro-1, -2, -6, -22, -23) each rediscovered the same
+    starvation by hand and none of them could pin it: #25 sat ready and
+    unclaimed for 33.5h with nothing able to assert it should not have.
+
+    The load-bearing case is a p0 that unblocks nothing against a p2 that
+    unblocks ten. If priority were the last term rather than the first, that
+    comes out backwards -- so this single assertion is what proves the label
+    actually schedules work rather than annotating it.
+
+    The other half matters as much: untriaged must sort exactly as it did before
+    priorities existed. 92 open issues carry no priority label, and a default
+    that sank them would have handed the whole port to whatever got labelled
+    first.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    try:
+        import gh
+    except Exception as exc:                     # noqa: BLE001 - reported, not raised
+        return fail(f"cannot import orchestrator/gh.py to check queue order: {exc!r}")
+
+    if not hasattr(gh, "rank_key"):
+        return fail("gh.py has no module-level rank_key() — queue order is "
+                    "unobservable again, and only GitHub can answer what runs next")
+
+    def issue(n: int, labels: list[str]):
+        return gh.Issue(number=n, title="", body="", labels=labels)
+
+    def order(issues, dependants):
+        return [i.number for i in sorted(issues, key=lambda i: gh.rank_key(i, dependants))]
+
+    bad = 0
+
+    got = order([issue(2, ["fr:ready"]), issue(1, ["fr:ready", "fr:p0"])], {2: 10})
+    if got != [1, 2]:
+        bad += fail(f"a p0 unblocking nothing lost to a p2 unblocking ten: {got} — "
+                    "priority is decorating the queue, not ordering it")
+
+    got = order([issue(1, ["fr:p3"]), issue(2, ["fr:p0"])], {1: 99})
+    if got != [2, 1]:
+        bad += fail(f"a p3 with 99 dependants outranked a p0 leaf: {got}")
+
+    if gh.priority(issue(9, ["fr:ready"])) != gh.priority(issue(9, ["fr:ready", "fr:p2"])):
+        bad += fail("an untriaged issue does not sort as fr:p2 — the 92 issues "
+                    "that predate priorities have silently changed position")
+
+    got = order([issue(5, ["fr:ready"]), issue(3, ["fr:ready", "fr:meta"]),
+                 issue(4, ["fr:ready"])], {5: 1})
+    if got != [5, 4, 3]:
+        bad += fail(f"untriaged issues no longer order by dependants, then "
+                    f"housekeeping, then number: {got}")
+
+    if gh.priority(issue(1, ["fr:p3", "fr:p0"])) != 0:
+        bad += fail("contradictory priority labels do not resolve to the "
+                    "strongest — a half-finished downgrade reads as a downgrade")
+
+    if gh.priority(issue(1, ["fr:p9"])) != gh.P_DEFAULT:
+        bad += fail("a label that merely looks like a priority is being parsed "
+                    "as one")
+
+    declared = set(gh.PRIORITY_LABELS) - set(gh.LABELS)
+    if declared:
+        bad += fail(f"{sorted(declared)} rank the queue but are absent from "
+                    "LABELS, so ensure_labels() never creates them and every "
+                    "attempt to set one fails against a label that does not exist")
+    return bad
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
@@ -2018,6 +2090,7 @@ if __name__ == "__main__":
              + check_silent_reviewer_is_not_a_pass() + check_pre_implementer_stages_restore()
              + check_unmerged_work_survives_reclaim()
              + check_filing_contract_is_stated() + check_reviewer_restore()
+             + check_priority_leads_the_queue()
              + check_verdict_parsing() + check_record_repairs_torn_journal()
              + check_retro_cycle_survives_restart()
              + check_retro_callers_derive_the_cycle()

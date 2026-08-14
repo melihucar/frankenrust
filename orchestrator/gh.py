@@ -65,6 +65,14 @@ LABELS = {
     # them; a merge touching loop.py or gh.py makes the loop re-exec into the
     # new code at the next batch boundary (see loop.py: restart_into_new_code).
     "fr:meta": ("d4c5f9", "Improvement to the loop itself"),
+    # Priority is the loop's own lever on what it does next, and it leads
+    # rank_key() -- a priority that only breaks ties is a comment, not a
+    # priority. Untriaged is P_DEFAULT (`fr:p2`), so the queue that existed
+    # before these labels keeps exactly the order it had.
+    "fr:p0": ("e11d21", "Wrong code can reach main until this lands"),
+    "fr:p1": ("eb6420", "On the critical path to the next milestone"),
+    "fr:p2": ("fef2c0", "Normal -- the default when untriaged"),
+    "fr:p3": ("ededed", "Cosmetic or speculative; do it when idle"),
 }
 
 ISSUE_RE = re.compile(r"#(\d+)")
@@ -201,8 +209,74 @@ def closed_numbers() -> set[int]:
     return {i.number for i in fetch(state="closed")}
 
 
+PRIORITY_LABELS = ("fr:p0", "fr:p1", "fr:p2", "fr:p3")
+P_DEFAULT = 2
+
+
+def priority(i: Issue) -> int:
+    """Declared priority, or P_DEFAULT when nobody has triaged the issue.
+
+    Lower wins, like every other term in rank_key(). The default is the middle
+    of the range rather than the bottom on purpose: 92 issues predate these
+    labels, and reading "untriaged" as "unimportant" would bury the entire
+    existing port behind whatever happened to get labelled first.
+
+    Two priority labels on one issue is a mistake rather than a state, and the
+    strongest is the safe reading -- an issue carrying both p0 and p3 is far
+    more likely to be a p0 someone began downgrading than the reverse.
+    """
+    declared = [PRIORITY_LABELS.index(l) for l in i.labels if l in PRIORITY_LABELS]
+    return min(declared) if declared else P_DEFAULT
+
+
+def rank_key(i: Issue, dependants: dict[int, int]) -> tuple[int, int, int, int]:
+    """Sort key for the claim queue; lowest wins.
+
+    Priority leads, and everything after it is the previous ordering unchanged:
+    how much the issue unblocks, then housekeeping, then filing order.
+
+    Module-level, and taking `dependants` explicitly, so the queue order can be
+    observed without a network round trip. This was a closure inside claimable()
+    and therefore untestable except against live GitHub, which is why the
+    starvation it produced was found by five retrospectives and never by a check.
+    """
+    housekeeping = 1 if {"fr:followup", "fr:meta"} & set(i.labels) else 0
+    return (priority(i), -dependants.get(i.number, 0), housekeeping, i.number)
+
+
+def set_priority(n: int, level: int) -> bool:
+    """Move an issue to a priority band, clearing whichever one it held.
+
+    Adding `fr:p0` without removing `fr:p2` leaves both on the issue. priority()
+    resolves that safely, but the queue a human reads would stop matching the
+    queue the loop sees -- the exact divergence sync_waiting() exists to
+    prevent. Only labels actually present are removed, because `gh issue edit
+    --remove-label` errors on a label the issue does not carry and would fail
+    the whole edit, silently leaving the priority unset.
+    """
+    if not 0 <= level < len(PRIORITY_LABELS):
+        return False
+    rc, out = gh(["issue", "view", str(n), "--json", "labels"])
+    if rc != 0:
+        return False
+    try:
+        held = {l["name"] for l in json.loads(out).get("labels", [])}
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return False
+    want = PRIORITY_LABELS[level]
+    stale = sorted((held & set(PRIORITY_LABELS)) - {want})
+    args = ["issue", "edit", str(n), "--add-label", want]
+    if stale:
+        args += ["--remove-label", ",".join(stale)]
+    rc, _ = gh(args)
+    return rc == 0
+
+
 def claimable() -> list[Issue]:
     """Ready issues whose dependencies are all closed, most valuable first.
+
+    Ordering is rank_key(): priority first, then how much the issue unblocks,
+    then housekeeping, then filing order.
 
     Order used to be whatever `gh issue list` returned, which is newest-first.
     Issue numbers only increase and agents file followups while they work, so
@@ -227,11 +301,7 @@ def claimable() -> list[Issue]:
         for d in i.deps:
             dependants[d] = dependants.get(d, 0) + 1
 
-    def rank(i: Issue) -> tuple[int, int, int]:
-        housekeeping = 1 if {"fr:followup", "fr:meta"} & set(i.labels) else 0
-        return (-dependants.get(i.number, 0), housekeeping, i.number)
-
-    return sorted(ready, key=rank)
+    return sorted(ready, key=lambda i: rank_key(i, dependants))
 
 
 def sync_waiting() -> tuple[int, int]:
