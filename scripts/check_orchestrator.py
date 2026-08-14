@@ -686,6 +686,73 @@ def check_verdict_parsing() -> int:
     return bad
 
 
+def check_record_repairs_torn_journal() -> int:
+    """A short write to events.jsonl must cost exactly one record, not two.
+
+    #104: `record()` opens the journal in plain append mode. If a previous
+    write landed short -- ENOSPC is the realistic trigger, and this loop
+    already emits `low_disk` because the disk does fill -- the file is left
+    mid-token with no trailing newline. Appending onto that fragment welds
+    the *next*, complete record onto its tail, so a line-by-line reader (the
+    retrospective) discards both: the one that was already lost, and the one
+    that just arrived. The fix isolates the fragment on its own line before
+    writing anything else and says so with a `journal_torn` event, so this
+    checks that exactly the fragment -- not the record after it -- ends up
+    unreadable.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    bad = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        logs = Path(tmp)
+        journal = logs / "events.jsonl"
+        # A write that stopped mid-token: no closing brace, no trailing '\n'.
+        fragment = '{"ts": "2026-08-14T00:00:00", "event": "retrospective"'
+        journal.write_text(fragment)
+
+        real_journal, real_logs = loop.JOURNAL, loop.LOGS
+        loop.JOURNAL, loop.LOGS = journal, logs
+        try:
+            loop.record("merged", issue=4)
+        finally:
+            loop.JOURNAL, loop.LOGS = real_journal, real_logs
+
+        lines = journal.read_text().splitlines()
+        if len(lines) != 3:
+            return bad + fail(f"expected the fragment plus a journal_torn record "
+                              f"plus the merged record (3 lines), got "
+                              f"{len(lines)}: {lines!r}")
+        if lines[0] != fragment:
+            bad += fail(f"the original fragment was rewritten, not just "
+                        f"isolated on its own line: {lines[0]!r}")
+
+        unreadable = 0
+        parsed = []
+        for line in lines:
+            try:
+                parsed.append(json.loads(line))
+            except json.JSONDecodeError:
+                unreadable += 1
+        if unreadable != 1:
+            bad += fail(f"expected exactly 1 unreadable line (the original "
+                        f"fragment); got {unreadable} of {len(lines)}: {lines!r}")
+
+        events = [r.get("event") for r in parsed]
+        if "journal_torn" not in events:
+            bad += fail(f"record() did not report the tear with a journal_torn "
+                        f"event: {lines!r}")
+        else:
+            torn = parsed[events.index("journal_torn")]
+            if torn.get("offset") != len(fragment):
+                bad += fail(f"journal_torn offset {torn.get('offset')!r} does not "
+                            f"match the fragment's length {len(fragment)}")
+        if events[-1] != "merged":
+            bad += fail(f"the merged event record() was asked to write did not "
+                        f"land as its own, final, complete line: {lines!r}")
+    return bad
+
+
 def check_retro_cycle_survives_restart() -> int:
     """The retrospective's cycle number must be re-derivable, not remembered.
 
@@ -1250,7 +1317,8 @@ if __name__ == "__main__":
              + check_silent_reviewer_is_not_a_pass() + check_pre_implementer_stages_restore()
              + check_unmerged_work_survives_reclaim()
              + check_filing_contract_is_stated() + check_reviewer_restore()
-             + check_verdict_parsing() + check_retro_cycle_survives_restart()
+             + check_verdict_parsing() + check_record_repairs_torn_journal()
+             + check_retro_cycle_survives_restart()
              + check_retro_callers_derive_the_cycle()
              + check_retro_no_clobber() + check_retro_cycle_claim_is_atomic()
              + check_retro_orphaned_claim_does_not_skew_forever()

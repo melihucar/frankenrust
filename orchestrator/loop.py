@@ -156,6 +156,28 @@ _journal_lock = threading.Lock()
 JOURNAL = LOGS / "events.jsonl"
 
 
+def _torn_journal_offset() -> int | None:
+    """Byte length of JOURNAL if it ends mid-record, else None.
+
+    A short write -- ENOSPC is the realistic trigger, and this loop already
+    emits `low_disk` because the disk does fill -- leaves the file mid-token
+    with no trailing newline. Appending onto that in the usual "a" mode would
+    weld the *next*, complete record onto the tail of the broken one, so a
+    line-by-line reader discards both instead of just the one that was
+    already lost.
+    """
+    if not JOURNAL.exists():
+        return None
+    size = JOURNAL.stat().st_size
+    if size == 0:
+        return None
+    with JOURNAL.open("rb") as fh:
+        fh.seek(-1, os.SEEK_END)
+        if fh.read(1) == b"\n":
+            return None
+    return size
+
+
 def record(event: str, **fields) -> None:
     """Append a structured event.
 
@@ -166,8 +188,23 @@ def record(event: str, **fields) -> None:
     """
     rec = {"ts": now(), "event": event, **fields}
     LOGS.mkdir(parents=True, exist_ok=True)
-    with _journal_lock, JOURNAL.open("a") as fh:
-        fh.write(json.dumps(rec) + "\n")
+    with _journal_lock:
+        tear = _torn_journal_offset()
+        # One open()/close() per call, not one write(): close() is what
+        # flushes to disk, and restart_into_new_code() hands off via
+        # os.execve, which replaces the process image without running
+        # Python's normal buffer flush. A write that outlived close() would
+        # silently vanish, so everything below must land before this `with`
+        # block exits.
+        with JOURNAL.open("a") as fh:
+            if tear is not None:
+                # Isolate the fragment on its own line before anything else
+                # touches the file, then say so in the journal itself -- a
+                # hole the journal reports is recoverable evidence.
+                fh.write("\n")
+                fh.write(json.dumps({"ts": now(), "event": "journal_torn",
+                                      "offset": tear}) + "\n")
+            fh.write(json.dumps(rec) + "\n")
 
 
 def codex_ok() -> bool:
