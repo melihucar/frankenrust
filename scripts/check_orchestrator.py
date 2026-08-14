@@ -712,13 +712,19 @@ def check_retro_cycle_survives_restart() -> int:
             {"ts": "t", "event": "gate_fail", "issue": 2},
             {"ts": "t", "event": "retrospective", "cycle": 2},
         ]) + "\n")
+        # An empty, isolated LOGS: _next_retro_cycle() also looks at disk (see
+        # check_retro_orphaned_claim_does_not_skew_forever), so it must not pick
+        # up whatever this developer's own worktree happens to have lying
+        # around in the real orchestrator/logs/.
+        logs = Path(tmp) / "logs"
+        logs.mkdir()
 
-        real_journal = loop.JOURNAL
-        loop.JOURNAL = journal
+        real_journal, real_logs = loop.JOURNAL, loop.LOGS
+        loop.JOURNAL, loop.LOGS = journal, logs
         try:
             got = loop._next_retro_cycle()
         finally:
-            loop.JOURNAL = real_journal
+            loop.JOURNAL, loop.LOGS = real_journal, real_logs
         if got != 3:
             bad += fail(f"_next_retro_cycle() read a journal with two "
                         f"retrospective events and returned {got}, want 3")
@@ -728,6 +734,7 @@ def check_retro_cycle_survives_restart() -> int:
             "from pathlib import Path\n"
             "import loop\n"
             f"loop.JOURNAL = Path({str(journal)!r})\n"
+            f"loop.LOGS = Path({str(logs)!r})\n"
             "print(loop._next_retro_cycle())\n"
         )
         p = subprocess.run([sys.executable, "-c", script], capture_output=True,
@@ -899,6 +906,66 @@ def check_retro_cycle_claim_is_atomic() -> int:
         loop.log, loop.record = real_log, real_record
 
 
+def check_retro_orphaned_claim_does_not_skew_forever() -> int:
+    """A pass killed after claiming a cycle must not poison every pass after it.
+
+    `_claim_retro_cycle` pre-creates a cycle's report file before the agent
+    that fills it in has run. `restart_into_new_code()` can kill exactly that
+    pass: it calls `os.execve` without joining the retro thread, and `execve`
+    destroys every thread but the caller's without running so much as a
+    `finally`, so nothing ever unclaims the slot or records a `retrospective`
+    event for it. A derivation that only counts JOURNAL never finds out --
+    every later pass asks for the same already-claimed number, gets bumped
+    forward by `_claim_retro_cycle`, and logs a `retro_clobber_avoided` that
+    is not describing a real disagreement, forever.
+
+    Simulates exactly that: two successful retrospectives in JOURNAL, a third
+    that claimed `retro-3.md` and never got further. The next call must jump
+    straight to 4, and claiming that 4 must not itself bump again -- the
+    orphan gets absorbed exactly once.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    events: list[tuple[str, dict]] = []
+    real_record, real_log = loop.record, loop.log
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = Path(tmp) / "events.jsonl"
+            journal.write_text("\n".join(json.dumps(r) for r in [
+                {"ts": "t", "event": "retrospective", "cycle": 1},
+                {"ts": "t", "event": "retrospective", "cycle": 2},
+            ]) + "\n")
+            logs = Path(tmp) / "logs"
+            logs.mkdir()
+            (logs / "retro-3.md").touch()   # the orphaned claim; empty, no journal entry
+
+            real_journal, real_logs = loop.JOURNAL, loop.LOGS
+            loop.JOURNAL, loop.LOGS = journal, logs
+            try:
+                got = loop._next_retro_cycle()
+                bad = 0
+                if got != 4:
+                    bad += fail(f"_next_retro_cycle() with 2 journal events and an "
+                                f"orphaned retro-3.md on disk returned {got}, want 4 "
+                                "-- the claim from the killed pass was never absorbed")
+                used = loop._claim_retro_cycle(got)
+                if used != got:
+                    bad += fail(f"_claim_retro_cycle({got}) used {used}; the orphan "
+                                "should already be accounted for by _next_retro_cycle, "
+                                "so claiming its answer must succeed on the first try")
+                if events:
+                    bad += fail(f"claiming the derived cycle logged {events}; a "
+                                "correctly-derived cycle should never collide")
+            finally:
+                loop.JOURNAL, loop.LOGS = real_journal, real_logs
+            return bad
+    finally:
+        loop.record, loop.log = real_record, real_log
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
@@ -911,4 +978,5 @@ if __name__ == "__main__":
              + check_filing_contract_is_stated() + check_reviewer_restore()
              + check_verdict_parsing() + check_retro_cycle_survives_restart()
              + check_retro_callers_derive_the_cycle()
-             + check_retro_no_clobber() + check_retro_cycle_claim_is_atomic() else 0)
+             + check_retro_no_clobber() + check_retro_cycle_claim_is_atomic()
+             + check_retro_orphaned_claim_does_not_skew_forever() else 0)

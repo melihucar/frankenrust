@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import shutil
 import sys
@@ -1036,8 +1037,53 @@ def cmd_seed() -> int:
     return 0 if issues else 1
 
 
+def _retro_artifacts(cycle: int) -> list[Path]:
+    return [
+        LOGS / f"retro-{cycle}.md",
+        LOGS / "retro" / f"prompt.r{cycle}.md",
+        LOGS / "retro" / f"claude.r{cycle}.log",
+        LOGS / "retro" / f"claude.r{cycle}.final.txt",
+    ]
+
+
+_RETRO_ARTIFACT_PATTERNS = [
+    (lambda: LOGS, re.compile(r"^retro-(\d+)\.md$")),
+    (lambda: LOGS / "retro", re.compile(r"^prompt\.r(\d+)\.md$")),
+    (lambda: LOGS / "retro", re.compile(r"^claude\.r(\d+)\.log$")),
+    (lambda: LOGS / "retro", re.compile(r"^claude\.r(\d+)\.final\.txt$")),
+]
+
+
+def _highest_retro_cycle_claimed() -> int:
+    """The largest cycle number with any artifact on disk, or 0 if none.
+
+    `_claim_retro_cycle` reserves a cycle by creating its report file before
+    the agent that fills it in has run. If that pass is the one
+    `restart_into_new_code()` kills -- `os.execve` tears down every thread but
+    the caller's without running so much as a `finally`, so nothing in
+    `retrospective()` gets a chance to give the slot back -- the claim is real
+    but JOURNAL never learns about it: no `retrospective` event is ever
+    recorded for that cycle. `_next_retro_cycle()` folds this in alongside the
+    journal count so an orphaned claim like that is absorbed once, by the very
+    next caller, instead of leaving the journal permanently one cycle behind
+    what disk actually holds -- which would otherwise make every retrospective
+    after it collide with the claimed slot and log a `retro_clobber_avoided`
+    that is not describing a real disagreement.
+    """
+    highest = 0
+    for dir_fn, pattern in _RETRO_ARTIFACT_PATTERNS:
+        d = dir_fn()
+        if not d.exists():
+            continue
+        for p in d.iterdir():
+            m = pattern.match(p.name)
+            if m:
+                highest = max(highest, int(m.group(1)))
+    return highest
+
+
 def _next_retro_cycle() -> int:
-    """The count of `retrospective` events already in JOURNAL, plus one.
+    """One past the highest cycle either JOURNAL or disk already knows about.
 
     Not a local counter: `retro_thread()` used to keep `n` as a plain variable,
     which lives only in that thread's memory. `restart_into_new_code()` stops
@@ -1047,28 +1093,23 @@ def _next_retro_cycle() -> int:
     retrospective that already owned that name. JOURNAL is a file, so it
     survives the restart, and re-deriving the count from it every time means a
     fresh process reads back the same number the old one would have used next.
+
+    The journal count alone is not enough: it only grows when a pass finishes,
+    but `_claim_retro_cycle` reserves a slot before the pass runs. Taking the
+    max against `_highest_retro_cycle_claimed()` keeps the two from skewing
+    apart when a pass is killed mid-flight -- see that function's docstring.
     """
-    if not JOURNAL.exists():
-        return 1
     n = 0
-    with JOURNAL.open() as fh:
-        for line in fh:
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if rec.get("event") == "retrospective":
-                n += 1
-    return n + 1
-
-
-def _retro_artifacts(cycle: int) -> list[Path]:
-    return [
-        LOGS / f"retro-{cycle}.md",
-        LOGS / "retro" / f"prompt.r{cycle}.md",
-        LOGS / "retro" / f"claude.r{cycle}.log",
-        LOGS / "retro" / f"claude.r{cycle}.final.txt",
-    ]
+    if JOURNAL.exists():
+        with JOURNAL.open() as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("event") == "retrospective":
+                    n += 1
+    return max(n, _highest_retro_cycle_claimed()) + 1
 
 
 def _claim_retro_cycle(wanted: int) -> int:
