@@ -1210,6 +1210,15 @@ def _prev_retro_through() -> int:
     return highest
 
 
+def _report_state(p: Path) -> tuple[int, int] | None:
+    """(size, mtime_ns) of a retrospective report, or None if it is absent."""
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        return None
+    return st.st_size, st.st_mtime_ns
+
+
 def retrospective(cycle: int | str) -> None:
     """Diagnose the loop, not the issues, and file fixes for itself."""
     if not JOURNAL.exists():
@@ -1234,6 +1243,20 @@ def retrospective(cycle: int | str) -> None:
         # empty` does not, so a torn or damaged line costs this command
         # nothing and it keeps reading -- matching what `through` already
         # tolerates on the code side.
+        #
+        # `tail` comes FIRST, and the order is the whole point: `through` is a
+        # physical line count of events.jsonl, and only `tail` reading the file
+        # directly counts in those units. Piped the other way round, `tail`
+        # would be skipping lines of jq's pretty-printed *output* -- roughly
+        # five per record -- so the agent would be handed the journal from
+        # about line N/5 onward, starting mid-record on a fragment that is not
+        # valid JSON, while the prompt told it the first N lines were already
+        # analysed. #105's own spec prescribed that order; it contradicts the
+        # same item's requirement that the agent get the slice the code
+        # recorded, so this implements the requirement (see the note on #105).
+        # `jq -Rc ... | tail` is not a fix either: compact output is 1:1 with
+        # input only until `fromjson?` drops a damaged line, after which the
+        # two drift apart by the number of tears.
         slice_note = (
             "\n# Evidence already analysed\n\n"
             f"A previous retrospective analysed orchestrator/logs/events.jsonl "
@@ -1241,23 +1264,39 @@ def retrospective(cycle: int | str) -> None:
             "line, though you may still look back further if a new event "
             "only makes sense against an old one. To read just the new "
             "slice, tolerating a damaged line instead of stopping at it:\n\n"
-            "```sh\njq -R 'fromjson? // empty' orchestrator/logs/events.jsonl "
-            f"| tail -n +{prev_through + 1}\n```\n"
+            f"```sh\ntail -n +{prev_through + 1} orchestrator/logs/events.jsonl "
+            "| jq -R 'fromjson? // empty'\n```\n"
         )
     p = "\n".join([(PROMPTS / "shared.md").read_text(),
                     (PROMPTS / "retrospective.md").read_text(),
                     f"\n# This is retrospective {cycle}. Write to "
                     f"orchestrator/logs/retro-{cycle}.md\n",
                     slice_note])
+    report = LOGS / f"retro-{cycle}.md"
+    # What the report looked like before this pass ran, so that "non-empty
+    # afterwards" can only be satisfied by bytes *this* pass produced. For a
+    # numbered cycle _claim_retro_cycle() has just created the file empty, so
+    # this is already true; the "final" cycle is not a number and skips that
+    # claim entirely (see the isinstance check above). orchestrator/logs/ is
+    # gitignored and nothing ever cleans it -- events.jsonl surviving across
+    # runs is load-bearing for _next_retro_cycle() -- and scripts/supervise.sh
+    # restarts cmd_run, which ends in retrospective("final"), so a non-empty
+    # retro-final.md from an earlier run is simply still sitting there. Without
+    # this snapshot it would satisfy the report check on behalf of a pass that
+    # produced nothing, and that pass would claim the whole journal as
+    # analysed. Comparing states rather than deleting keeps the older run's
+    # findings on disk.
+    before = _report_state(report)
     _, rc, text = invoke("claude", ROOT, p, LOGS / "retro", f"r{cycle}", role="critic")
     # Only a pass that demonstrably produced analysis may advance the
     # watermark. invoke() drops the error reason _final_text() returns
     # alongside its text (see _final_text()/invoke()), so an API-error result
-    # can arrive as non-empty text with rc == 0. The report file existing and
-    # non-empty is the check that cannot lie about that: it is the one thing
-    # only a real analysis pass produces.
-    report = LOGS / f"retro-{cycle}.md"
-    if rc == 0 and report.exists() and report.stat().st_size > 0 and text.strip():
+    # can arrive as non-empty text with rc == 0. The report being non-empty
+    # *and* changed by this pass is the check that cannot lie about that: it
+    # is the one thing only a real analysis pass produces.
+    after = _report_state(report)
+    wrote_report = after is not None and after[0] > 0 and after != before
+    if rc == 0 and wrote_report and text.strip():
         record("retrospective", cycle=cycle, through=through)
     else:
         # Still counted -- _next_retro_cycle() must not hand out this number
