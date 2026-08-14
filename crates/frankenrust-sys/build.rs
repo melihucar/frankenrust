@@ -371,6 +371,20 @@ fn main() {
         .allowlist_function("__zval_empty_string__")
         .allowlist_function("__zval_arr__")
         .allowlist_function("__zend_new_array__")
+        // zval type tags (`Zend/zend_types.h`, `IS_UNDEF 0` .. `IS_ARRAY 7`) and
+        // the packed-array flag (`Zend/zend_hash.h`'s `HASH_FLAG_PACKED`). Needed
+        // by the zend_array/zval walkers ported from vendor/frankenphp/types.go,
+        // which switch on `zval_get_type()`'s result and test `ht->u.flags` --
+        // issue #106's converter reads these instead of open-coding the values.
+        .allowlist_var("IS_UNDEF")
+        .allowlist_var("IS_NULL")
+        .allowlist_var("IS_FALSE")
+        .allowlist_var("IS_TRUE")
+        .allowlist_var("IS_LONG")
+        .allowlist_var("IS_DOUBLE")
+        .allowlist_var("IS_STRING")
+        .allowlist_var("IS_ARRAY")
+        .allowlist_var("HASH_FLAG_PACKED")
         .default_enum_style(bindgen::EnumVariation::Rust {
             non_exhaustive: false,
         })
