@@ -334,6 +334,16 @@ fn main() {
         // matching definitions before the nm check ever gets to see them.
         .allowlist_function("frankenphp_new_main_thread")
         .allowlist_function("frankenphp_new_php_thread")
+        .allowlist_function("frankenphp_init_persistent_string")
+        .allowlist_function("frankenphp_init_thread_metrics")
+        .allowlist_function("frankenphp_destroy_thread_metrics")
+        .allowlist_function("frankenphp_force_kill_thread")
+        .allowlist_function("frankenphp_release_thread_for_kill")
+        // PHP includes stdlib.h unconditionally. These declarations keep
+        // cross-boundary allocations paired with C's allocator without adding
+        // a second hand-written FFI surface in frankenrust-core.
+        .allowlist_function("malloc")
+        .allowlist_function("free")
         // types.h's helpers: thin wrappers this port uses instead of bindgen-ing
         // macro-only Zend APIs directly (ZVAL_* etc. are macros, invisible to
         // bindgen). Not called yet (out of scope: "any callback body beyond the

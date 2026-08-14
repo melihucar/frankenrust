@@ -9,4 +9,5 @@ description = "Safe layer: PHP thread lifecycle, request context, and the 26 go_
 name = "frankenrust_core"
 
 [dependencies]
+crossbeam-channel = "0.5"
 frankenrust-sys = { path = "../frankenrust-sys" }
