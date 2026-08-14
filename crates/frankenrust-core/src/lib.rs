@@ -7,4 +7,5 @@
 
 pub mod callbacks;
 pub mod cgi;
+pub mod context;
 pub mod state;
