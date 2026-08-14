@@ -321,12 +321,13 @@ impl SyslogLevel {
 ///
 /// # Safety
 ///
-/// `message` must be a non-NULL pointer to a NUL-terminated byte buffer,
-/// valid for reads and not mutated or freed for the duration of this call.
-/// The sole caller, `frankenphp_log_message` (`frankenphp.c:1385-1388`,
-/// wired up as `sapi_module_struct.log_message`), always supplies exactly
-/// that: PHP's own `const char *message` for the duration of one
-/// `log_message()` invocation.
+/// `message` may be NULL, which is read as an empty message rather than
+/// dereferenced -- see the NULL check in the body. If it is non-NULL it must
+/// point to a NUL-terminated byte buffer, valid for reads and not mutated or
+/// freed for the duration of this call. The sole caller,
+/// `frankenphp_log_message` (`frankenphp.c:1385-1388`, wired up as
+/// `sapi_module_struct.log_message`), always supplies exactly that: PHP's own
+/// `const char *message` for the duration of one `log_message()` invocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn go_log(_thread_index: usize, message: *mut c_char, level: c_int) {
     let syslog_level = SyslogLevel::from_raw(level);
@@ -334,13 +335,27 @@ pub unsafe extern "C" fn go_log(_thread_index: usize, message: *mut c_char, leve
     log(
         syslog_level.level(),
         || {
-            // SAFETY: this closure only runs from inside `log`, which is
-            // called synchronously and returns before `go_log` does, so
-            // `message` is still within the validity window this function's
-            // own `# Safety` section requires of its caller. We copy the
-            // bytes into an owned `Vec<u8>` here and never retain the
-            // pointer itself. PHP strings are arbitrary bytes, so this reads
-            // `.to_bytes()`, never `.to_str().unwrap()`.
+            // Upstream reads this with `C.GoString(message)`
+            // (`frankenphp.go:766`), and cgo's `GoString` yields `""` for a
+            // nil pointer -- so upstream is nil-safe here by construction and
+            // we have to check explicitly to match it. No caller in
+            // `frankenphp.c` passes NULL today (`frankenphp_log_message` is
+            // only installed as `sapi_module_struct.log_message`, and every
+            // path into it in PHP's `php_log_err_with_severity` passes an
+            // `spprintf`-built buffer), but this is the SAPI error-log hook:
+            // it fires during `MINIT`, `opcache.preload` and
+            // `php_module_shutdown()`, and losing the oracle's nil-tolerance
+            // there would turn a would-be empty log line into a segfault.
+            if message.is_null() {
+                return Vec::new();
+            }
+            // SAFETY: `message` is non-NULL by the check above. This closure
+            // only runs from inside `log`, which is called synchronously and
+            // returns before `go_log` does, so `message` is still within the
+            // validity window this function's own `# Safety` section requires
+            // of its caller. We copy the bytes into an owned `Vec<u8>` here
+            // and never retain the pointer itself. PHP strings are arbitrary
+            // bytes, so this reads `.to_bytes()`, never `.to_str().unwrap()`.
             unsafe { CStr::from_ptr(message) }.to_bytes().to_vec()
         },
         || {
@@ -370,6 +385,7 @@ pub extern "C" fn go_log_attrs(
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
+    use std::ptr;
 
     use super::*;
 
@@ -421,6 +437,36 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].level, Level::ERROR);
         assert_eq!(records[0].message, raw_message);
+    }
+
+    /// The gap two reviewers caught and zero tests did: `go_log` used to hand
+    /// `message` straight to `CStr::from_ptr`, which is undefined behaviour on
+    /// NULL, where upstream's `C.GoString(message)` (`frankenphp.go:766`)
+    /// yields `""` for a nil pointer and is therefore nil-safe by
+    /// construction. No caller in `frankenphp.c` passes NULL today, so no
+    /// conformance run can reach this -- a direct call is the only thing that
+    /// can, which is precisely why it needs a unit test rather than being left
+    /// to the contract in the `# Safety` section.
+    #[test]
+    fn go_log_tolerates_a_null_message() {
+        // SAFETY: `go_log`'s `# Safety` section admits NULL explicitly, and
+        // reads it as an empty message; that contract is what is under test.
+        let (_, records) = capture::capture(|| unsafe {
+            go_log(0, ptr::null_mut(), 3 /* err */);
+        });
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].level, Level::ERROR);
+        assert!(
+            records[0].message.is_empty(),
+            "a NULL message must log as empty, the way C.GoString(nil) does, \
+             not be dereferenced; got {:?}",
+            records[0].message
+        );
+        // The rest of the record still has to be well-formed -- a NULL
+        // message must not cost the syslog_level attribute too.
+        assert_eq!(records[0].attrs.len(), 1);
+        assert_eq!(records[0].attrs[0].value, "err");
     }
 
     #[test]

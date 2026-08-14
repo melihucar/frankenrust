@@ -188,28 +188,55 @@ mod tests {
         RequestContext::new(String::new(), None, None, CompletionSignal::none())
     }
 
+    /// Thread indices for the tests below, which are the only code in the
+    /// whole workspace that touches the process-global [`CONTEXT_SLOTS`]
+    /// (`context.rs`'s own tests each build a local `ContextSlots::new()`).
+    ///
+    /// They must be **distinct** from one another -- `cargo test` runs these
+    /// concurrently in one process against that one shared table, so two
+    /// tests sharing an index would race over whether a context is installed
+    /// -- and they must be **small**. `ContextSlots::slot`
+    /// (`context.rs:1244-1258`) grows the table *densely*, one
+    /// `Arc<Mutex<Option<RequestContext>>>` pushed per index up to the one
+    /// asked for, with no sparse map and no bound; the table is a `static`,
+    /// so nothing is ever reclaimed. A large index is therefore not a
+    /// "collision-proof" index, it is just the same collision-freedom paid
+    /// for in hundreds of megabytes: measured on the gate's own binary,
+    /// indices around 800k cost 362 MB of peak RSS for this crate's test run
+    /// against 5.5 MB with these, and a green gate cannot see the difference.
+    /// Any distinct small integers do the job identically.
+    const IDX_NO_CONTEXT: usize = 1;
+    const IDX_LIVE: usize = 2;
+    const IDX_DONE: usize = 3;
+    const IDX_TOLERATES_NO_REQUEST: usize = 4;
+
     #[test]
     fn go_is_context_done_is_true_with_no_context_installed() {
-        // An index nothing else in this file (or, so far, any other test)
-        // ever calls `CONTEXT_SLOTS.set` for.
-        assert!(go_is_context_done(800_001));
+        // An index no test ever calls `CONTEXT_SLOTS.set` for.
+        assert!(go_is_context_done(IDX_NO_CONTEXT));
     }
 
     #[test]
     fn go_is_context_done_is_false_for_a_live_context() {
-        let idx = 800_002;
+        let idx = IDX_LIVE;
         CONTEXT_SLOTS.set(idx, fresh_context());
-        assert!(!go_is_context_done(idx));
+        let done = go_is_context_done(idx);
+        // The table is a process-global `static`: without this the context
+        // and its arena stay resident for the rest of the test binary's life.
+        CONTEXT_SLOTS.clear(idx);
+        assert!(!done);
     }
 
     #[test]
     fn go_is_context_done_is_true_once_the_context_is_marked_done() {
-        let idx = 800_003;
+        let idx = IDX_DONE;
         CONTEXT_SLOTS.set(idx, fresh_context());
         CONTEXT_SLOTS.with_context_mut(idx, |ctx| {
             ctx.expect("just set").close_context();
         });
-        assert!(go_is_context_done(idx));
+        let done = go_is_context_done(idx);
+        CONTEXT_SLOTS.clear(idx);
+        assert!(done);
     }
 
     #[test]
@@ -295,7 +322,7 @@ mod tests {
 
     #[test]
     fn every_callback_in_this_module_tolerates_no_current_request() {
-        let idx = 800_004;
+        let idx = IDX_TOLERATES_NO_REQUEST;
 
         assert!(go_is_context_done(idx));
         assert!(go_putenv(ptr::null_mut(), 0, ptr::null_mut(), 0));
