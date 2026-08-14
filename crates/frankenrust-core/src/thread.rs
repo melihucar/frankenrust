@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use frankenrust_sys::{
     force_kill_slot, frankenphp_destroy_thread_metrics, frankenphp_force_kill_thread,
-    frankenphp_init_thread_metrics, frankenphp_new_main_thread, frankenphp_new_php_thread,
-    frankenphp_release_thread_for_kill,
+    frankenphp_get_current_memory_limit, frankenphp_init_thread_metrics,
+    frankenphp_new_main_thread, frankenphp_new_php_thread, frankenphp_release_thread_for_kill,
 };
 
 use crate::state::{State, ThreadState};
@@ -27,13 +27,26 @@ use crate::thread_inactive::InactiveThread;
 
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
+/// The caller's requested `max_threads`: an explicit ceiling, or automatic
+/// sizing from the PHP memory limit and total system memory
+/// (`phpmainthread.go:259-278`, `setAutomaticMaxThreads`).
+///
+/// Upstream encodes `auto` as a negative `int` and returns early once
+/// `maxThreads >= 0` (`phpmainthread.go:263-265`); this enum makes that an
+/// exhaustive match instead of a sentinel value threaded through arithmetic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaxThreads {
+    Fixed(usize),
+    Auto,
+}
+
 /// Errors which can occur while starting the PHP thread registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ThreadError {
     AlreadyInitialized,
     InvalidThreadCount {
         num_threads: usize,
-        max_threads: usize,
+        max_threads: MaxThreads,
     },
     MainThreadCreation {
         code: c_int,
@@ -56,7 +69,7 @@ impl fmt::Display for ThreadError {
                 max_threads,
             } => write!(
                 formatter,
-                "invalid PHP thread counts: num_threads={num_threads}, max_threads={max_threads}"
+                "invalid PHP thread counts: num_threads={num_threads}, max_threads={max_threads:?}"
             ),
             Self::MainThreadCreation { code } => {
                 write!(formatter, "unable to create PHP main thread (code {code})")
@@ -570,16 +583,26 @@ struct ShutdownTicket {
 pub struct PhpMainThread {
     state: ThreadState,
     num_threads: usize,
+    requested_max_threads: MaxThreads,
     max_threads: AtomicUsize,
     php_ini: Mutex<HashMap<String, String>>,
 }
 
 impl PhpMainThread {
-    fn new(num_threads: usize, max_threads: usize, php_ini: HashMap<String, String>) -> Self {
+    fn new(num_threads: usize, max_threads: MaxThreads, php_ini: HashMap<String, String>) -> Self {
+        let initial = match max_threads {
+            MaxThreads::Fixed(count) => count,
+            // Placeholder only: nothing may observe `max_threads()` before
+            // `finalize_max_threads` replaces this with the real resolution,
+            // which runs before the main callback publishes Ready (#10's
+            // initialisation-ordering rule).
+            MaxThreads::Auto => num_threads,
+        };
         Self {
             state: ThreadState::new(),
             num_threads,
-            max_threads: AtomicUsize::new(max_threads),
+            requested_max_threads: max_threads,
+            max_threads: AtomicUsize::new(initial),
             php_ini: Mutex::new(php_ini),
         }
     }
@@ -613,17 +636,111 @@ impl PhpMainThread {
         self.max_threads.load(Ordering::Acquire)
     }
 
-    /// Named seam for #103's `max_threads=auto` resolution. In this issue the
-    /// caller supplies a plain count; the only finalization is upstream's
-    /// lower bound at `phpmainthread.go:250-253`.
+    /// `phpmainthread.go:250-253`: resolves `max_threads=auto`
+    /// (`setAutomaticMaxThreads`, `:262-278`) if requested, then raises the
+    /// result back up to `num_threads` if it came out lower. Runs only from
+    /// `go_frankenphp_main_thread_is_ready`, on the main PHP pthread, before
+    /// that callback publishes `Ready` (#10's initialisation-ordering rule).
     pub(crate) fn finalize_max_threads(&self) {
-        self.max_threads
-            .fetch_max(self.num_threads, Ordering::AcqRel);
+        let resolved = match self.requested_max_threads {
+            MaxThreads::Fixed(_) => {
+                resolve_max_threads(self.num_threads, self.requested_max_threads, 0, 0)
+            }
+            MaxThreads::Auto => {
+                // SAFETY: `finalize_max_threads` runs only from
+                // `go_frankenphp_main_thread_is_ready` (`frankenphp.c:1710`,
+                // `callbacks/mainthread.rs`), on the main PHP pthread after
+                // `frankenphp_new_main_thread` has completed `ts_resource(0)`
+                // and PHP module startup, so `PG(memory_limit)` already holds
+                // php.ini's parsed value. The C function takes no pointer
+                // arguments and only reads that global (`frankenphp.c:1916`).
+                let per_thread_limit = i64::from(unsafe { frankenphp_get_current_memory_limit() });
+                resolve_max_threads(
+                    self.num_threads,
+                    self.requested_max_threads,
+                    per_thread_limit,
+                    total_system_memory(),
+                )
+            }
+        };
+        self.max_threads.store(resolved, Ordering::Release);
     }
 
     pub(crate) fn php_ini(&self) -> MutexGuard<'_, HashMap<String, String>> {
         lock_mutex(&self.php_ini)
     }
+}
+
+/// `phpmainthread.go:250-253` + `:262-278`, as one pure function of the
+/// caller's request and the two `setAutomaticMaxThreads` inputs. An explicit
+/// [`MaxThreads::Fixed`] value is never recomputed from `per_thread_limit`/
+/// `total_memory` -- upstream returns from `setAutomaticMaxThreads` before
+/// touching either. Either way, the result is then raised back up to
+/// `num_threads` if it came out lower (`phpmainthread.go:251-252`), which
+/// upstream applies unconditionally after `setAutomaticMaxThreads` returns,
+/// not only on the automatic path.
+///
+/// No PHP or OS calls happen here: `per_thread_limit` and `total_memory` are
+/// plain inputs, so this is unit-testable without booting PHP.
+fn resolve_max_threads(
+    num_threads: usize,
+    requested: MaxThreads,
+    per_thread_limit: i64,
+    total_memory: u64,
+) -> usize {
+    let resolved = match requested {
+        MaxThreads::Fixed(count) => count,
+        MaxThreads::Auto => automatic_max_threads(num_threads, per_thread_limit, total_memory),
+    };
+    resolved.max(num_threads)
+}
+
+/// `phpmainthread.go:262-278` (`setAutomaticMaxThreads`'s body once `auto`
+/// is already selected): `total_memory / per_thread_limit`, truncating, or
+/// `num_threads * 2` when the interpreter has no real memory limit
+/// (`per_thread_limit <= 0`, which includes `memory_limit = -1`, unlimited)
+/// or the total system memory could not be determined (`total_memory ==
+/// 0`). Both are the documented fallback, not an error path.
+fn automatic_max_threads(num_threads: usize, per_thread_limit: i64, total_memory: u64) -> usize {
+    if per_thread_limit <= 0 || total_memory == 0 {
+        return num_threads.saturating_mul(2);
+    }
+    // per_thread_limit > 0 was just checked, so this widening is exact.
+    (total_memory / (per_thread_limit as u64)) as usize
+}
+
+/// `internal/memory/memory_linux.go:5-13` (`TotalSysMemory`): `Totalram *
+/// Unit` from `sysinfo(2)`, or `0` on any error -- a `0` routes
+/// [`automatic_max_threads`] to the `num_threads * 2` fallback, same as
+/// upstream. Deliberately not `/proc/meminfo`: a hardened container or
+/// chroot without procfs would silently take the doubling fallback where
+/// upstream still computes a real limit.
+#[cfg(target_os = "linux")]
+fn total_system_memory() -> u64 {
+    // SAFETY: `libc::sysinfo` is `sysinfo(2)`: it takes a pointer to a
+    // `libc::sysinfo` that it fully populates before returning 0, or leaves
+    // untouched and returns -1 on error (`man 2 sysinfo`). Zeroing first
+    // makes the error path well-defined too, since every field is a plain
+    // integer with no invalid bit pattern. `info` is a local, exclusively
+    // borrowed for the duration of this one call.
+    let (status, info) = unsafe {
+        let mut info: libc::sysinfo = std::mem::zeroed();
+        (libc::sysinfo(&mut info), info)
+    };
+    if status != 0 {
+        return 0;
+    }
+    // `totalram` is already `u64` (`c_ulong` on every Linux target this
+    // project builds for is LP64); only `mem_unit` (`c_uint`) needs widening.
+    info.totalram.wrapping_mul(u64::from(info.mem_unit))
+}
+
+/// `internal/memory/memory_others.go`: upstream has no non-Linux
+/// implementation -- it is a hard `0`, which routes to the doubling
+/// fallback by design, including on macOS.
+#[cfg(not(target_os = "linux"))]
+fn total_system_memory() -> u64 {
+    0
 }
 
 #[derive(Default)]
@@ -645,11 +762,16 @@ fn registry() -> &'static Mutex<Registry> {
 /// Starts PHP's main pthread and `num_threads` inactive PHP pthreads.
 pub fn init_php_threads(
     num_threads: usize,
-    max_threads: usize,
+    max_threads: MaxThreads,
     php_ini: HashMap<String, String>,
 ) -> Result<Arc<PhpMainThread>, ThreadError> {
     let _scaling = lock_mutex(&SCALING);
-    if max_threads == 0 || num_threads > c_int::MAX as usize || max_threads > c_int::MAX as usize {
+    // `MaxThreads::Auto` cannot be validated up front -- its final value is
+    // only known after `finalize_max_threads` resolves it, and that
+    // resolution always yields at least `num_threads` (see
+    // `resolve_max_threads`'s unconditional raise).
+    let fixed_count_out_of_range = matches!(max_threads, MaxThreads::Fixed(count) if count == 0 || count > c_int::MAX as usize);
+    if fixed_count_out_of_range || num_threads > c_int::MAX as usize {
         return Err(ThreadError::InvalidThreadCount {
             num_threads,
             max_threads,
@@ -950,7 +1072,7 @@ pub(crate) static TEST_REGISTRY: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 pub(crate) fn install_test_main(php_ini: HashMap<String, String>) -> Arc<PhpMainThread> {
-    let main = Arc::new(PhpMainThread::new(0, 1, php_ini));
+    let main = Arc::new(PhpMainThread::new(0, MaxThreads::Fixed(1), php_ini));
     let mut installed = lock_mutex(registry());
     if installed.main.is_none() {
         installed.main = Some(Arc::clone(&main));
@@ -1341,7 +1463,8 @@ mod tests {
             ("display_startup_errors".to_string(), "0".to_string()),
             ("log_errors".to_string(), "0".to_string()),
         ]);
-        let main = init_php_threads(2, 2, php_ini).expect("real lifecycle boot must succeed");
+        let main = init_php_threads(2, MaxThreads::Fixed(2), php_ini)
+            .expect("real lifecycle boot must succeed");
         let threads = php_threads();
         assert_eq!(threads.len(), 2);
         assert!(threads
@@ -1356,5 +1479,103 @@ mod tests {
         // post-tsrm_shutdown lifecycle.
         assert_eq!(main.state(), State::Reserved);
         write_test_marker("UNEXPECTED_DRAIN_RETURN");
+    }
+
+    // #103: max_threads=auto resolution (phpmainthread.go:250-278). Pure
+    // functions of (num_threads, per_thread_limit, total_memory) -- no PHP
+    // or OS calls, so these run without booting PHP.
+
+    #[test]
+    fn explicit_max_threads_passes_through_untouched() {
+        // Garbage per_thread_limit/total_memory: an explicit value must
+        // never be recomputed from them (phpmainthread.go:263-265's early
+        // return).
+        assert_eq!(
+            resolve_max_threads(2, MaxThreads::Fixed(10), -1, 0),
+            10,
+            "an explicit max_threads at or above num_threads must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn explicit_max_threads_below_num_threads_is_still_raised() {
+        // phpmainthread.go:251-252's raise runs unconditionally after
+        // setAutomaticMaxThreads returns, on both the explicit and the
+        // automatic path.
+        assert_eq!(
+            resolve_max_threads(10, MaxThreads::Fixed(3), -1, 0),
+            10,
+            "an explicit max_threads below num_threads must be raised to it"
+        );
+    }
+
+    #[test]
+    fn automatic_max_threads_doubles_when_there_is_no_real_memory_limit() {
+        assert_eq!(
+            automatic_max_threads(4, 0, 1024),
+            8,
+            "memory_limit=0 must double num_threads"
+        );
+        assert_eq!(
+            automatic_max_threads(4, -1, 1024),
+            8,
+            "memory_limit=-1 (unlimited) must double num_threads"
+        );
+    }
+
+    #[test]
+    fn automatic_max_threads_doubles_when_total_memory_is_unknown() {
+        assert_eq!(
+            automatic_max_threads(4, 128 * 1024 * 1024, 0),
+            8,
+            "an undetermined total system memory (0) must double num_threads"
+        );
+    }
+
+    #[test]
+    fn automatic_max_threads_divides_and_truncates() {
+        // 1000 / 300 = 3.33..., must truncate to 3, not round.
+        assert_eq!(automatic_max_threads(1, 300, 1000), 3);
+        // Exact division still works.
+        assert_eq!(
+            automatic_max_threads(1, 128 * 1024 * 1024, 1024 * 1024 * 1024),
+            8
+        );
+    }
+
+    #[test]
+    fn resolve_max_threads_raises_a_low_automatic_result_to_num_threads() {
+        // total / per_thread_limit truncates to 0, well below num_threads.
+        assert_eq!(
+            resolve_max_threads(10, MaxThreads::Auto, 1_000_000, 500_000),
+            10,
+            "an automatic result below num_threads must be raised to it"
+        );
+    }
+
+    #[test]
+    fn resolve_max_threads_auto_uses_the_automatic_result_when_it_is_higher() {
+        assert_eq!(
+            resolve_max_threads(1, MaxThreads::Auto, 128 * 1024 * 1024, 1024 * 1024 * 1024),
+            8
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn total_system_memory_is_nonzero_on_linux() {
+        assert_ne!(
+            total_system_memory(),
+            0,
+            "sysinfo(2) must resolve a real total on a normal Linux host"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn total_system_memory_is_exactly_zero_off_linux() {
+        // memory_others.go: no non-Linux implementation exists upstream, so
+        // this must route callers to the doubling fallback by design.
+        assert_eq!(total_system_memory(), 0);
     }
 }

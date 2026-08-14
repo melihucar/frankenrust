@@ -11,3 +11,8 @@ name = "frankenrust_core"
 [dependencies]
 crossbeam-channel = "0.5"
 frankenrust-sys = { path = "../frankenrust-sys" }
+# sysinfo(2) for #103's max_threads=auto (total_system_memory): a vetted,
+# per-platform-correct `struct sysinfo` binding instead of a hand-declared
+# one. Already resolved transitively (bindgen -> clang-sys), so this adds no
+# new supply-chain surface, only a direct edge to it.
+libc = "0.2"

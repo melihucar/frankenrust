@@ -339,6 +339,12 @@ fn main() {
         .allowlist_function("frankenphp_destroy_thread_metrics")
         .allowlist_function("frankenphp_force_kill_thread")
         .allowlist_function("frankenphp_release_thread_for_kill")
+        // `max_threads=auto` resolution (issue #103, `frankenphp.h:210`):
+        // reads `PG(memory_limit)`, truncated to C `int` by the function
+        // itself (`frankenphp.c:1916`). Only ever called from the main PHP
+        // pthread inside `go_frankenphp_main_thread_is_ready`, after PHP
+        // module startup has parsed php.ini.
+        .allowlist_function("frankenphp_get_current_memory_limit")
         // PHP includes stdlib.h unconditionally. These declarations keep
         // cross-boundary allocations paired with C's allocator without adding
         // a second hand-written FFI surface in frankenrust-core.
