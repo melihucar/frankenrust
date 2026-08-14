@@ -531,7 +531,31 @@ def merge_worktree(tid: str, logdir: Path, gate: str) -> bool:
             log(f"    !! {tid} ff merge failed: {out}")
             return False
         log(f"    ++ {tid} merged into main")
+        publish_main(tid)
         return True
+
+
+def publish_main(tid: str) -> None:
+    """Get the merge off this machine. Best-effort: never fails a merge.
+
+    The loop merged into a purely local `main` and stopped there, so an eight
+    hour unattended run accumulated its entire output in one directory on one
+    laptop. Nothing replicated it, and the GitHub view a human checks in the
+    morning showed whatever was last pushed by hand -- three hours stale on the
+    night this was written, which made the branch list read as "no progress"
+    while two merges sat locally.
+
+    A push failure must not undo a merge that already passed the gate and two
+    reviewers: no network is a worse reason to discard work than any of the
+    reasons we discard work on purpose. So this logs and moves on, and the next
+    merge pushes both.
+    """
+    rc, out = git(["push", "origin", "main"])
+    if rc != 0:
+        log(f"    !! could not push main after {tid}: {out[-200:]}")
+        record("push_failed", issue=tid, reason=out[-500:])
+        return
+    record("pushed", issue=tid)
 
 
 # --- stages ------------------------------------------------------------------
