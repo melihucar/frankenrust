@@ -1235,38 +1235,50 @@ def retrospective(cycle: int | str) -> None:
     with JOURNAL.open() as fh:
         through = sum(1 for _ in fh)
     prev_through = _prev_retro_through()
-    slice_note = ""
-    if prev_through:
-        # Advisory, not a fence: this tells the agent where NEW evidence
-        # starts, not that earlier lines are off limits. jq (as used by the
-        # recipes above) halts at the first malformed line; `fromjson? //
-        # empty` does not, so a torn or damaged line costs this command
-        # nothing and it keeps reading -- matching what `through` already
-        # tolerates on the code side.
-        #
-        # `tail` comes FIRST, and the order is the whole point: `through` is a
-        # physical line count of events.jsonl, and only `tail` reading the file
-        # directly counts in those units. Piped the other way round, `tail`
-        # would be skipping lines of jq's pretty-printed *output* -- roughly
-        # five per record -- so the agent would be handed the journal from
-        # about line N/5 onward, starting mid-record on a fragment that is not
-        # valid JSON, while the prompt told it the first N lines were already
-        # analysed. #105's own spec prescribed that order; it contradicts the
-        # same item's requirement that the agent get the slice the code
-        # recorded, so this implements the requirement (see the note on #105).
-        # `jq -Rc ... | tail` is not a fix either: compact output is 1:1 with
-        # input only until `fromjson?` drops a damaged line, after which the
-        # two drift apart by the number of tears.
-        slice_note = (
-            "\n# Evidence already analysed\n\n"
+    # Emitted unconditionally, even when prev_through == 0 (true for every
+    # journal that predates this field -- orchestrator/logs/ is never cleaned,
+    # so that is not just a first-run corner case). retrospective.md's own
+    # recipes use plain jq, which halts at the first malformed line; #104
+    # guarantees a torn journal leaves exactly that kind of line behind. If
+    # this command were gated on prev_through, a pre-existing journal would
+    # fall back to those plain recipes, stop at the first tear, and still have
+    # `through` recorded as the full physical line count -- silently blessing
+    # everything after the tear as analysed when nothing read it. Advisory,
+    # not a fence: this tells the agent where NEW evidence starts, not that
+    # earlier lines are off limits. jq's `fromjson? // empty` does not halt on
+    # a malformed line, so a torn or damaged line costs this command nothing
+    # and it keeps reading -- matching what `through` already tolerates on the
+    # code side.
+    #
+    # `tail` comes FIRST, and the order is the whole point: `through` is a
+    # physical line count of events.jsonl, and only `tail` reading the file
+    # directly counts in those units. Piped the other way round, `tail`
+    # would be skipping lines of jq's pretty-printed *output* -- roughly
+    # five per record -- so the agent would be handed the journal from
+    # about line N/5 onward, starting mid-record on a fragment that is not
+    # valid JSON, while the prompt told it the first N lines were already
+    # analysed. #105's own spec prescribed that order; it contradicts the
+    # same item's requirement that the agent get the slice the code
+    # recorded, so this implements the requirement (see the note on #105).
+    # `jq -Rc ... | tail` is not a fix either: compact output is 1:1 with
+    # input only until `fromjson?` drops a damaged line, after which the
+    # two drift apart by the number of tears.
+    slice_note = (
+        "\n# Evidence already analysed\n\n"
+        + (
             f"A previous retrospective analysed orchestrator/logs/events.jsonl "
             f"through line {prev_through}. New evidence starts after that "
             "line, though you may still look back further if a new event "
-            "only makes sense against an old one. To read just the new "
-            "slice, tolerating a damaged line instead of stopping at it:\n\n"
-            f"```sh\ntail -n +{prev_through + 1} orchestrator/logs/events.jsonl "
-            "| jq -R 'fromjson? // empty'\n```\n"
+            "only makes sense against an old one. "
+            if prev_through
+            else "No prior retrospective has recorded a watermark, so treat "
+            "the whole journal as new evidence. "
         )
+        + "To read it, tolerating a damaged line instead of stopping at "
+        "it:\n\n"
+        f"```sh\ntail -n +{prev_through + 1} orchestrator/logs/events.jsonl "
+        "| jq -R 'fromjson? // empty'\n```\n"
+    )
     p = "\n".join([(PROMPTS / "shared.md").read_text(),
                     (PROMPTS / "retrospective.md").read_text(),
                     f"\n# This is retrospective {cycle}. Write to "

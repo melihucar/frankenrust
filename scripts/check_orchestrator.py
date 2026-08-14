@@ -1327,6 +1327,103 @@ def check_retro_damaged_line_and_tolerant_prompt_command() -> int:
     return bad
 
 
+def check_retro_first_pass_still_gets_tolerant_recipe() -> int:
+    """#105: with no prior watermark, the prompt must still embed the tolerant recipe.
+
+    A reviewer blocked an earlier fix over exactly this: the tolerant
+    `tail`/`jq 'fromjson? // empty'` recipe was only emitted `if prev_through:`,
+    so the very first retrospective against any journal -- and every journal
+    that predates the `through` field, which is all of them the moment this
+    merges, since orchestrator/logs/ is never cleaned -- got no read command at
+    all and fell back to prompts/retrospective.md's plain, non-tolerant `jq`
+    recipes. Those halt at the first malformed line, while `through` is still
+    recorded as the full physical count -- silently blessing everything after
+    a tear as analysed when the agent's own command never reached it. This
+    drives retrospective() with an empty journal history (no prior
+    `retrospective` record at all, so prev_through == 0) against a journal
+    that itself contains a damaged line, and checks that the embedded command
+    still exists, starts at line 1, and -- run for real -- reaches records on
+    both sides of the tear.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    events: list[tuple[str, dict]] = []
+    real_record, real_log, real_invoke = loop.record, loop.log, loop.invoke
+    real_journal, real_logs = loop.JOURNAL, loop.LOGS
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    bad = 0
+    captured: dict = {}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs = root / "orchestrator" / "logs"
+            logs.mkdir(parents=True)
+            journal = logs / "events.jsonl"
+
+            fresh_before = [{"ts": "t", "event": "merged", "issue": 1},
+                             {"ts": "t", "event": "gate_fail", "issue": 2}]
+            damaged = '{"ts": "t", "event": "gate_fail", "issue": 3'   # torn: no closing brace
+            fresh_after = [{"ts": "t", "event": "recovered", "issue": 4},
+                           {"ts": "t", "event": "merged", "issue": 5}]
+            lines = ([json.dumps(r) for r in fresh_before]
+                     + [damaged]
+                     + [json.dumps(r) for r in fresh_after])
+            journal.write_text("\n".join(lines) + "\n")
+            total_lines = len(lines)
+            want_issues = [1, 2, 4, 5]
+
+            loop.JOURNAL, loop.LOGS = journal, logs
+
+            def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
+                            escalate=False):
+                captured["prompt"] = prompt
+                (logs / "retro-1.md").write_text("findings\n")
+                return "claude", 0, "some analysis"
+
+            loop.invoke = fake_invoke
+            loop.retrospective(1)
+
+            recs = [f for e, f in events if e == "retrospective"]
+            if len(recs) != 1 or recs[0].get("through") != total_lines:
+                bad += fail(f"want through={total_lines} (the physical line count, "
+                            f"damaged line included), got {recs}")
+
+            text = captured.get("prompt", "")
+            blocks = re.findall(r"```sh\n(.*?)```", text, re.S)
+            tolerant = [b for b in blocks if "fromjson" in b]
+            if not tolerant:
+                return bad + fail("with no prior watermark, the prompt embeds no "
+                                  "tolerant jq/tail recipe at all -- the first "
+                                  f"retrospective against any journal falls back to "
+                                  f"prompts/retrospective.md's plain jq: {text[-1000:]!r}")
+            cmd = tolerant[0].strip()
+            off = re.search(r"tail -n \+(\d+)", cmd)
+            if not off or int(off.group(1)) != 1:
+                bad += fail(f"embedded command has the wrong tail offset: {cmd!r}, "
+                            "want +1 (no prior watermark, so the whole journal is "
+                            "new evidence)")
+
+            proc = subprocess.run(["bash", "-c", cmd], cwd=root,
+                                  capture_output=True, text=True, timeout=30)
+            got = _decode_json_stream(proc.stdout)
+            if got is None:
+                bad += fail("the embedded command emitted output that is not a "
+                            "clean stream of JSON objects; "
+                            f"stdout:\n{proc.stdout}")
+            elif [r.get("issue") for r in got] != want_issues:
+                bad += fail(
+                    f"the embedded command emitted issues "
+                    f"{[r.get('issue') for r in got]}, want {want_issues}: the "
+                    "damaged line should be skipped and both sides of it present; "
+                    f"stdout:\n{proc.stdout}")
+    finally:
+        loop.record, loop.log, loop.invoke = real_record, real_log, real_invoke
+        loop.JOURNAL, loop.LOGS = real_journal, real_logs
+    return bad
+
+
 def check_retro_final_does_not_inherit_a_stale_report() -> int:
     """#105: retrospective("final") must not claim coverage on someone else's report.
 
@@ -1706,5 +1803,6 @@ if __name__ == "__main__":
              + check_retro_through_is_snapshotted_before_invoke()
              + check_retro_unanalysed_pass_does_not_advance_through()
              + check_retro_damaged_line_and_tolerant_prompt_command()
+             + check_retro_first_pass_still_gets_tolerant_recipe()
              + check_retro_final_does_not_inherit_a_stale_report()
              + check_rolling_pool_abandons_safely() + check_rolling_pool() else 0)
