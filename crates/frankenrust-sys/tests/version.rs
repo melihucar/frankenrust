@@ -1,8 +1,10 @@
 //! Proves the whole chain actually works: `frankenphp.c` and `types.c`
 //! compiled, linked against libphp, and the resulting code runs; and that
 //! all 26 `go_*` symbols it calls back into resolved to a real definition
-//! (from `frankenrust-core`'s abort-stubs) rather than staying undefined.
-//! See issue #7's Acceptance section.
+//! -- from `frankenrust-core`'s abort-stubs for 25 of them, and from
+//! `frankenrust-sys/shim.c` for `go_register_server_variables` (issue #11:
+//! it is the one callback whose C-ABI entry point had to move out of Rust) --
+//! rather than staying undefined. See issue #7's Acceptance section.
 //!
 //! `frankenrust-core` is a dev-dependency (see frankenrust-sys/Cargo.toml)
 //! purely so this binary links: `frankenphp.c`'s compiled object
@@ -130,7 +132,8 @@ fn all_26_go_symbols_are_defined_in_the_test_binary() {
         assert!(
             defined.contains(symbol),
             "{symbol} is not a defined symbol in {} -- it should be defined by \
-             frankenrust-core/src/callbacks/*.rs",
+             frankenrust-core/src/callbacks/*.rs, except go_register_server_variables, \
+             which is defined by frankenrust-sys/shim.c (issue #11)",
             exe.display()
         );
     }

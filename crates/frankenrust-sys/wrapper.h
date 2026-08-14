@@ -15,3 +15,4 @@
 #include "types.h"
 
 #include "_cgo_export.h"
+#include "frankenrust_shim.h"

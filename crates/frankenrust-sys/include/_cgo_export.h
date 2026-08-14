@@ -85,7 +85,12 @@ char *go_read_cookies(uintptr_t threadIndex); /* :1196 */
 struct go_apache_request_headers_return
 go_apache_request_headers(uintptr_t threadIndex); /* :766 */
 
-/* callbacks/servervars.rs */
+/* go_register_server_variables is defined in shim.c, not in
+ * callbacks/servervars.rs -- see shim.c's header comment and issue #11: a
+ * zend_bailout() out of the PHP calls it makes must never cross a Rust
+ * frame, so its C-ABI entry point has to be a C frame the whole way down.
+ * go_update_request_info makes no PHP call and stays in
+ * callbacks/servervars.rs. */
 void go_register_server_variables(uintptr_t threadIndex,
                                   zval *trackVarsArray); /* :1379 */
 char *go_update_request_info(uintptr_t threadIndex,

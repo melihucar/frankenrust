@@ -121,6 +121,8 @@ fn main() {
         vendor_dir.join("types.h"),
         vendor_dir.join("frankenphp_arginfo.h"),
         sys_include_dir.join("_cgo_export.h"),
+        sys_include_dir.join("frankenrust_shim.h"),
+        manifest_dir.join("shim.c"),
         wrapper_h.clone(),
     ] {
         println!("cargo:rerun-if-changed={}", path.display());
@@ -149,6 +151,12 @@ fn main() {
     build
         .file(vendor_dir.join("frankenphp.c"))
         .file(vendor_dir.join("types.c"))
+        // Ours, not upstream's: the C-side definition of
+        // go_register_server_variables, which keeps a zend_bailout()'s longjmp
+        // from ever crossing a Rust frame (issue #11). Compiled with exactly
+        // the same flags and include path as the vendored sources because it
+        // calls into them and reads EG()/SG() the same way.
+        .file(manifest_dir.join("shim.c"))
         // for frankenphp.c:47 `#include "_cgo_export.h"`
         .include(&sys_include_dir)
         // for _cgo_export.h's own `#include "frankenphp.h"`, and types.c/types.h's
@@ -298,12 +306,25 @@ fn main() {
         .allowlist_type("HashTable")
         .allowlist_type("zval")
         .allowlist_type("zend_long")
+        // shim.c's wire format (frankenrust_shim.h) -- see the `.file()` above.
+        // Taken from the header rather than hand-written in frankenrust-core so
+        // the two sides of the boundary cannot drift.
+        .allowlist_type("frankenrust_header_var")
+        .allowlist_type("frankenrust_server_vars_batch")
         // frankenphp.h functions this issue's acceptance test and the near-term
         // callback bodies need. frankenrust-sys/build.rs is not part of issue #7's
         // frozen module layout (docs/ARCHITECTURE.md) -- later issues extend this
         // list as they need more of frankenphp.h's / types.h's surface.
         .allowlist_function("frankenphp_get_version")
         .allowlist_function("frankenphp_get_config")
+        // Interning is the one PHP call issue #11 makes from Rust (see
+        // servervars.rs's `intern`) -- it is a plain persistent malloc with no
+        // TSRM dependency and cannot bail out. `frankenphp_register_server_vars`,
+        // `frankenphp_register_known_variable` and `frankenphp_register_variable_safe`
+        // are deliberately NOT allowlisted here: under issue #11's design they are
+        // called only from shim.c, which already has the real header, and exposing
+        // them to Rust would invite the mistake that design exists to prevent.
+        .allowlist_function("frankenphp_init_persistent_string")
         // The two real thread entry points (frankenphp.h:190-191): not called by
         // this issue's abort-stubs, but tests/version.rs takes their address (never
         // calls them) so the linker's --gc-sections can see a live reference into
