@@ -1621,18 +1621,19 @@ def check_rolling_pool(join_timeout: float = 15.0) -> int:
     saved = {name: getattr(loop, name) for name in _LOOP_GLOBALS}
 
     def drive(fake, work, *, max_parallel: int, wallclock: float,
-              join_timeout: float) -> dict:
+              join_timeout: float, self_update_pending=None,
+              restart_into_new_code=None, drain_confirmations: int = 3) -> dict:
         loop.gh = fake
         loop.work = work
-        loop.self_update_pending = lambda: False
-        loop.restart_into_new_code = lambda: None
+        loop.self_update_pending = self_update_pending or (lambda: False)
+        loop.restart_into_new_code = restart_into_new_code or (lambda: None)
         loop.record = lambda event, **f: None
         loop.log = lambda msg: None
         loop.retro_thread = lambda: None
         loop.retrospective = lambda cycle: None
         loop.MAX_PARALLEL = max_parallel
         loop.WALLCLOCK_LIMIT = wallclock
-        loop.DRAIN_CONFIRMATIONS = 3
+        loop.DRAIN_CONFIRMATIONS = drain_confirmations
         loop._start = time.time()
         result: dict = {}
 
@@ -1726,6 +1727,228 @@ def check_rolling_pool(join_timeout: float = 15.0) -> int:
         if peak > 3:
             bad += fail(f"claims outstanding peaked at {peak} > max_parallel=3: "
                         f"claims={claims} finishes={sorted(finishes)}")
+
+        def bail_if_abandoned(out: dict, desc: str) -> bool:
+            """Shared with the scenario above: same daemon-thread-plus-join-timeout
+            contract, same reason for leaving loop's globals stubbed rather than
+            restored -- see the comment on `if out["alive"]:` above.
+            check_rolling_pool_abandons_safely() only has to see the FIRST
+            scenario honour this contract (a stubbed cmd_run that never returns
+            makes every drive() call here hang, so it never reaches the rest of
+            this function) -- every scenario after it follows the same rule so
+            that a hang anywhere in this file fails loud instead of leaking a
+            real gh/work into a thread nobody controls.
+            """
+            nonlocal bad, abandoned
+            if not out["alive"]:
+                return False
+            abandoned = True
+            bad += fail(f"{desc} -- did not finish within its join timeout")
+            return True
+
+        # ---- scenario: quiescent self-update (#125) ----
+        # self_update_pending() flips True the instant the first issue is
+        # claimed. A correct cmd_run must then claim nothing further -- two
+        # more issues are sitting claimable, so "nothing left to claim" cannot
+        # be why -- drain the one in-flight issue to zero, call
+        # restart_into_new_code() exactly once with the pool empty, and stop.
+        # max_parallel=1 so exactly one claim happens before the flip is even
+        # visible to cmd_run, which is what makes "claimed after the flip"
+        # unambiguous.
+        #
+        # Catches: the quiesce check missing or never firing (claims keep
+        # coming after the flip), restarting before the in-flight worker has
+        # actually finished (restart_into_new_code called with the pool
+        # non-empty), and a missing `break` after the restart call (it fires
+        # more than once, or spins forever and this scenario's own join
+        # timeout catches it as a hang).
+        dur_a = {1: 0.3, 2: 0.5, 3: 0.2}
+        finishes_a: list[tuple[float, int]] = []
+        fake_a = FakeGh([issue(n) for n in dur_a])
+        restart_calls: list[int] = []
+
+        def work_a(iss: gh.Issue) -> None:
+            time.sleep(dur_a[iss.number])
+            finishes_a.append((time.time(), iss.number))
+
+        def self_update_pending_a() -> bool:
+            return len(fake_a.claims) >= 1
+
+        def restart_into_new_code_a() -> None:
+            restart_calls.append(len(fake_a.claims) - len(finishes_a))
+
+        out_a = drive(fake_a, work_a, max_parallel=1, wallclock=5.0,
+                      join_timeout=5.0, self_update_pending=self_update_pending_a,
+                      restart_into_new_code=restart_into_new_code_a,
+                      drain_confirmations=1)
+        if bail_if_abandoned(out_a, "quiescent self-update scenario deadlocked"):
+            return bad
+
+        if len(fake_a.claims) != 1:
+            bad += fail(f"self_update_pending() flipped after the first claim "
+                        f"but {len(fake_a.claims)} issue(s) were claimed, not 1: "
+                        f"{fake_a.claims} -- quiesce must stop new claims")
+        if sorted(fake_a.ready) != [2, 3]:
+            bad += fail(f"quiescent self-update left {sorted(fake_a.ready)} "
+                        "claimable, want [2, 3] left untouched -- this scenario "
+                        "proves nothing unless the queue still had work to "
+                        "(wrongly) claim")
+        if restart_calls != [0]:
+            bad += fail(f"restart_into_new_code() should fire exactly once with "
+                        f"the pool drained to zero; recorded in-flight counts "
+                        f"at call time were {restart_calls}, want [0]")
+
+        # ---- scenario: no early drain while a worker is busy (#125) ----
+        # Issue 1 is claimed, the queue immediately goes empty (nothing else
+        # was ever seeded), and issue 1's own worker -- still "running" as far
+        # as cmd_run is concerned -- requeues a brand new issue before it
+        # returns. This is resolve_question()'s RESOLUTION: REWRITE path
+        # (its `gh.requeue()` call, made from inside _work() before the
+        # worker returns). drain_confirmations=1 so a broken implementation
+        # that miscounts the busy window as an empty poll exits on its very
+        # first wrong empty read instead of being saved by extra confirmations
+        # it does not deserve, and so a correct one still exits promptly.
+        #
+        # Catches: checking "is the queue empty" before checking "is a worker
+        # still running" -- i.e. counting the momentarily-empty ready list
+        # against DRAIN_CONFIRMATIONS while inflight is non-empty, which logs
+        # "queue drained" and exits before the running worker ever hands back
+        # issue 2.
+        fake_b = FakeGh([issue(1)])
+        finishes_b: list[tuple[float, int]] = []
+
+        def work_b(iss: gh.Issue) -> None:
+            if iss.number == 1:
+                time.sleep(0.35)
+                fake_b.requeue(issue(2))
+            else:
+                time.sleep(0.15)
+            finishes_b.append((time.time(), iss.number))
+
+        out_b = drive(fake_b, work_b, max_parallel=1, wallclock=5.0,
+                      join_timeout=5.0, drain_confirmations=1)
+        if bail_if_abandoned(out_b, "no-early-drain scenario deadlocked"):
+            return bad
+
+        claimed_b = sorted(n for _, n in fake_b.claims)
+        if claimed_b != [1, 2]:
+            bad += fail(f"no-early-drain scenario claimed {claimed_b}, want "
+                        "[1, 2] -- issue 2 (requeued by issue 1's own worker "
+                        "while it was still running) was never picked up; the "
+                        "loop must have read the momentarily-empty queue as drained")
+        finished_b = sorted(n for _, n in finishes_b)
+        if finished_b != [1, 2]:
+            bad += fail(f"no-early-drain scenario: {finished_b} ran to "
+                        f"completion, want [1, 2]")
+
+        # ---- scenario: wallclock stop drains in-flight work (#125) ----
+        # Two issues claimed immediately fill the pool (max_parallel=2); two
+        # more sit claimable and untouched. The wallclock limit expires while
+        # issue 2 is still running. A correct cmd_run stops claiming -- issues
+        # 3 and 4 stay in fake_c.ready forever -- but must NOT cancel issue 2:
+        # preserve_branch/merge_worktree mean an unmerged attempt is the only
+        # copy of itself (commit 8dd6f46), so cancelling it destroys work
+        # outright rather than merely delaying it.
+        #
+        # Catches: the wallclock check being skipped or inverted (3 and/or 4
+        # would get claimed too), and a wallclock stop that abandons in-flight
+        # futures instead of draining them (issue 2 would never reach
+        # finishes_c, and drive() would return in well under issue 2's own
+        # duration).
+        dur_c = {1: 0.45, 2: 1.1, 3: 0.15, 4: 0.15}
+        finishes_c: list[tuple[float, int]] = []
+        fake_c = FakeGh([issue(n) for n in dur_c])
+
+        def work_c(iss: gh.Issue) -> None:
+            time.sleep(dur_c[iss.number])
+            finishes_c.append((time.time(), iss.number))
+
+        t0_c = time.time()
+        out_c = drive(fake_c, work_c, max_parallel=2, wallclock=0.25,
+                      join_timeout=6.0, drain_confirmations=1)
+        elapsed_c = time.time() - t0_c
+        if bail_if_abandoned(out_c, "wallclock-drain scenario deadlocked"):
+            return bad
+
+        claimed_c = sorted(n for _, n in fake_c.claims)
+        if claimed_c != [1, 2]:
+            bad += fail(f"wallclock-drain scenario claimed {claimed_c}, want "
+                        "[1, 2] -- claiming must stop at the limit even though "
+                        "issues 3 and 4 were still sitting ready")
+        if sorted(fake_c.ready) != [3, 4]:
+            bad += fail(f"wallclock-drain scenario left {sorted(fake_c.ready)} "
+                        "claimable, want [3, 4] left untouched")
+        finished_c = sorted(n for _, n in finishes_c)
+        if finished_c != [1, 2]:
+            bad += fail(f"wallclock-drain scenario: {finished_c} ran to "
+                        "completion, want [1, 2] -- issue 2 was still in flight "
+                        "when the limit hit and must not be cancelled")
+        if elapsed_c < dur_c[2] - 0.2:
+            bad += fail(f"wallclock-drain scenario returned after {elapsed_c:.2f}s, "
+                        f"faster than issue 2's own {dur_c[2]}s duration -- the "
+                        "in-flight future was abandoned, not drained")
+
+        # ---- scenario: busy self-requeue exclusion (#125) ----
+        # Issue 1's own worker requeues issue 1 itself partway through -- the
+        # same RESOLUTION: REWRITE shape as the no-early-drain scenario above,
+        # except this time it is the SAME issue number reappearing in
+        # fake_d.ready while its own future is still inflight, not a new one.
+        # loop.py's `busy` set (built from inflight.values() just above the
+        # claim loop) exists for exactly this: reclaiming it here would call
+        # make_worktree(1) a second time and force-remove the worktree and
+        # branch out from under the still-running first attempt. Issues 2 and
+        # 3 free up pool slots at different times so there is always spare
+        # budget to (wrongly) reclaim issue 1 with while it is still busy, and
+        # issue 4 keeps the pool full a while longer so the busy window is not
+        # just "nothing else was claimable anyway" (the single-issue-queue
+        # trap: a queue with nothing else in it cannot tell exclusion from
+        # coincidence).
+        #
+        # Catches: a missing or reverted `busy` filter (issue 1 gets reclaimed
+        # while its own future is still running, strictly before its first
+        # completion timestamp), and a `busy` filter that never releases
+        # (issue 1 would be claimed only once total instead of twice).
+        requeued_d = {"done": False}
+        finishes_d: list[tuple[float, int]] = []
+        fake_d = FakeGh([issue(1), issue(2), issue(3), issue(4)])
+
+        def work_d(iss: gh.Issue) -> None:
+            if iss.number == 1 and not requeued_d["done"]:
+                requeued_d["done"] = True
+                time.sleep(0.4)
+                fake_d.requeue(issue(1))
+                time.sleep(0.8)
+            elif iss.number == 2:
+                time.sleep(0.2)
+            elif iss.number == 3:
+                time.sleep(0.6)
+            elif iss.number == 4:
+                time.sleep(0.7)
+            else:  # issue 1's second run, after its own worker has retired
+                time.sleep(0.15)
+            finishes_d.append((time.time(), iss.number))
+
+        out_d = drive(fake_d, work_d, max_parallel=3, wallclock=5.0,
+                      join_timeout=6.0, drain_confirmations=1)
+        if bail_if_abandoned(out_d, "busy-exclusion scenario deadlocked"):
+            return bad
+
+        claimed_nums_d = sorted(n for _, n in fake_d.claims)
+        if claimed_nums_d != [1, 1, 2, 3, 4]:
+            bad += fail(f"busy-exclusion scenario claimed {claimed_nums_d}, "
+                        "want [1, 1, 2, 3, 4] -- issue 1 must be claimed once "
+                        "up front and once again after it fully retires")
+        else:
+            claim1_times = sorted(t for t, n in fake_d.claims if n == 1)
+            finish1_times = sorted(t for t, n in finishes_d if n == 1)
+            if len(finish1_times) != 2:
+                bad += fail(f"busy-exclusion scenario: issue 1 finished "
+                            f"{len(finish1_times)} time(s), want 2")
+            elif claim1_times[1] < finish1_times[0]:
+                bad += fail("busy-exclusion scenario: issue 1 was re-claimed "
+                            f"at {claim1_times[1]:.3f} before its own first run "
+                            f"finished at {finish1_times[0]:.3f} -- it was "
+                            "reclaimed while its own worker was still busy")
     finally:
         if not abandoned:
             for name, val in saved.items():
