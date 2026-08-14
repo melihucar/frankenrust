@@ -1186,6 +1186,30 @@ def _claim_retro_cycle(wanted: int) -> int:
     return cycle
 
 
+def _prev_retro_through() -> int:
+    """The highest `through` recorded by any prior retrospective, or 0.
+
+    Only a pass that demonstrably analysed the journal writes `through` (see
+    retrospective()); a pass that did not is still recorded, but with no
+    `through` field, so plain `.get("through")` already skips it here. That is
+    what makes the watermark hold still across a failed pass instead of
+    advancing on a pass that read nothing: the next retrospective calls this
+    again and gets back the same line a failed one was already given.
+    """
+    highest = 0
+    if not JOURNAL.exists():
+        return highest
+    with JOURNAL.open() as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("event") == "retrospective" and "through" in rec:
+                highest = max(highest, rec["through"])
+    return highest
+
+
 def retrospective(cycle: int | str) -> None:
     """Diagnose the loop, not the issues, and file fixes for itself."""
     if not JOURNAL.exists():
@@ -1193,12 +1217,52 @@ def retrospective(cycle: int | str) -> None:
     if isinstance(cycle, int):
         cycle = _claim_retro_cycle(cycle)
     log(f"== retrospective ({cycle})")
+    # Counted before invoke(), not after. Events appended while the agent is
+    # running may or may not have been read by it, and the two ways to be
+    # wrong here are not symmetric: claiming too little only costs the next
+    # pass some re-reading, while claiming too much marks evidence as
+    # analysed that nothing ever actually looked at -- and that evidence is
+    # what the *next* pass would skip past on the strength of this one.
+    with JOURNAL.open() as fh:
+        through = sum(1 for _ in fh)
+    prev_through = _prev_retro_through()
+    slice_note = ""
+    if prev_through:
+        # Advisory, not a fence: this tells the agent where NEW evidence
+        # starts, not that earlier lines are off limits. jq (as used by the
+        # recipes above) halts at the first malformed line; `fromjson? //
+        # empty` does not, so a torn or damaged line costs this command
+        # nothing and it keeps reading -- matching what `through` already
+        # tolerates on the code side.
+        slice_note = (
+            "\n# Evidence already analysed\n\n"
+            f"A previous retrospective analysed orchestrator/logs/events.jsonl "
+            f"through line {prev_through}. New evidence starts after that "
+            "line, though you may still look back further if a new event "
+            "only makes sense against an old one. To read just the new "
+            "slice, tolerating a damaged line instead of stopping at it:\n\n"
+            "```sh\njq -R 'fromjson? // empty' orchestrator/logs/events.jsonl "
+            f"| tail -n +{prev_through + 1}\n```\n"
+        )
     p = "\n".join([(PROMPTS / "shared.md").read_text(),
                     (PROMPTS / "retrospective.md").read_text(),
                     f"\n# This is retrospective {cycle}. Write to "
-                    f"orchestrator/logs/retro-{cycle}.md\n"])
-    invoke("claude", ROOT, p, LOGS / "retro", f"r{cycle}", role="critic")
-    record("retrospective", cycle=cycle)
+                    f"orchestrator/logs/retro-{cycle}.md\n",
+                    slice_note])
+    _, rc, text = invoke("claude", ROOT, p, LOGS / "retro", f"r{cycle}", role="critic")
+    # Only a pass that demonstrably produced analysis may advance the
+    # watermark. invoke() drops the error reason _final_text() returns
+    # alongside its text (see _final_text()/invoke()), so an API-error result
+    # can arrive as non-empty text with rc == 0. The report file existing and
+    # non-empty is the check that cannot lie about that: it is the one thing
+    # only a real analysis pass produces.
+    report = LOGS / f"retro-{cycle}.md"
+    if rc == 0 and report.exists() and report.stat().st_size > 0 and text.strip():
+        record("retrospective", cycle=cycle, through=through)
+    else:
+        # Still counted -- _next_retro_cycle() must not hand out this number
+        # again -- but not claiming coverage: no `through` field.
+        record("retrospective", cycle=cycle, analysed=False)
 
 
 def cmd_retro() -> int:

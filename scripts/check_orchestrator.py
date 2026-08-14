@@ -1034,6 +1034,231 @@ def check_retro_orphaned_claim_does_not_skew_forever() -> int:
         loop.record, loop.log = real_record, real_log
 
 
+def check_retro_through_is_snapshotted_before_invoke() -> int:
+    """#105: a successful pass records `through` as of *before* the agent ran.
+
+    `through` has to be the physical line count of events.jsonl as it stood
+    the instant invoke() was called, not whatever the file grows to while the
+    agent is working -- a merge landing mid-pass may or may not have been
+    read by it, and claiming it was is the wrong way to be wrong (evidence
+    lost for good beats one redundant re-read). This drives retrospective()
+    with a fake invoke() that appends a new journal line *during* the call --
+    simulating exactly that race -- and a report file, so the pass reads as
+    genuinely analysed. The recorded `through` must reflect the journal as it
+    stood before invoke() ran, not after.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    events: list[tuple[str, dict]] = []
+    real_record, real_log, real_invoke = loop.record, loop.log, loop.invoke
+    real_journal, real_logs = loop.JOURNAL, loop.LOGS
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    bad = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            journal = logs / "events.jsonl"
+            journal.write_text("\n".join(json.dumps(r) for r in [
+                {"ts": "t", "event": "merged", "issue": 1},
+                {"ts": "t", "event": "gate_fail", "issue": 2},
+            ]) + "\n")
+            loop.JOURNAL, loop.LOGS = journal, logs
+
+            def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
+                            escalate=False):
+                # A merge landing while the agent is "running" -- must not be
+                # folded into `through`, which was already taken.
+                with journal.open("a") as fh:
+                    fh.write(json.dumps({"ts": "t", "event": "merged", "issue": 99}) + "\n")
+                (logs / "retro-1.md").write_text("findings\n")
+                return "claude", 0, "some analysis"
+
+            loop.invoke = fake_invoke
+            loop.retrospective(1)
+
+            recs = [f for e, f in events if e == "retrospective"]
+            if len(recs) != 1:
+                bad += fail(f"expected exactly one retrospective record, got {recs}")
+            elif recs[0].get("through") != 2:
+                bad += fail(f"through={recs[0].get('through')!r}, want 2 (the "
+                            "journal's line count before invoke() ran, excluding "
+                            f"the merge recorded during it): {recs[0]}")
+    finally:
+        loop.record, loop.log, loop.invoke = real_record, real_log, real_invoke
+        loop.JOURNAL, loop.LOGS = real_journal, real_logs
+    return bad
+
+
+def check_retro_unanalysed_pass_does_not_advance_through() -> int:
+    """#105: a pass that did not demonstrably analyse anything must not move the watermark.
+
+    Three things must ALL hold before a pass may claim coverage: rc == 0, a
+    non-empty final message, and a non-empty logs/retro-{cycle}.md on disk.
+    invoke() drops the error reason _final_text() returns alongside its text,
+    so an API-error result can arrive as non-empty text with rc == 0 -- the
+    report file is the check that cannot lie about that. This drives two
+    failing shapes (rc != 0 with nothing written; rc == 0 with text but no
+    report file) and asserts each records `analysed=False` with no `through`,
+    and that _prev_retro_through() -- what the *next* pass's prompt is built
+    from -- is unmoved by either, so the next pass is offered the same
+    starting line as the failed one, not a line further on.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    events: list[tuple[str, dict]] = []
+    real_record, real_log, real_invoke = loop.record, loop.log, loop.invoke
+    real_journal, real_logs = loop.JOURNAL, loop.LOGS
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    bad = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            journal = logs / "events.jsonl"
+            journal.write_text("\n".join(json.dumps(r) for r in [
+                {"ts": "t", "event": "merged", "issue": 1},
+                {"ts": "t", "event": "retrospective", "cycle": 1, "through": 1},
+            ]) + "\n")
+            loop.JOURNAL, loop.LOGS = journal, logs
+
+            # cycle 2: the agent errors out. rc != 0, nothing written.
+            loop.invoke = lambda *a, **k: ("claude", 1, "")
+            loop.retrospective(2)
+
+            # cycle 3: a non-empty final message, but no report file -- the
+            # API-error-arrives-as-success shape invoke() can produce.
+            loop.invoke = lambda *a, **k: ("claude", 0, "looks fine, nothing to report")
+            loop.retrospective(3)
+
+            recs = [(e, f) for e, f in events if e == "retrospective"]
+            labels = ["rc != 0", "no report file"]
+            if len(recs) != 2:
+                bad += fail(f"expected 2 retrospective records, got {recs}")
+            else:
+                for (_, f), label in zip(recs, labels):
+                    if f.get("analysed") is not False:
+                        bad += fail(f"{label}: expected analysed=False, got {f}")
+                    if "through" in f:
+                        bad += fail(f"{label}: recorded through={f['through']!r}; "
+                                    "a pass that did not analyse anything must not "
+                                    "claim coverage")
+
+            got = loop._prev_retro_through()
+            if got != 1:
+                bad += fail(f"_prev_retro_through() after two unanalysed passes "
+                            f"returned {got}, want 1 -- an unanalysed pass moved "
+                            "the watermark even though it read nothing")
+    finally:
+        loop.record, loop.log, loop.invoke = real_record, real_log, real_invoke
+        loop.JOURNAL, loop.LOGS = real_journal, real_logs
+    return bad
+
+
+def check_retro_damaged_line_and_tolerant_prompt_command() -> int:
+    """#105: a damaged line must not freeze `through`, and the agent's own
+    read command must survive it too.
+
+    `through` is a physical line count specifically so a torn or malformed
+    line costs exactly one line rather than capping the watermark at the last
+    readable one forever (an earlier attempt at this issue did exactly that).
+    But the code advancing past the damage is only half of it: the *agent* is
+    hand a `jq`/`tail` recipe to read the new slice, and plain `jq` -- what
+    prompts/retrospective.md's own recipes use -- halts at the first
+    malformed line. If the embedded command did the same, the watermark would
+    advance over evidence the agent's own command never reached. This builds
+    a journal with a valid record, a torn line, and two more valid records
+    after it, runs a successful retrospective, and checks both: `through`
+    lands past the damage, and the exact command text embedded in the prompt,
+    executed for real against that journal, reaches the records on both sides
+    of the tear (unlike the non-tolerant recipe, run alongside for contrast).
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    events: list[tuple[str, dict]] = []
+    real_record, real_log, real_invoke = loop.record, loop.log, loop.invoke
+    real_journal, real_logs = loop.JOURNAL, loop.LOGS
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    bad = 0
+    captured: dict = {}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs = root / "orchestrator" / "logs"
+            logs.mkdir(parents=True)
+            journal = logs / "events.jsonl"
+
+            before = [{"ts": "t", "event": "merged", "issue": 1},
+                     {"ts": "t", "event": "retrospective", "cycle": 1, "through": 1}]
+            damaged = '{"ts": "t", "event": "gate_fail", "issue": 2'   # torn: no closing brace
+            after = [{"ts": "t", "event": "recovered", "issue": 3},
+                    {"ts": "t", "event": "merged", "issue": 4}]
+            lines = [json.dumps(r) for r in before] + [damaged] + [json.dumps(r) for r in after]
+            journal.write_text("\n".join(lines) + "\n")
+            total_lines = len(lines)
+
+            loop.JOURNAL, loop.LOGS = journal, logs
+
+            def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
+                            escalate=False):
+                captured["prompt"] = prompt
+                (logs / "retro-2.md").write_text("findings\n")
+                return "claude", 0, "some analysis"
+
+            loop.invoke = fake_invoke
+            loop.retrospective(2)
+
+            recs = [f for e, f in events if e == "retrospective"]
+            if len(recs) != 1 or recs[0].get("through") != total_lines:
+                bad += fail(f"want through={total_lines} (the physical line count, "
+                            f"damaged line included), got {recs}")
+
+            text = captured.get("prompt", "")
+            # retrospective.md has its own ```sh fences (the plain, non-tolerant
+            # recipes in "Your evidence"), so find the one this change adds --
+            # not just the first fence in the prompt.
+            blocks = re.findall(r"```sh\n(.*?)```", text, re.S)
+            tolerant = [b for b in blocks if "fromjson" in b]
+            if not tolerant:
+                return bad + fail("the prompt does not embed the tolerant jq/tail "
+                                  f"recipe at all: {text[-1000:]!r}")
+            cmd = tolerant[0].strip()
+            off = re.search(r"tail -n \+(\d+)", cmd)
+            if not off or int(off.group(1)) != 2:   # prev through=1, so line 2 on
+                bad += fail(f"embedded command has the wrong tail offset: {cmd!r}, "
+                            "want +2 (previous through=1, new evidence starts at line 2)")
+
+            proc = subprocess.run(["bash", "-c", cmd], cwd=root,
+                                  capture_output=True, text=True, timeout=30)
+            out = proc.stdout
+            if '"issue": 3' not in out or '"issue": 4' not in out:
+                bad += fail("the embedded command did not reach the records after "
+                            f"the damaged line; stdout:\n{out}")
+            if '"cycle": 1' not in out:
+                bad += fail("the embedded command lost a valid record ahead of the "
+                            f"damaged line; stdout:\n{out}")
+
+            # Contrast: the plain, non-tolerant recipe the rest of
+            # retrospective.md uses on the same slice must fail to reach
+            # the records after the tear -- the exact regression this recipe
+            # exists to avoid.
+            naive = subprocess.run(
+                ["bash", "-c", f"jq . orchestrator/logs/events.jsonl | tail -n +2"],
+                cwd=root, capture_output=True, text=True, timeout=30)
+            if '"issue": 3' in naive.stdout or '"issue": 4' in naive.stdout:
+                bad += fail("the naive (non-tolerant) jq recipe reached past the "
+                            "damaged line in this test setup, so the contrast this "
+                            "check relies on does not hold -- rebuild the fixture")
+    finally:
+        loop.record, loop.log, loop.invoke = real_record, real_log, real_invoke
+        loop.JOURNAL, loop.LOGS = real_journal, real_logs
+    return bad
+
+
 # The whole surface cmd_run resolves as a module global at call time, and so
 # the whole surface the harness below has to swap out -- and put back. Shared
 # with check_rolling_pool_abandons_safely() so the two cannot drift: a name
@@ -1322,4 +1547,7 @@ if __name__ == "__main__":
              + check_retro_callers_derive_the_cycle()
              + check_retro_no_clobber() + check_retro_cycle_claim_is_atomic()
              + check_retro_orphaned_claim_does_not_skew_forever()
+             + check_retro_through_is_snapshotted_before_invoke()
+             + check_retro_unanalysed_pass_does_not_advance_through()
+             + check_retro_damaged_line_and_tolerant_prompt_command()
              + check_rolling_pool_abandons_safely() + check_rolling_pool() else 0)
