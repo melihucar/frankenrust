@@ -46,7 +46,7 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1250,13 +1250,70 @@ def cmd_run() -> int:
     retro = threading.Thread(target=retro_thread, daemon=True)
     retro.start()
     empty = 0
+    # Rolling pool, not a batch barrier: a worker that finishes early takes the
+    # next issue immediately instead of waiting on its slowest sibling.
+    # `inflight` is the single source of truth for how much of the pool is
+    # occupied -- the claim budget, the drain confirmation and the busy
+    # exclusion below are all keyed off it, not off MAX_PARALLEL.
+    inflight: dict[Future, gh.Issue] = {}
+
+    def reap(timeout: float = 0) -> None:
+        """Drop finished futures from `inflight`, surfacing any exception.
+
+        work() is documented to never raise (its own try/except sees to that),
+        so `.result()` here is not the normal path -- it exists so a broken
+        contract becomes a log line instead of a future nobody ever asks
+        about, which is what dropping `f.result()` entirely would have done.
+
+        `timeout` lets a caller block until something changes instead of
+        busy-polling: 0 (the default) is a non-blocking sweep to free capacity
+        before budgeting a new claim; a caller with nothing else to do passes
+        a real timeout to wait for the next completion.
+        """
+        if not inflight:
+            return
+        done, _ = wait(list(inflight), timeout=timeout, return_when=FIRST_COMPLETED)
+        for f in done:
+            issue = inflight.pop(f)
+            try:
+                f.result()
+            except Exception as exc:  # noqa: BLE001
+                log(f"    !! #{issue.number} escaped work(): {exc}")
+                record("work_escaped", issue=issue.number, reason=repr(exc),
+                       trace=traceback.format_exc()[-2000:])
+
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
         while True:
             if time.time() - _start > WALLCLOCK_LIMIT:
+                # Claim nothing further. The futures already in `inflight` are
+                # not cancelled -- preserve_branch/merge_worktree mean an
+                # unmerged attempt is the only copy of itself -- so `break`
+                # falls through to the `with` block's shutdown(wait=True),
+                # which waits for exactly those futures. The claim budget below
+                # never lets more than MAX_PARALLEL be submitted at once, so
+                # there is nothing queued behind them for shutdown to overshoot
+                # into -- the limit is missed by the tail of one issue, not by
+                # a whole extra batch.
                 log("!! wallclock limit reached, stopping")
                 break
+
+            reap()  # opportunistic, non-blocking: free capacity before budgeting
+
+            # No new claims once a self-update is pending -- swapping the
+            # module out from under a running worker would orphan its
+            # worktree. Drain to zero, then hand off. #90 owns turning this
+            # into a named, logged, once-only quiesce; this is the minimum
+            # that keeps the invariant true.
+            if self_update_pending():
+                if inflight:
+                    reap(5)
+                    continue
+                restart_into_new_code()
+                break  # unreachable once restart_into_new_code() execve's;
+                       # kept so this loop is correct on its own terms too.
+
             # Recover before claiming, so anything rescued is claimable in this
-            # same batch. Cheap when there is nothing to do -- blocked_needing_recovery
+            # same round. Cheap when there is nothing to do -- blocked_needing_recovery
             # only reaches an agent for a block that other open issues wait on.
             recover_blocked()
             # Mirror the dependency filter onto the labels. Only writes on a
@@ -1266,55 +1323,87 @@ def cmd_run() -> int:
                 log(f"fr:waiting +{added} -{removed}")
 
             with _claim_lock:
-                # Claim lazily, up to the batch size. Claiming everything and
-                # then slicing strands the remainder in fr:claimed with no
-                # worker and no human -- claimable() then reads empty and the
-                # run ends early believing the queue is drained.
+                # Claim lazily, up to however much of the pool is actually
+                # free -- MAX_PARALLEL - len(inflight), not MAX_PARALLEL.
+                # ThreadPoolExecutor queues submissions past max_workers rather
+                # than running them, so claiming beyond what is free strands
+                # the remainder in fr:claimed with a worker that never starts,
+                # and the drain/self-update logic above would count it as
+                # in-flight work that in fact nobody is touching.
                 batch: list[gh.Issue] = []
-                for cand in gh.claimable():
-                    if len(batch) >= MAX_PARALLEL:
-                        break
-                    if gh.claim(cand.number):
-                        batch.append(cand)
-            if not batch:
-                remaining = gh.fetch(label="fr:ready")
-                if remaining:
-                    empty = 0
-                    # Distinguish the two reasons this can happen. "Dependencies
-                    # unmet" with every blocker itself blocked is not waiting,
-                    # it is deadlock, and it used to look identical in the log to
-                    # a batch that was about to free up.
-                    stuck = gh.fetch(label="fr:blocked")
-                    detail = (f", {len(stuck)} blocked" if stuck else "")
-                    log(f"waiting: {len(remaining)} ready but dependencies unmet{detail}")
-                    time.sleep(30)
-                    continue
-                # GitHub's issue list is eventually consistent -- a queue seeded
-                # seconds ago reads back empty. Quitting on the first empty poll
-                # would end the run before it started.
-                empty += 1
-                if empty >= DRAIN_CONFIRMATIONS:
-                    log("queue drained")
-                    break
-                log(f"queue reads empty ({empty}/{DRAIN_CONFIRMATIONS}); confirming")
-                time.sleep(20)
+                budget = MAX_PARALLEL - len(inflight)
+                if budget > 0:
+                    # An issue can land back in fr:ready while its OWN worker
+                    # is still running: resolve_question's REWRITE path calls
+                    # gh.requeue() from inside work(), and that worker still
+                    # has comment(), restore_worktree() and retire_worktree()
+                    # ahead of it -- several seconds still holding
+                    # WORKTREES/<n> and branch issue/<n>. Reclaiming it here
+                    # would call make_worktree(n) a second time and
+                    # force-remove that worktree and branch out from under the
+                    # first worker, destroying the attempt preserve_branch
+                    # exists to keep. Exclude anything already inflight;
+                    # reap() re-opens it the moment the owning worker actually
+                    # returns.
+                    busy = {i.number for i in inflight.values()}
+                    for cand in gh.claimable():
+                        if len(batch) >= budget:
+                            break
+                        if cand.number in busy:
+                            continue
+                        if gh.claim(cand.number):
+                            batch.append(cand)
+
+            if batch:
+                empty = 0
+                # Disk pressure looks exactly like bad code from inside the gate:
+                # cargo fails, three attempts burn, the issue is blocked. Put it in
+                # the journal so the retrospective can name the real cause. The loop
+                # does not prune anything itself -- deleting a user's images or
+                # caches unattended is not a call it gets to make.
+                free_gb = shutil.disk_usage(ROOT).free / 1e9
+                if free_gb < 10:
+                    log(f"!! {free_gb:.1f}GB free — builds may fail for lack of disk, not for lack of correctness")
+                    record("low_disk", free_gb=round(free_gb, 1))
+                for issue in batch:
+                    inflight[pool.submit(work, issue)] = issue
                 continue
-            empty = 0
-            # Disk pressure looks exactly like bad code from inside the gate:
-            # cargo fails, three attempts burn, the issue is blocked. Put it in
-            # the journal so the retrospective can name the real cause. The loop
-            # does not prune anything itself -- deleting a user's images or
-            # caches unattended is not a call it gets to make.
-            free_gb = shutil.disk_usage(ROOT).free / 1e9
-            if free_gb < 10:
-                log(f"!! {free_gb:.1f}GB free — builds may fail for lack of disk, not for lack of correctness")
-                record("low_disk", free_gb=round(free_gb, 1))
-            for f in [pool.submit(work, i) for i in batch]:
-                f.result()
-            # Only at a batch boundary, with no agent mid-flight: swapping the
-            # code out from under a running worker would orphan its worktree.
-            if self_update_pending():
-                restart_into_new_code()
+
+            if inflight:
+                # Nothing claimable this instant, but a worker could finish --
+                # or requeue something -- any second. That is progress, not an
+                # empty queue, so it must not feed DRAIN_CONFIRMATIONS: counting
+                # it is how three empty polls while workers are still running
+                # would read as "queue drained" right as they are about to hand
+                # something back. Wait for the next completion instead of
+                # polling on a fixed timer.
+                reap(10)
+                continue
+
+            remaining = gh.fetch(label="fr:ready")
+            if remaining:
+                empty = 0
+                # Distinguish the two reasons this can happen. "Dependencies
+                # unmet" with every blocker itself blocked is not waiting,
+                # it is deadlock, and it used to look identical in the log to
+                # a batch that was about to free up.
+                stuck = gh.fetch(label="fr:blocked")
+                detail = (f", {len(stuck)} blocked" if stuck else "")
+                log(f"waiting: {len(remaining)} ready but dependencies unmet{detail}")
+                time.sleep(30)
+                continue
+            # GitHub's issue list is eventually consistent -- a queue seeded
+            # seconds ago reads back empty. Quitting on the first empty poll
+            # would end the run before it started. Reached only with `inflight`
+            # empty (see above), so this really is "nothing to claim and
+            # nothing running", not a snapshot of a momentarily-idle pool.
+            empty += 1
+            if empty >= DRAIN_CONFIRMATIONS:
+                log("queue drained")
+                break
+            log(f"queue reads empty ({empty}/{DRAIN_CONFIRMATIONS}); confirming")
+            time.sleep(20)
+            continue
 
     # Stop the thread first, then retrospect synchronously: racing a final
     # set() against the stop flag would silently skip the whole-run pass.

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -966,6 +967,195 @@ def check_retro_orphaned_claim_does_not_skew_forever() -> int:
         loop.record, loop.log = real_record, real_log
 
 
+def check_rolling_pool() -> int:
+    """A worker that finishes early must be able to take the next issue.
+
+    retro-2.md Finding 1: cmd_run used to claim a batch of MAX_PARALLEL issues
+    and then block on `f.result()` for every one of them before claiming
+    again, so a worker that finished in minutes sat idle until the slowest
+    member of its batch -- sometimes hours -- finished too. Measured over one
+    run: ~50% of worker-time idle and 321 issue-minutes of queue latency,
+    entirely self-inflicted -- the critic/resolver/reviewer stages were
+    behaving correctly and finishing fast; the batch barrier is what turned
+    their speed into idle time.
+
+    A regex proving `f.result()` is gone cannot tell a correct rewrite from
+    one that over-claims, drains early or deadlocks, so this drives the real
+    cmd_run() against a fake queue and a stubbed work(), and asserts on what
+    it actually does. Every name cmd_run touches is a module global read at
+    call time -- loop.gh, loop.work, loop.self_update_pending,
+    loop.restart_into_new_code, loop.record, loop.log, loop.retro_thread,
+    loop.retrospective, loop.MAX_PARALLEL, loop.WALLCLOCK_LIMIT,
+    loop.DRAIN_CONFIRMATIONS and loop._start -- which is what makes this
+    possible without a worktree, an agent or a network call. It runs on a
+    daemon thread with a join timeout: a rolling pool that deadlocks must fail
+    this check, not hang the gate.
+
+    Only the two properties #40 is scoped to: a fourth issue claimed before
+    the slow one finishes (the barrier this issue removes), and claims
+    outstanding never exceeding MAX_PARALLEL (the failure mode on the other
+    side of the same fix -- the claim budget forgetting to subtract
+    len(inflight)). Quiescent self-update, early-drain-while-busy, the
+    wallclock drain and the busy-worker exclusion are #125's; #40 only had to
+    implement those invariants in cmd_run, not prove them here.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import gh
+    import loop
+
+    class FakeGh:
+        """Every method cmd_run (and the recover_blocked/sync_waiting it
+        calls) touches, with no network. `ready` is the only state a scenario
+        drives: claim() pops from it and records when; a work stub can push a
+        new issue back mid-run via requeue() to simulate a resolver's REWRITE.
+        """
+        Issue = gh.Issue
+
+        def __init__(self, issues):
+            self.ready = {i.number: i for i in issues}
+            self.claims: list[tuple[float, int]] = []
+
+        def ensure_labels(self) -> None:
+            pass
+
+        def fetch(self, label: str | None = None, state: str = "open"):
+            if state == "closed":
+                return []
+            if label in (None, "fr:ready"):
+                return list(self.ready.values())
+            return []   # fr:blocked / fr:claimed / fr:questioned: none, ever
+
+        def claimable(self):
+            return sorted(self.ready.values(), key=lambda i: i.number)
+
+        def claim(self, n: int) -> bool:
+            if n not in self.ready:
+                return False
+            del self.ready[n]
+            self.claims.append((time.time(), n))
+            return True
+
+        def requeue(self, issue) -> None:
+            self.ready[issue.number] = issue
+
+        def release(self, n: int, label: str = "fr:ready") -> None:
+            pass
+
+        def sync_waiting(self) -> tuple[int, int]:
+            return (0, 0)
+
+        def blocked_needing_recovery(self):
+            return []
+
+        def closed_numbers(self):
+            return set()
+
+        def comment(self, n: int, body: str) -> None:
+            pass
+
+        def close(self, n: int, summary: str) -> None:
+            pass
+
+        def block(self, n: int, why: str) -> None:
+            pass
+
+    def issue(n: int) -> gh.Issue:
+        return gh.Issue(number=n, title=f"issue {n}",
+                        body="Gate: bootstrap\nAgent: claude\n", labels=["fr:ready"])
+
+    saved = {name: getattr(loop, name) for name in (
+        "gh", "work", "self_update_pending", "restart_into_new_code", "record",
+        "log", "retro_thread", "retrospective", "MAX_PARALLEL", "WALLCLOCK_LIMIT",
+        "DRAIN_CONFIRMATIONS", "_start")}
+
+    def drive(fake, work, *, max_parallel: int, wallclock: float,
+              join_timeout: float) -> dict:
+        loop.gh = fake
+        loop.work = work
+        loop.self_update_pending = lambda: False
+        loop.restart_into_new_code = lambda: None
+        loop.record = lambda event, **f: None
+        loop.log = lambda msg: None
+        loop.retro_thread = lambda: None
+        loop.retrospective = lambda cycle: None
+        loop.MAX_PARALLEL = max_parallel
+        loop.WALLCLOCK_LIMIT = wallclock
+        loop.DRAIN_CONFIRMATIONS = 3
+        loop._start = time.time()
+        result: dict = {}
+
+        def runner() -> None:
+            result["rc"] = loop.cmd_run()
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        t.join(timeout=join_timeout)
+        return {"alive": t.is_alive(), **result}
+
+    bad = 0
+    try:
+        # One issue ten times slower than the rest, sized so the fixed loop's
+        # own drain-confirmation sleeps (20-30s, untouched by #40 and not this
+        # check's concern) never get a chance to run -- the wallclock check at
+        # the top of the next iteration catches the run first.
+        SLOW, FAST = 3.0, 0.3
+        dur = {1: SLOW, **{n: FAST for n in range(2, 8)}}
+        finishes: list[tuple[float, int]] = []
+
+        def work_(iss) -> None:
+            time.sleep(dur[iss.number])
+            finishes.append((time.time(), iss.number))
+
+        fake = FakeGh([issue(n) for n in dur])
+        out = drive(fake, work_, max_parallel=3, wallclock=1.5, join_timeout=15)
+
+        if out["alive"]:
+            bad += fail("rolling pool deadlocked (1 slow + 6 fast issues, "
+                        "max_parallel=3) -- did not finish within the join timeout")
+            return bad   # nothing below is safe to assert with the thread still live
+
+        claims = sorted(fake.claims)
+        if len(claims) < 4:
+            bad += fail(f"rolling pool only claimed {len(claims)}/7 issues; "
+                        f"claims={claims} finishes={sorted(finishes)}")
+            return bad
+
+        # Rolling: a 4th issue must be claimed strictly before the slow one
+        # (#1) finishes. Under the batch barrier this is impossible by
+        # construction -- claimable() cannot run again until every future in
+        # the batch has had f.result() called on it -- so this reproduces
+        # retro-2.md Finding 1 directly against the unfixed code.
+        slow_finish = next((t for t, n in finishes if n == 1), None)
+        fourth_claim = claims[3][0]
+        if slow_finish is None:
+            bad += fail("the slow issue (#1) never finished")
+        elif fourth_claim >= slow_finish:
+            bad += fail("a 4th issue was not claimed until the slow issue finished -- "
+                        f"this is the batch barrier: claims={claims} "
+                        f"finishes={sorted(finishes)}")
+
+        # No over-claiming: at no instant may claims outstanding (claimed but
+        # not yet finished) exceed max_parallel. The failure mode on the other
+        # side of the same fix -- the claim budget forgetting to subtract
+        # len(inflight) -- over-subscribes the pool and strands the excess in
+        # fr:claimed with no worker, since ThreadPoolExecutor just queues
+        # submissions past max_workers instead of running them.
+        events = sorted([(t, 1) for t, _ in fake.claims] +
+                        [(t, -1) for t, _ in finishes])
+        outstanding = peak = 0
+        for _, delta in events:
+            outstanding += delta
+            peak = max(peak, outstanding)
+        if peak > 3:
+            bad += fail(f"claims outstanding peaked at {peak} > max_parallel=3: "
+                        f"claims={claims} finishes={sorted(finishes)}")
+    finally:
+        for name, val in saved.items():
+            setattr(loop, name, val)
+
+    return bad
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
@@ -979,4 +1169,5 @@ if __name__ == "__main__":
              + check_verdict_parsing() + check_retro_cycle_survives_restart()
              + check_retro_callers_derive_the_cycle()
              + check_retro_no_clobber() + check_retro_cycle_claim_is_atomic()
-             + check_retro_orphaned_claim_does_not_skew_forever() else 0)
+             + check_retro_orphaned_claim_does_not_skew_forever()
+             + check_rolling_pool() else 0)
