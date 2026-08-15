@@ -474,6 +474,113 @@ def check_silent_reviewer_is_not_a_pass() -> int:
     return bad
 
 
+def check_review_stage_retries_a_silent_reviewer() -> int:
+    """One silent reviewer must not be read as consent -- it must be retried.
+
+    check_silent_reviewer_is_not_a_pass pins review_outcome()'s classification:
+    one silent, one passing reviewer is correctly *not* a block. #139 is that
+    nothing acted on that classification -- review_stage() logged
+    review_incomplete and returned the pass anyway, so a reviewer killed by the
+    60-minute AGENT_TIMEOUT (loop.py:440) was read as two reviews having
+    happened. #40 got a 1,006-line rewrite of the orchestrator's own scheduling
+    loop cleared for merge on one review; only an unrelated rebase conflict
+    stopped it landing.
+
+    This exercises review_stage() itself (not just review_outcome) against a
+    real git worktree, with loop.invoke stubbed so the "reviewer" is scripted
+    by tag: a silent reviewer 1 must be retried exactly once, into a
+    `review1.<tag>.retry` tag, before the merge path is reached -- and a
+    reviewer that passed on the first round must never be re-invoked.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import gh
+    import loop
+
+    def sh(wt: Path, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=wt, check=True, capture_output=True, text=True)
+
+    def make_repo(wt: Path) -> None:
+        wt.mkdir(parents=True, exist_ok=True)
+        sh(wt, "init", "-q", "-b", "main")
+        sh(wt, "config", "user.email", "check_orchestrator@example.com")
+        sh(wt, "config", "user.name", "check_orchestrator")
+        (wt / "a.txt").write_text("base\n")
+        sh(wt, "add", "-A")
+        sh(wt, "commit", "-q", "-m", "base")
+        (wt / "a.txt").write_text("base\nunder review\n")   # the diff to review
+
+    issue = gh.Issue(number=139, title="a reviewer killed by the timeout", body="body")
+
+    real_invoke, real_record, real_log = loop.invoke, loop.record, loop.log
+    loop.record = lambda event, **f: None
+    loop.log = lambda msg: None
+
+    def run_case(script: dict[str, str]) -> tuple[tuple, list[str]]:
+        calls: list[str] = []
+
+        def stub(agent, wt, prompt, logdir, tag, role="implementer", escalate=False):
+            calls.append(tag)
+            return agent, 0, script.get(tag, "")
+
+        loop.invoke = stub
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "repo"
+            make_repo(wt)
+            logdir = Path(tmp) / "logs"
+            logdir.mkdir()
+            result = loop.review_stage(issue, wt, logdir, "1")
+        return result, calls
+
+    bad = 0
+    try:
+        # Reviewer 1 goes silent on the first pass, then blocks on the retry.
+        # Reviewer 2 passes immediately and must not be re-invoked.
+        (blocking, verdicts), calls = run_case({
+            "review1.1": "",
+            "review2.1": "Looks correct.\nVERDICT: PASS",
+            "review1.1.retry": "Found a real defect.\n\nVERDICT: BLOCK",
+        })
+        if calls.count("review1.1.retry") != 1:
+            bad += fail(f"a silent reviewer must be retried exactly once "
+                        f"before the merge path is reached; calls were {calls}")
+        if "review2.1.retry" in calls:
+            bad += fail(f"reviewer 2 passed on the first round and was retried "
+                        f"anyway: {calls}")
+        if not blocking or "VERDICT: BLOCK" not in blocking:
+            bad += fail(f"a BLOCK produced on the retry did not block the "
+                        f"diff: {blocking!r}")
+        if verdicts.get(1) != "block":
+            bad += fail(f"the retried reviewer's BLOCK verdict is missing "
+                        f"from the final verdicts: {verdicts}")
+
+        # Reviewer 1 stays silent even after the retry. The round must not
+        # block -- review_outcome's classification of "one silent, one
+        # passing" is not itself the bug -- but it must come back marked as
+        # one review, not two, for _work() to hand to gh.close().
+        (blocking, verdicts), calls = run_case({
+            "review1.1": "",
+            "review2.1": "Looks correct.\nVERDICT: PASS",
+            "review1.1.retry": "",
+        })
+        if blocking:
+            bad += fail(f"a reviewer still silent after its one retry must "
+                        f"not block a diff the other reviewer passed: {blocking!r}")
+        if calls.count("review1.1.retry") != 1:
+            bad += fail(f"a reviewer still silent after retry was retried "
+                        f"again instead of the round being scored final: {calls}")
+        if verdicts != {1: "silent", 2: "pass"}:
+            bad += fail(f"final verdicts do not show reviewer 1 as still "
+                        f"silent: {verdicts}")
+        summary = loop.review_summary(verdicts)
+        if "two adversarial" in summary or "one adversarial review" not in summary:
+            bad += fail(f"review_summary() must say one review happened, not "
+                        f"two, when a reviewer stayed silent through the "
+                        f"retry: {summary!r}")
+    finally:
+        loop.invoke, loop.record, loop.log = real_invoke, real_record, real_log
+    return bad
+
+
 def check_pre_implementer_stages_restore() -> int:
     """The critic and resolver must not be able to change what gets merged.
 
@@ -2087,7 +2194,9 @@ if __name__ == "__main__":
     sys.exit(1 if check_runs() + check_prompts() + check_dep_parsing()
              + check_gate_targets_the_worktree() + check_no_absorbing_states()
              + check_blocked_has_a_recovery_path() + check_waiting_is_annotation_only()
-             + check_silent_reviewer_is_not_a_pass() + check_pre_implementer_stages_restore()
+             + check_silent_reviewer_is_not_a_pass()
+             + check_review_stage_retries_a_silent_reviewer()
+             + check_pre_implementer_stages_restore()
              + check_unmerged_work_survives_reclaim()
              + check_filing_contract_is_stated() + check_reviewer_restore()
              + check_priority_leads_the_queue()

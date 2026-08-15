@@ -704,6 +704,32 @@ SILENT_REVIEW = (
     "is unchanged and the review will be retried."
 )
 
+# Fixed reviewer/agent pairing for a round: index 1 is always claude, index 2
+# is always codex (falling back to claude inside invoke() once codex is out of
+# quota). review_stage() uses this to retry only the reviewer(s) that went
+# silent, and review_summary() uses it to name them in the closing comment.
+REVIEWER_AGENTS = {1: "claude", 2: "codex"}
+
+
+def review_summary(verdicts: dict[int, str]) -> str:
+    """What the closing comment should claim happened, from a round's verdicts.
+
+    "Two adversarial reviews" is a claim the morning reader takes on faith; it
+    must not survive when one reviewer never came back even after
+    review_stage()'s retry. #40 got a 1,006-line diff cleared for merge on one
+    review while gh.close() was about to record two -- only an unrelated
+    rebase conflict stopped it from landing.
+    """
+    silent = [REVIEWER_AGENTS[i] for i, v in sorted(verdicts.items()) if v == "silent"]
+    if not silent:
+        return ("two adversarial reviews (claude + codex)" if codex_ok()
+                else "two adversarial reviews, both claude — codex was unavailable")
+    reported = [REVIEWER_AGENTS[i] for i, v in sorted(verdicts.items()) if v != "silent"]
+    who = " and ".join(reported) if reported else "no reviewer"
+    return (f"one adversarial review ({who}); the other reviewer was killed by "
+            f"the {AGENT_TIMEOUT // 60}-minute timeout (or crashed) and did not "
+            "report, even after a retry")
+
 
 def review_outcome(results: dict[int, str]) -> tuple[str | None, dict[int, str]]:
     """What the reviewers actually said. Returns (blocking text or None, verdicts).
@@ -739,7 +765,8 @@ def review_outcome(results: dict[int, str]) -> tuple[str | None, dict[int, str]]
     return None, verdicts
 
 
-def review_stage(issue: gh.Issue, wt: Path, logdir: Path, tag: str) -> str | None:
+def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
+                  tag: str) -> tuple[str | None, dict[int, str]]:
     """Two adversarial reviewers, independent contexts, diff only.
 
     Reviewers run with cwd=wt and full tool access, and reviewer.md tells them
@@ -748,47 +775,74 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path, tag: str) -> str | Non
     the *next* stage's diff by worktree_diff's `git add -A`, and from there into
     `main` by merge_worktree's. Snapshot the tree before they run and restore it
     unconditionally after, so reviewing can never change what gets merged.
+
+    A reviewer that comes back silent -- killed by AGENT_TIMEOUT, crashed, hit
+    a quota wall -- gets exactly one retry, into a `.retry`-suffixed tag, same
+    prompt. That is a harness fault, not a finding, and the cheap correct
+    response to a harness fault is to run it again: invoke() already does this
+    one level down for a codex quota wall. Retrying blindly reads a real BLOCK
+    as silence and asks for it twice, so only reviewers review_outcome actually
+    classified as silent -- never one that blocked -- are re-run.
+
+    Returns (blocking text or None, the final round's verdicts). The caller
+    needs the verdicts too: a round that is still one-sided after the retry is
+    not blocking, but the merge that follows must say one review happened, not
+    two (#139) -- and only the verdicts carry that.
     """
     diff = worktree_diff(wt)
     if not diff.strip():
-        return None
+        return None, {}
     (logdir / f"diff.{tag}.patch").write_text(diff)
     p = prompt_for("reviewer", issue, f"\n## The diff\n```diff\n{diff[:120000]}\n```\n")
 
     results: dict[int, str] = {}
 
-    def one(idx: int, agent: str) -> None:
-        _, _, text = invoke(agent, wt, p, logdir, f"review{idx}.{tag}", role="reviewer")
+    def one(idx: int, agent: str, rtag: str) -> None:
+        _, _, text = invoke(agent, wt, p, logdir, rtag, role="reviewer")
         results[idx] = text
 
-    snapshot = snapshot_worktree(wt)
-    try:
-        # Cross-model on purpose: two instances of one model reviewing a diff behave
-        # closer to one reviewer than to two. Once codex is out of quota both become
-        # Opus, losing vendor diversity but keeping independent contexts.
-        threads = [threading.Thread(target=one, args=(1, "claude")),
-                   threading.Thread(target=one, args=(2, "codex"))]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-    finally:
-        # Unconditional: the PASS path merges this worktree, and BLOCK feeds it
-        # to the fixer, then to a post-fix review_stage that stages everything
-        # again -- either way, anything reviewer-authored still here gets merged.
-        restore_worktree(wt, snapshot)
+    def run_round(idxs: dict[int, str], rtag: str) -> None:
+        snapshot = snapshot_worktree(wt)
+        try:
+            threads = [threading.Thread(target=one, args=(idx, agent, f"review{idx}.{rtag}"))
+                       for idx, agent in idxs.items()]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            # Unconditional: the PASS path merges this worktree, and BLOCK feeds it
+            # to the fixer, then to a post-fix review_stage that stages everything
+            # again -- either way, anything reviewer-authored still here gets merged.
+            restore_worktree(wt, snapshot)
 
-    blocking, verdicts = review_outcome(results)
-    record("review_verdicts", issue=issue.number, tag=tag, verdicts=verdicts)
-    if blocking and not any(v == "block" for v in verdicts.values()):
-        log(f"    xx #{issue.number} no reviewer produced a verdict ({tag})")
-        record("review_silent", issue=issue.number, tag=tag, verdicts=verdicts)
-    elif not blocking and any(v == "silent" for v in verdicts.values()):
-        log(f"    !! #{issue.number} only "
-            f"{sum(v == 'pass' for v in verdicts.values())}/{len(verdicts)} "
-            f"reviewers reported ({tag})")
-        record("review_incomplete", issue=issue.number, tag=tag, verdicts=verdicts)
-    return blocking
+    def score(rtag: str) -> tuple[str | None, dict[int, str]]:
+        blocking, verdicts = review_outcome(results)
+        record("review_verdicts", issue=issue.number, tag=rtag, verdicts=verdicts)
+        if blocking and not any(v == "block" for v in verdicts.values()):
+            log(f"    xx #{issue.number} no reviewer produced a verdict ({rtag})")
+            record("review_silent", issue=issue.number, tag=rtag, verdicts=verdicts)
+        elif not blocking and any(v == "silent" for v in verdicts.values()):
+            log(f"    !! #{issue.number} only "
+                f"{sum(v == 'pass' for v in verdicts.values())}/{len(verdicts)} "
+                f"reviewers reported ({rtag})")
+            record("review_incomplete", issue=issue.number, tag=rtag, verdicts=verdicts)
+        return blocking, verdicts
+
+    # Cross-model on purpose: two instances of one model reviewing a diff behave
+    # closer to one reviewer than to two. Once codex is out of quota both become
+    # Opus, losing vendor diversity but keeping independent contexts.
+    run_round(REVIEWER_AGENTS, tag)
+    blocking, verdicts = score(tag)
+
+    silent = {i: a for i, a in REVIEWER_AGENTS.items() if verdicts.get(i) == "silent"}
+    if silent and not any(v == "block" for v in verdicts.values()):
+        log(f"    -> #{issue.number} retrying silent reviewer(s) "
+            f"{sorted(silent.values())} ({tag})")
+        run_round(silent, f"{tag}.retry")
+        blocking, verdicts = score(f"{tag}.retry")
+
+    return blocking, verdicts
 
 
 def resolve_question(issue: gh.Issue, wt: Path, logdir: Path, critique: str) -> bool:
@@ -1006,7 +1060,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
                        "broke nothing; it is not evidence of work.")
             continue
 
-        blocking = review_stage(issue, wt, logdir, str(attempt))
+        blocking, verdicts = review_stage(issue, wt, logdir, str(attempt))
         if blocking:
             log(f"    xx review BLOCKED #{issue.number}")
             # Head, not tail. review_outcome puts "## Reviewer N" at the front of
@@ -1029,7 +1083,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             # attempt the fixed string "Reviewers still blocking after the fix
             # pass" -- which names no defect, so attempts 2 and 3 re-derived
             # from scratch what attempt 1 had already been told, or guessed.
-            still_blocking = review_stage(issue, wt, logdir, f"post{attempt}")
+            still_blocking, verdicts = review_stage(issue, wt, logdir, f"post{attempt}")
             if still_blocking:
                 record("review_block", issue=issue.number, attempt=attempt,
                        phase="post-fix", excerpt=still_blocking[:1500])
@@ -1042,9 +1096,10 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             # Say which reviewers actually ran. "Two adversarial reviews" reads
             # as cross-model review whether or not that is what happened, and
             # once codex is walled off it is two runs of one model -- a weaker
-            # claim that the morning reader deserves to see on the issue.
-            reviewed = ("two adversarial reviews (claude + codex)" if codex_ok()
-                        else "two adversarial reviews, both claude — codex was unavailable")
+            # claim that the morning reader deserves to see on the issue. And
+            # if a reviewer was still silent after review_stage()'s retry, this
+            # is one review, not two (#139).
+            reviewed = review_summary(verdicts)
             gh.close(issue.number,
                      f"Merged as `{sha}` after {attempt} attempt(s), gate `{issue.gate}`, "
                      f"and {reviewed}.")
