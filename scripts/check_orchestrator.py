@@ -2292,6 +2292,236 @@ def check_priority_leads_the_queue() -> int:
     return bad
 
 
+def check_reviewer_diff_not_silently_truncated() -> int:
+    """An over-cap diff must never reach a reviewer as a silent, unmarked cut.
+
+    `prompt_for("reviewer", issue, f"...{diff[:120000]}...")` closed the fence
+    right after the bare slice, so an over-cap diff arrived as a syntactically
+    well-formed markdown code block that happened to stop mid-token -- no
+    marker, no byte count, no list of what fell off. And because
+    `worktree_diff` stages with `git add -A` and git emits changed paths
+    alphabetically, the tail that fell off was deterministic: `frankenrust-sys`
+    -- shim.c, the bindgen headers, build.rs -- exactly what reviewer.md ranks
+    as priority one to check. #11 merged with six of nine changed files never
+    shown to either reviewer of the round that approved it. Retro 21, finding 1.
+
+    Pins loop.diff_prompt_section against the three things #135 asks for:
+    every path named in a manifest regardless of the cut, an unmissable prose
+    notice carrying both byte counts, and the absolute path of the complete
+    patch on disk so a reviewer with tool access can go read what the inline
+    copy dropped. The synthetic diff below reproduces the actual failure shape
+    -- alphabetically-first Rust files large enough alone to blow the cap,
+    pushing the C shim and headers entirely past it.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    def hunk(path: str, body_lines: int) -> str:
+        header = (f"diff --git a/{path} b/{path}\n"
+                  f"index 0000000..1111111 100644\n"
+                  f"--- a/{path}\n+++ b/{path}\n"
+                  f"@@ -1,1 +1,{body_lines} @@\n")
+        body = "".join(f"+line {n} of {path}\n" for n in range(body_lines))
+        return header + body
+
+    # Alphabetical, as git emits them -- frankenrust-core sorts before -sys,
+    # and core's two biggest files alone exceed the cap, so the C shim and
+    # headers land entirely past the cut just like they did on #11.
+    files = [
+        ("crates/frankenrust-core/src/cgi.rs", 2500),
+        ("crates/frankenrust-core/src/context.rs", 2500),
+        ("crates/frankenrust-core/src/lib.rs", 400),
+        ("crates/frankenrust-sys/build.rs", 200),
+        ("crates/frankenrust-sys/include/frankenrust_shim.h", 200),
+        ("crates/frankenrust-sys/shim.c", 200),
+        ("crates/frankenrust-sys/wrapper.h", 100),
+    ]
+    diff = "".join(hunk(path, n) for path, n in files)
+    total = len(diff.encode())
+    if total <= loop.DIFF_INLINE_CAP:
+        return fail(f"test setup bug: synthetic diff ({total} bytes) does not "
+                    f"exceed the cap ({loop.DIFF_INLINE_CAP} bytes)")
+
+    bad = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        patch_path = Path(tmp) / "diff.post3.patch"
+        patch_path.write_text(diff)
+        prompt = loop.diff_prompt_section(diff, patch_path)
+
+        for path, _ in files:
+            if path not in prompt:
+                bad += fail(f"{path} never appears in the reviewer prompt -- it "
+                            "changed and no reviewer is ever told its name")
+
+        if f"{total:,}" not in prompt:
+            bad += fail("prompt does not state the full diff's byte count "
+                        f"({total:,})")
+        if f"{loop.DIFF_INLINE_CAP:,}" not in prompt:
+            bad += fail("prompt does not state how many bytes are actually "
+                        f"shown inline ({loop.DIFF_INLINE_CAP:,})")
+        if "truncat" not in prompt.lower() and "incomplete" not in prompt.lower():
+            bad += fail("prompt carries no explicit prose notice that the "
+                        "inline copy is not the whole diff")
+        if str(patch_path.resolve()) not in prompt:
+            bad += fail("prompt does not give the reviewer the absolute path "
+                        "of the complete, untruncated patch on disk")
+
+    # The manifest's counts are advertised to the reviewer as fact, so a line
+    # whose own content starts with `---`/`+++` must not be mistaken for the
+    # file header those prefixes also mark. Deleting a markdown rule or YAML
+    # separator renders as `----`, which a prefix test reads as "not a change"
+    # and drops -- a file could show (+0/-0) while being rewritten.
+    meta = ("diff --git a/docs/x.md b/docs/x.md\n"
+            "--- a/docs/x.md\n+++ b/docs/x.md\n@@ -1,3 +1,3 @@\n"
+            " title\n----\n+++ replacement\n body\n")
+    if loop.diff_file_stats(meta) != [("docs/x.md", 1, 1)]:
+        bad += fail("diff_file_stats miscounts a hunk whose own lines begin "
+                    f"with ---/+++: {loop.diff_file_stats(meta)} != "
+                    "[('docs/x.md', 1, 1)]")
+
+    # Pin the regression by name, not just by behaviour: the bare slice must
+    # not come back wearing a different variable name.
+    src = (ROOT / "orchestrator" / "loop.py").read_text()
+    if re.search(r"\bdiff\[:\s*120[_,]?000\s*\]", src):
+        bad += fail("loop.py still slices the diff with a bare diff[:120000] "
+                    "-- the exact silent truncation this check exists to catch")
+    return bad
+
+
+def check_reviewer_patch_file_is_complete_and_applies() -> int:
+    """The path the prompt sends a reviewer to must be a whole, usable patch.
+
+    The notice is only worth what the file behind it is worth. Drives
+    review_stage for real over an over-cap diff -- invoke() stubbed to leave the
+    artifacts the real one leaves -- and pins three properties of the disclosed
+    path that a rendered-string test cannot see:
+
+    - it exists, and `git apply` accepts it. `git()` strips its output, so the
+      diff arrives without the trailing newline a unified diff must end with,
+      and a patch written raw makes `git apply` report "corrupt patch at line
+      N". A reviewer who tries to apply what we handed them concludes the patch
+      is damaged rather than that the tooling is. (#161 is the strip itself.)
+    - it holds what the inline copy dropped -- `shim.c` here, the file that
+      falls off every over-cap diff in this repo.
+    - the manifest the reviewer is shown agrees with `git apply --numstat` on
+      the same patch, path for path and count for count. The manifest is parsed
+      out of the diff text by diff_file_stats rather than measured by git, so
+      this is the check that it is telling the truth: a wrong `(+0/-0)` invites
+      a reviewer to skip a file that really changed, which is the exact failure
+      #135 exists to prevent.
+
+    What this deliberately does *not* assert is that the patch sits in a
+    directory of its own. It does not: logdir also holds every transcript for
+    the issue, and pointing a reviewer there is a real hazard to the
+    independence of the two reviews. The mitigation here is the notice's closing
+    sentence, asserted below; the structural fix -- a second copy under a
+    patches-only directory -- is specified by open issue #160 and belongs to it.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import gh
+    import loop
+
+    def sh(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+    prompts: list[str] = []
+
+    def fake_invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
+                    role: str = "implementer", escalate: bool = False):
+        # The real invoke's side effects on logdir, verbatim -- these are the
+        # files that sit next to the patch the reviewer is pointed at.
+        logdir.mkdir(parents=True, exist_ok=True)
+        (logdir / f"prompt.{tag}.md").write_text(prompt)
+        (logdir / f"{agent}.{tag}.log").write_text("... reviewer transcript ...\n")
+        (logdir / f"{agent}.{tag}.final.txt").write_text("VERDICT: PASS\n")
+        prompts.append(prompt)
+        return agent, 0, "VERDICT: PASS"
+
+    saved = (loop.invoke, loop.record, loop.log)
+    loop.invoke = fake_invoke
+    loop.record = lambda event, **f: None
+    loop.log = lambda msg: None
+    bad = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "wt"
+            (wt / "crates" / "frankenrust-sys").mkdir(parents=True)
+            sh(wt, "init", "-q", "-b", "main")
+            sh(wt, "config", "user.email", "check_orchestrator@example.com")
+            sh(wt, "config", "user.name", "check_orchestrator")
+            (wt / "seed.txt").write_text("seed\n")
+            sh(wt, "add", "-A")
+            sh(wt, "commit", "-q", "-m", "base")
+
+            # Over the cap on its own, so the prompt takes the branch that
+            # discloses the path -- and alphabetically first, so the C shim is
+            # what falls off, which is the shape #135 is about.
+            core = wt / "crates" / "frankenrust-core"
+            core.mkdir(parents=True)
+            (core / "cgi.rs").write_text(
+                "".join(f"// line {n}\n" for n in range(12_000)))
+            (wt / "crates" / "frankenrust-sys" / "shim.c").write_text(
+                "int go_register_server_variables(void) { return 0; }\n")
+
+            logdir = Path(tmp) / "logs" / "135"
+            logdir.mkdir(parents=True)
+            if len(loop.worktree_diff(wt).encode()) <= loop.DIFF_INLINE_CAP:
+                return fail("test setup bug: the worktree diff is under the cap, "
+                            "so the prompt never discloses a patch path at all")
+
+            issue = gh.Issue(number=135, title="reviewer prompt", body="body")
+            loop.review_stage(issue, wt, logdir, "post3")
+
+            if len(prompts) != 2:
+                return fail(f"review_stage invoked {len(prompts)} reviewers, expected 2")
+            prompt = prompts[0]
+            if prompts[1] != prompt:
+                bad += fail("the two reviewers were handed different prompts")
+            disclosed = re.findall(r"(/\S+\.patch)\b", prompt)
+            if not disclosed:
+                return fail("the reviewer prompt discloses no absolute path to the "
+                            "complete patch")
+            patch = Path(disclosed[0])
+            if not patch.is_file():
+                return fail(f"the path the prompt sends the reviewer to does not "
+                            f"exist: {patch}")
+            if "shim.c" not in patch.read_text():
+                bad += fail("the patch on disk is not the complete diff -- the file "
+                            "the inline copy dropped is missing from it too")
+
+            # git's own reading of the file we wrote: proves it parses as a
+            # patch at all, and yields the counts to hold the manifest to.
+            applied = sh(wt, "apply", "--numstat", str(patch))
+            if applied.returncode != 0:
+                bad += fail("git refuses the patch the reviewer is told to read: "
+                            f"{(applied.stdout + applied.stderr).strip()}")
+            for row in applied.stdout.splitlines():
+                added, removed, path = (row.split("\t") + ["", "", ""])[:3]
+                if added == "-":            # binary; git reports no counts
+                    continue
+                entry = f"- {path} (+{added}/-{removed})"
+                if entry not in prompt:
+                    bad += fail(f"the manifest disagrees with git about {path}: "
+                                f"expected {entry!r}, not in the prompt")
+
+            # The patch is disclosed from inside the transcripts directory, so
+            # the notice must fence the reviewer to that one file. If #160 later
+            # moves it somewhere that holds only patches, this stops applying
+            # and stops being asserted -- the hazard is the neighbours, not the
+            # sentence.
+            neighbours = [q.name for q in patch.parent.iterdir()
+                          if q != patch and not q.name.endswith(".patch")]
+            if neighbours and "nothing else" not in prompt:
+                bad += fail(f"the disclosed patch sits beside {sorted(neighbours)} "
+                            "and the prompt does not tell the reviewer to read that "
+                            "one file only -- a reviewer that lists the directory "
+                            "reads the other reviewer's verdict, and the "
+                            "two-reviewer gate becomes one")
+            return bad
+    finally:
+        loop.invoke, loop.record, loop.log = saved
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
@@ -2315,4 +2545,6 @@ if __name__ == "__main__":
              + check_retro_damaged_line_and_tolerant_prompt_command()
              + check_retro_first_pass_still_gets_tolerant_recipe()
              + check_retro_final_does_not_inherit_a_stale_report()
+             + check_reviewer_diff_not_silently_truncated()
+             + check_reviewer_patch_file_is_complete_and_applies()
              + check_rolling_pool_abandons_safely() + check_rolling_pool() else 0)

@@ -14,6 +14,12 @@ You may build repros in the worktree, and are encouraged to when a claim needs
 proof -- but the tree is the artifact under review: anything you leave behind
 in it is proposed for merge, not discarded on your behalf.
 
+If the diff section below is marked incomplete, the inline copy stops
+mid-file and the file manifest is your only evidence of what else changed.
+Read the complete patch at the absolute path it gives you, with your own
+tools, before you conclude anything -- including PASS -- about a file whose
+hunks are not inline. A file you never read is not a file you reviewed.
+
 ## Where the bugs actually are in this project
 
 Look hardest at these, in order:

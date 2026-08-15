@@ -792,6 +792,102 @@ def review_outcome(results: dict[int, str]) -> tuple[str | None, dict[int, str]]
     return None, verdicts
 
 
+DIFF_INLINE_CAP = 120_000
+
+
+def diff_file_stats(diff: str) -> list[tuple[str, int, int]]:
+    """Parse a unified diff into (path, lines added, lines removed) per file.
+
+    Reads only the diff text, not the repository, so the manifest built from
+    it is right regardless of how much of the diff a byte cap later discards
+    -- and so it can be exercised in a test against a bare string, no git
+    worktree required.
+    """
+    stats: list[tuple[str, int, int]] = []
+    path: str | None = None
+    added = removed = 0
+    in_hunk = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            if path is not None:
+                stats.append((path, added, removed))
+            m = re.match(r"^diff --git a/(.*) b/(.*)$", line)
+            path = m.group(2) if m else line[len("diff --git "):]
+            added = removed = 0
+            in_hunk = False
+        elif line.startswith("@@"):
+            # `---`/`+++` are file headers only before the first hunk. Inside
+            # one the first character alone decides, so gate on position rather
+            # than on the prefix: deleting a line that itself starts with `---`
+            # (a markdown rule, YAML front matter) renders as `----` and would
+            # otherwise be counted as no change at all.
+            in_hunk = True
+        elif in_hunk and line.startswith("+"):
+            added += 1
+        elif in_hunk and line.startswith("-"):
+            removed += 1
+    if path is not None:
+        stats.append((path, added, removed))
+    return stats
+
+
+def diff_prompt_section(diff: str, patch_path: Path, cap: int = DIFF_INLINE_CAP) -> str:
+    """Render the diff for the reviewer prompt -- never a silent cut.
+
+    A bare `diff[:cap]` reaches the reviewer as a syntactically well-formed
+    fenced code block that happens to stop mid-token, with nothing in the
+    prompt to say a byte was missing. Git emits changed paths alphabetically,
+    so the tail of every over-cap diff in this repo is deterministically
+    `frankenrust-sys` -- shim.c, the bindgen headers, build.rs -- which is
+    exactly what reviewer.md ranks as priority one to check. #135.
+
+    The manifest below is built from the diff text itself rather than a
+    second `git diff --numstat` call, so a file whose hunks fall entirely
+    past the cut is still named for the reviewer, and the whole path (patch
+    on disk, one path per file, unmistakable notice) survives being handed a
+    diff string with no repository behind it at all.
+
+    `patch_path` is inside the per-issue log directory, which also holds every
+    transcript for the issue -- the *other* reviewer's log, appended live while
+    both run; its `.final.txt` verdict the moment it lands; `prompt.fix.N.md`
+    carrying the previous round's blocking findings verbatim. A reviewer that
+    lists the directory it was just pointed at finds its peer's verdict, and
+    `review_outcome` merges on a single PASS, so two correlated reviewers are
+    worth about one. Hence the last sentence of the notice, which is emitted
+    only in this branch, the only one that names a path there. #160 makes it
+    structural by writing a second copy into a patches-only directory.
+    """
+    encoded = diff.encode()
+    total = len(encoded)
+    stats = diff_file_stats(diff)
+
+    if total <= cap:
+        return f"\n## The diff ({total:,} bytes, {len(stats)} file(s))\n```diff\n{diff}\n```\n"
+
+    shown = encoded[:cap].decode(errors="replace")
+    omitted = total - cap
+    manifest = "\n".join(f"- {path} (+{added}/-{removed})" for path, added, removed in stats)
+    return (
+        f"\n## The diff is too large to show in full -- READ THIS BEFORE THE DIFF\n\n"
+        f"This diff is {total:,} bytes. The inline copy below is truncated to the "
+        f"first {cap:,} bytes; the final {omitted:,} bytes ({omitted / total:.0%} of "
+        f"the diff) are cut and do not appear inline, mid-file and without warning "
+        f"beyond this notice.\n\n"
+        f"The complete, untruncated patch is on disk at:\n\n"
+        f"    {patch_path.resolve()}\n\n"
+        f"You have full tool access -- read that file directly before you "
+        f"conclude any file has no findings. Do not review only the inline "
+        f"copy below. Read that one patch and nothing else under the "
+        f"orchestrator's logs: everything else there is this run's own state, "
+        f"the other reviewer's transcript among it, and reading any of it "
+        f"collapses two independent reviews into one.\n\n"
+        f"## Every file in this diff ({len(stats)} file(s), independent of the cut)\n\n"
+        f"{manifest}\n\n"
+        f"## Inline copy, truncated at {cap:,} bytes -- INCOMPLETE, see notice above\n"
+        f"```diff\n{shown}\n```\n"
+    )
+
+
 def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
                   tag: str) -> tuple[str | None, dict[int, str], dict[int, str]]:
     """Two adversarial reviewers, independent contexts, diff only.
@@ -820,8 +916,22 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
     diff = worktree_diff(wt)
     if not diff.strip():
         return None, {}, {}
-    (logdir / f"diff.{tag}.patch").write_text(diff)
-    p = prompt_for("reviewer", issue, f"\n## The diff\n```diff\n{diff[:120000]}\n```\n")
+    # Stays exactly here: `unblocker.md` documents `logs/<N>/diff.*.patch` and
+    # the retrospectives cite those paths. Handing the reviewer a path inside
+    # the transcripts directory is a real hazard -- see the notice built by
+    # diff_prompt_section, which is the mitigation -- and quarantining the file
+    # into a patches-only subdirectory is already specified, with a second
+    # write rather than a move, by open issue #160. Doing it here as well would
+    # be the same work twice, spelled two different ways.
+    patch_path = logdir / f"diff.{tag}.patch"
+    # `git()` strips its output, so `diff` has lost the trailing newline every
+    # patch needs -- without it `git apply` reports "corrupt patch at <last
+    # line>" and a reviewer who tries to apply what we handed them concludes
+    # the patch is damaged. Restored here, at the only site that writes one;
+    # the strip itself is `git()`'s, shared by every caller, and is #161.
+    on_disk = diff if diff.endswith("\n") else diff + "\n"
+    patch_path.write_text(on_disk)
+    p = prompt_for("reviewer", issue, diff_prompt_section(diff, patch_path))
 
     # Seeded from the roster rather than filled in by whoever survives. invoke()
     # is the one Popen site in this file with no FileNotFoundError guard, so a
