@@ -26,12 +26,14 @@ step() {
 }
 
 # Fail closed: an agent that deletes the test suite must not get a green gate.
+# Rust tests live under crates/*/src and crates/*/tests (there is no top-level
+# src/), so both greps below scan `tests crates`, not `tests src`.
 step "test-suite-intact" bash -c '
   [ -d tests ] || { echo "tests/ is missing"; exit 1; }
-  n=$(grep -rl "#\[test\]\|#\[tokio::test\]" tests src 2>/dev/null | wc -l | tr -d " ")
+  n=$(grep -rl "#\[test\]\|#\[tokio::test\]" tests crates 2>/dev/null | wc -l | tr -d " ")
   min=$(cat .gate/min-test-files 2>/dev/null || echo 0)
   [ "$n" -ge "$min" ] || { echo "test files: $n < required $min"; exit 1; }
-  ! grep -rn "#\[ignore\]" tests src 2>/dev/null | grep -v "GATE-OK" || {
+  ! grep -rn "#\[ignore\]" tests crates 2>/dev/null | grep -v "GATE-OK" || {
     echo "found #[ignore] without a GATE-OK justification"; exit 1; }
 '
 
