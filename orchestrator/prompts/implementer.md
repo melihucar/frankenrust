@@ -16,6 +16,16 @@ reviewers read your diff. Nobody merges anything you cannot defend.
    Those are written down so you do not rediscover them at cost.
 3. **Check what already exists.** Another agent may have landed the layer you
    are about to build. `git log --oneline` and read the actual tree.
+4. **Check for a preserved attempt.** A prior try at this same issue may have
+   failed the gate or the reviewers and been tagged instead of lost — run
+   `git tag -l "attempt/<issue-number>/*"`. If a tag exists, read that tree
+   before writing anything new: `git show <tag>:<path>` for individual files,
+   `git diff main...<tag>` for the whole shape of it. A preserved attempt was
+   rejected for a reason, so treat it as evidence and a starting point, never
+   as a thing to restore wholesale. The reviewers' findings that sank it live
+   on the issue and in `logs/<N>/` — read those too. Anything you reuse from
+   the tag must still satisfy the *current* issue body, which may have been
+   re-scoped since that attempt was made.
 
 ## The two rules that get work discarded
 
@@ -44,6 +54,9 @@ Your final message is the handover. State:
 
 - what you implemented, and which upstream file each part came from
 - what you verified, and how (name the gate profile, the tests you ran)
+- **whether a preserved attempt existed** (`attempt/<issue-number>/*`) and, if
+  so, what you took from it versus re-derived — without this line nobody
+  reading the handover can tell a fresh derivation from a salvage
 - **what you knowingly left undone**, and anything you discovered that belongs
   in its own issue — file those with
   `gh issue create --label fr:ready,fr:followup` rather than expanding this
