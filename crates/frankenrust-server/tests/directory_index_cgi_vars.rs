@@ -13,12 +13,18 @@
 //!   GET /dirindex/   -> DOCUMENT_URI=/dirindex/index.php PATH_INFO=(empty)
 //!                        SCRIPT_NAME=/dirindex/index.php
 //!                        SCRIPT_FILENAME=/app/public/dirindex/index.php
+//!   GET /vars.php/a/ -> DOCUMENT_URI=/vars.php         PATH_INFO=/a
+//!                        SCRIPT_NAME=/vars.php          SCRIPT_FILENAME=/app/public/vars.php
+//!                        (REQUEST_URI=/vars.php/a/; no index.php anywhere)
 //!
-//! i.e. every CGI path variable is computed as though the request had asked
-//! for `index.php` directly; only `REQUEST_URI` stays unrewritten. This
-//! file's fixture (`tests/fixtures/directory_index/`) mirrors that shape one
-//! level deep (`sub/index.php`) so `GET /sub/` can be checked against
-//! `tryFiles`' second entry, `{path}/index.php`.
+//! i.e. for a path ending in `/` every CGI path variable is computed as
+//! though the request had asked for `index.php` directly, and only
+//! `REQUEST_URI` stays unrewritten -- but a path already carrying a `.php`
+//! split point is claimed by `tryFiles`' *first* entry and is not touched at
+//! all. This file's fixture (`tests/fixtures/directory_index/`) mirrors that
+//! shape: `sub/index.php` so `GET /sub/` can be checked against `tryFiles`'
+//! second entry (`{path}/index.php`), and `vars.php` so `GET /vars.php/a/`
+//! can be checked against the first.
 //!
 //! A separate binary from `tests/directory_index.rs` -- see that file's doc
 //! comment for why (`init_php_threads` succeeds once per process, and this
@@ -74,6 +80,10 @@ async fn get_root_and_get_sub_resolve_cgi_path_vars_as_if_index_php_were_request
         tokio::time::timeout(timeout, support::get(addr, "/sub/"))
             .await
             .expect("GET /sub/ must complete well within 30s");
+    let (path_info_status, _path_info_headers, path_info_body) =
+        tokio::time::timeout(timeout, support::get(addr, "/vars.php/a/"))
+            .await
+            .expect("GET /vars.php/a/ must complete well within 30s");
 
     let _ = shutdown_tx.send(());
     tokio::time::timeout(timeout, server)
@@ -113,5 +123,49 @@ async fn get_root_and_get_sub_resolve_cgi_path_vars_as_if_index_php_were_request
     assert_eq!(
         sub_vars.get("SCRIPT_FILENAME").map(String::as_str),
         Some(format!("{root_str}/sub/index.php")).as_deref()
+    );
+
+    // The guard, from the other side. `tryFiles` is ordered and its first
+    // entry -- `{http.request.uri.path}` behind a `file` matcher with
+    // `SplitPath: [".php"]` (`php-server.go:133` + `:165-171`) -- claims any
+    // path carrying a `.php` split point, so upstream never reaches the
+    // directory-index entry for one. Same oracle run as the header comment:
+    //
+    //   GET /vars.php/a/ -> DOCUMENT_URI=/vars.php  SCRIPT_NAME=/vars.php
+    //                        SCRIPT_FILENAME=/app/public/vars.php
+    //                        PATH_INFO=/a  REQUEST_URI=/vars.php/a/
+    //
+    // Without the guard `resolve_directory_index` rewrites this to
+    // `/vars.php/a/index.php`, `split_pos` splits at the *first* `.php`, and
+    // `PATH_INFO` becomes `/a/index.php` -- a segment the client never sent,
+    // delivered to the application's router. `SCRIPT_NAME`/`SCRIPT_FILENAME`
+    // stay correct either way, so PHP still runs and still answers 200:
+    // nothing but this assertion catches it.
+    assert_eq!(path_info_status, 200);
+    let path_info_vars = parse_vars(&path_info_body);
+    assert_eq!(
+        path_info_vars.get("DOCUMENT_URI").map(String::as_str),
+        Some("/vars.php")
+    );
+    assert_eq!(
+        path_info_vars.get("SCRIPT_NAME").map(String::as_str),
+        Some("/vars.php")
+    );
+    assert_eq!(
+        path_info_vars.get("SCRIPT_FILENAME").map(String::as_str),
+        Some(format!("{root_str}/vars.php")).as_deref()
+    );
+    // Upstream reports `/a`, we report `/a/`: Caddy's entry-1 rewrite
+    // canonicalises the trailing slash away and we have no URI-canonicalising
+    // layer. That one byte predates this rewrite -- it is what
+    // `split_cgi_path` alone produced for this path before
+    // `resolve_directory_index` existed -- and is filed as #196, which will
+    // flip this to `/a`. What is pinned here is that nothing is *appended*.
+    assert_eq!(
+        path_info_vars.get("PATH_INFO").map(String::as_str),
+        Some("/a/"),
+        "PATH_INFO must carry only what the client sent; `/a/index.php` here \
+         means the directory-index rewrite fired on a path upstream's \
+         tryFiles claims at entry 1"
     );
 }

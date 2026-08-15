@@ -261,7 +261,8 @@ pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
 }
 
 /// Rewrites a request path ending in `/` to that same path plus
-/// `index.php`, in place. No-op otherwise.
+/// `index.php`, in place, unless the path already carries a `.php` split
+/// point. No-op otherwise.
 ///
 /// Upstream does this one layer above `frankenphp` proper, in Caddy's
 /// `try_files` (`vendor/frankenphp/caddy/php-server.go:133`): by the time a
@@ -269,6 +270,30 @@ pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
 /// rewritten. FrankenRust has no Caddy layer, so `handle` plays that role
 /// itself, calling this immediately before `cgi::split_cgi_path` -- the same
 /// position relative to the split that upstream's rewrite occupies.
+///
+/// `tryFiles` is an *ordered* list, and the `index.php` entry is its
+/// **second**: `{"{http.request.uri.path}", "{http.request.uri.path}/" +
+/// indexFile, indexFile}`. Entry 1 is matched by a `file` matcher carrying
+/// `SplitPath: [".php"]` (`php-server.go:165-171`), so a path with a `.php`
+/// script segment matches there and is rewritten to itself -- it never
+/// reaches the directory-index entry. Hence the `split_pos` guard: without
+/// it, `GET /vars.php/a/` would be rewritten to `/vars.php/a/index.php`,
+/// `split_cgi_path` would split at the *first* `.php` (`cgi.rs`'s
+/// `split_pos`, pinned by its `("/path/to/script.php/some/path", 19)` case),
+/// and the appended segment would land in `PATH_INFO` -- a path component
+/// the client never sent, injected into application-visible routing data,
+/// with `SCRIPT_NAME` still correct so PHP runs and returns 200 anyway.
+///
+/// Gating on `cgi::split_pos` specifically -- rather than on a separate port
+/// of Caddy's `firstSplit` -- is what makes the rewrite provably
+/// segment-injection-free: `split_pos` returns `-1` only when `.php` occurs
+/// *nowhere* in the path, and a path ending in `/` cannot form a `.php`
+/// straddling the join, so the appended `index.php` is always the first and
+/// only split point. `doc_uri`/`script_name` therefore become the whole
+/// rewritten path and `path_info` is always empty, which is exactly what the
+/// oracle reports below. It also means every path this guard rejects keeps
+/// byte-for-byte the `split_cgi_path` output it had before this function
+/// existed, so the rewrite can regress nothing.
 ///
 /// This is deliberately the no-stat slice of `tryFiles`, not the full
 /// three-way probe: only "path ends in `/`" is handled. No filesystem stat,
@@ -280,19 +305,36 @@ pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
 ///
 /// Verified empirically, not assumed: run against the pinned upstream image
 /// (`dunglas/frankenphp@sha256:4b0713dd...`, `corpus.toml`'s
-/// `[targets.upstream]`) with `vendor/frankenphp/testdata` mounted at
-/// `/app/public`, `GET /` returns
-/// `DOCUMENT_URI=/index.php SCRIPT_NAME=/index.php
-/// SCRIPT_FILENAME=/app/public/index.php PATH_INFO=(empty)` but
-/// `REQUEST_URI=/` -- unrewritten (`GET /dirindex/` behaves the same way one
-/// level down: `DOCUMENT_URI=/dirindex/index.php`,
-/// `REQUEST_URI=/dirindex/`). So only the CGI-split input is rewritten here;
-/// `raw_target` (and therefore `REQUEST_URI` / `context.rs`'s
-/// `request_uri`, which copies `raw_target` verbatim) must stay untouched,
-/// which is exactly what mutating `core_request.path` and not
-/// `core_request.raw_target` gives us.
+/// `[targets.upstream]`) with `-e SERVER_NAME=:80` and a `$_SERVER`-dumping
+/// document root mounted at `/app/public` (`index.php`, `sub/index.php`,
+/// `vars.php`), the observed values are:
+///
+/// ```text
+/// GET /            REQUEST_URI=/            DOCUMENT_URI=/index.php      SCRIPT_NAME=/index.php      SCRIPT_FILENAME=/app/public/index.php      PATH_INFO=
+/// GET /sub/        REQUEST_URI=/sub/        DOCUMENT_URI=/sub/index.php  SCRIPT_NAME=/sub/index.php  SCRIPT_FILENAME=/app/public/sub/index.php  PATH_INFO=
+/// GET /vars.php/   REQUEST_URI=/vars.php/   DOCUMENT_URI=/vars.php       SCRIPT_NAME=/vars.php       SCRIPT_FILENAME=/app/public/vars.php       PATH_INFO=
+/// GET /vars.php/a/ REQUEST_URI=/vars.php/a/ DOCUMENT_URI=/vars.php       SCRIPT_NAME=/vars.php       SCRIPT_FILENAME=/app/public/vars.php       PATH_INFO=/a
+/// ```
+///
+/// Two things to read off that table. First, `REQUEST_URI` is *not*
+/// rewritten -- it is the original request line in every row -- so only the
+/// CGI-split input is rewritten here; `raw_target` (and therefore
+/// `REQUEST_URI` / `context.rs`'s `request_uri`, which copies `raw_target`
+/// verbatim) must stay untouched, which is exactly what mutating
+/// `core_request.path` and not `core_request.raw_target` gives us. Second,
+/// the bottom two rows are the ones the guard exists for: upstream leaves a
+/// `.php`-bearing path on entry 1 and never appends anything to it.
+///
+/// One known and deliberate divergence in the guarded case: for
+/// `/vars.php/a/` we emit `PATH_INFO=/a/`, upstream `/a`. Caddy's entry-1
+/// rewrite canonicalises that trailing slash away; our no-Caddy path has no
+/// URI-canonicalisation step, and adding one is neither this function's job
+/// nor in scope here. It predates this rewrite (it is what `split_cgi_path`
+/// alone has always produced for that path) and is filed as #196; what
+/// matters for this function is that it appends nothing, which is the part
+/// that would otherwise fabricate a segment.
 fn resolve_directory_index(path: &mut Vec<u8>) {
-    if path.ends_with(b"/") {
+    if path.ends_with(b"/") && cgi::split_pos(path, &[b".php".as_slice()]) < 0 {
         path.extend_from_slice(b"index.php");
     }
 }
@@ -419,6 +461,62 @@ mod tests {
         let mut sub_script = b"/sub/hello.php".to_vec();
         resolve_directory_index(&mut sub_script);
         assert_eq!(sub_script, b"/sub/hello.php");
+    }
+
+    /// `tryFiles`' first entry (`{path}` behind a `file` matcher with
+    /// `SplitPath: [".php"]`) claims any path carrying a `.php` split point,
+    /// so upstream never reaches the directory-index entry for these. The
+    /// pinned oracle confirms it: `GET /vars.php/a/` reports
+    /// `SCRIPT_NAME=/vars.php PATH_INFO=/a`, and `GET /vars.php/` reports
+    /// `SCRIPT_NAME=/vars.php PATH_INFO=` -- no `index.php` anywhere.
+    /// Appending it regardless would push the fabricated segment into
+    /// `PATH_INFO` (`split_pos` splits at the *first* `.php`), which PHP
+    /// hands to the application's router as if the client had sent it.
+    #[test]
+    fn resolve_directory_index_leaves_a_php_bearing_trailing_slash_path_alone() {
+        for path in [
+            b"/vars.php/".as_slice(),
+            b"/vars.php/a/".as_slice(),
+            b"/index.php/users/".as_slice(),
+            // `split_pos` matches `.php` anywhere, not only before a `/`, so
+            // this is left alone too -- and must be. Rewriting it would put
+            // `foo/index.php` in `PATH_INFO` behind a `/a.php` script name,
+            // the same injection one case further out.
+            b"/a.phpfoo/".as_slice(),
+        ] {
+            let mut rewritten = path.to_vec();
+            resolve_directory_index(&mut rewritten);
+            assert_eq!(
+                rewritten,
+                path,
+                "{} carries a .php split point, so it is claimed by tryFiles' \
+                 first entry upstream and must not gain an index.php segment",
+                String::from_utf8_lossy(path)
+            );
+        }
+    }
+
+    /// The invariant the `split_pos` guard buys, stated as a test: whenever
+    /// the rewrite *does* fire, the appended `index.php` is the first and
+    /// only `.php` in the result, so `split_cgi_path` puts the whole path in
+    /// `script_name` and leaves `path_info` empty -- matching the oracle's
+    /// `PATH_INFO=` for both `GET /` and `GET /sub/`.
+    #[test]
+    fn a_rewritten_path_splits_with_an_empty_path_info() {
+        for path in [b"/".as_slice(), b"/sub/".as_slice(), b"/a/b/".as_slice()] {
+            let mut rewritten = path.to_vec();
+            resolve_directory_index(&mut rewritten);
+
+            let paths = cgi::split_cgi_path(b"/var/www", None, &rewritten);
+            assert_eq!(
+                paths.path_info,
+                b"",
+                "rewriting {} must not leave anything in path_info",
+                String::from_utf8_lossy(path)
+            );
+            assert_eq!(paths.script_name, rewritten);
+            assert_eq!(paths.doc_uri, rewritten);
+        }
     }
 
     /// The accept loop's survival hinges on this classification, and the two
