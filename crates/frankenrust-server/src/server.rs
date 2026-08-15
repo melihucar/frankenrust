@@ -260,6 +260,43 @@ pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
     TcpListener::bind(addr).await
 }
 
+/// Rewrites a request path ending in `/` to that same path plus
+/// `index.php`, in place. No-op otherwise.
+///
+/// Upstream does this one layer above `frankenphp` proper, in Caddy's
+/// `try_files` (`vendor/frankenphp/caddy/php-server.go:133`): by the time a
+/// request reaches `splitCgiPath` (`cgi.go`), the URL has already been
+/// rewritten. FrankenRust has no Caddy layer, so `handle` plays that role
+/// itself, calling this immediately before `cgi::split_cgi_path` -- the same
+/// position relative to the split that upstream's rewrite occupies.
+///
+/// This is deliberately the no-stat slice of `tryFiles`, not the full
+/// three-way probe: only "path ends in `/`" is handled. No filesystem stat,
+/// no static-file branch, no configurable index filename -- out of scope for
+/// the thin slice (`docs/PORTING-NOTES.md:175`, `docs/ARCHITECTURE.md:401`),
+/// and matching what `docker/pasir.Dockerfile:37-42` and
+/// `bench/harness/config/Caddyfile.matched` both already document as the
+/// comparison point.
+///
+/// Verified empirically, not assumed: run against the pinned upstream image
+/// (`dunglas/frankenphp@sha256:4b0713dd...`, `corpus.toml`'s
+/// `[targets.upstream]`) with `vendor/frankenphp/testdata` mounted at
+/// `/app/public`, `GET /` returns
+/// `DOCUMENT_URI=/index.php SCRIPT_NAME=/index.php
+/// SCRIPT_FILENAME=/app/public/index.php PATH_INFO=(empty)` but
+/// `REQUEST_URI=/` -- unrewritten (`GET /dirindex/` behaves the same way one
+/// level down: `DOCUMENT_URI=/dirindex/index.php`,
+/// `REQUEST_URI=/dirindex/`). So only the CGI-split input is rewritten here;
+/// `raw_target` (and therefore `REQUEST_URI` / `context.rs`'s
+/// `request_uri`, which copies `raw_target` verbatim) must stay untouched,
+/// which is exactly what mutating `core_request.path` and not
+/// `core_request.raw_target` gives us.
+fn resolve_directory_index(path: &mut Vec<u8>) {
+    if path.ends_with(b"/") {
+        path.extend_from_slice(b"index.php");
+    }
+}
+
 /// The `ServeHTTP` port (`frankenphp.go:396-428`): builds a
 /// [`RequestContext`], validates it, dispatches it to a regular PHP thread,
 /// awaits completion, and renders the response through this crate's single
@@ -279,7 +316,8 @@ async fn handle(
         Err(_) => Bytes::new(),
     };
 
-    let core_request = build_request(&parts, body_bytes, remote_addr);
+    let mut core_request = build_request(&parts, body_bytes, remote_addr);
+    resolve_directory_index(&mut core_request.path);
 
     // #107 (CGI path splitting inside `RequestContext::new`) is open and
     // unlanded as of this issue: `doc_uri`/`path_info`/`script_name`/
@@ -360,6 +398,28 @@ fn path_bytes(path: &std::path::Path) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_directory_index_appends_index_php_to_a_trailing_slash() {
+        let mut root = b"/".to_vec();
+        resolve_directory_index(&mut root);
+        assert_eq!(root, b"/index.php");
+
+        let mut sub = b"/sub/".to_vec();
+        resolve_directory_index(&mut sub);
+        assert_eq!(sub, b"/sub/index.php");
+    }
+
+    #[test]
+    fn resolve_directory_index_leaves_a_non_directory_path_alone() {
+        let mut script = b"/index.php".to_vec();
+        resolve_directory_index(&mut script);
+        assert_eq!(script, b"/index.php");
+
+        let mut sub_script = b"/sub/hello.php".to_vec();
+        resolve_directory_index(&mut sub_script);
+        assert_eq!(sub_script, b"/sub/hello.php");
+    }
 
     /// The accept loop's survival hinges on this classification, and the two
     /// errnos that matter most (`EMFILE`/`ENFILE`) are unreachable from an

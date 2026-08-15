@@ -1,0 +1,117 @@
+//! Issue #187: asserts the four CGI path variables `resolve_directory_index`
+//! (`server.rs`) is responsible for getting right, against values observed
+//! empirically from the pinned upstream image
+//! (`dunglas/frankenphp@sha256:4b0713ddad6ca7eb21eb82ac6bdb7cb41de5192a930b615d89af6e15d74e82f8`,
+//! `tests/conformance/corpus.toml`'s `[targets.upstream]`), run by hand with
+//! `vendor/frankenphp/testdata` mounted at `/app/public` and a script that
+//! dumps `$_SERVER`:
+//!
+//!   GET /            -> DOCUMENT_URI=/index.php       PATH_INFO=(empty)
+//!                        SCRIPT_NAME=/index.php        SCRIPT_FILENAME=/app/public/index.php
+//!                        (REQUEST_URI=/, unrewritten -- not asserted here,
+//!                        already covered by context.rs's request_uri tests)
+//!   GET /dirindex/   -> DOCUMENT_URI=/dirindex/index.php PATH_INFO=(empty)
+//!                        SCRIPT_NAME=/dirindex/index.php
+//!                        SCRIPT_FILENAME=/app/public/dirindex/index.php
+//!
+//! i.e. every CGI path variable is computed as though the request had asked
+//! for `index.php` directly; only `REQUEST_URI` stays unrewritten. This
+//! file's fixture (`tests/fixtures/directory_index/`) mirrors that shape one
+//! level deep (`sub/index.php`) so `GET /sub/` can be checked against
+//! `tryFiles`' second entry, `{path}/index.php`.
+//!
+//! A separate binary from `tests/directory_index.rs` -- see that file's doc
+//! comment for why (`init_php_threads` succeeds once per process, and this
+//! needs a different document root).
+mod support;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use frankenrust_server::ServerConfig;
+
+fn fixture_document_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/directory_index")
+}
+
+/// Parses the fixture script's `KEY=value\n`-per-line body into a map.
+fn parse_vars(body: &[u8]) -> HashMap<String, String> {
+    String::from_utf8(body.to_vec())
+        .expect("the fixture script only ever emits ASCII")
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn get_root_and_get_sub_resolve_cgi_path_vars_as_if_index_php_were_requested() {
+    let listener = frankenrust_server::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("binding an ephemeral port must succeed");
+    let addr = listener
+        .local_addr()
+        .expect("a bound listener has a local address");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let root = fixture_document_root();
+    let config = ServerConfig {
+        document_root: root.clone(),
+        num_threads: 1,
+        php_ini: HashMap::new(),
+    };
+
+    let server = tokio::spawn(frankenrust_server::run(listener, config, async {
+        let _ = shutdown_rx.await;
+    }));
+
+    let timeout = std::time::Duration::from_secs(30);
+    let (root_status, _root_headers, root_body) =
+        tokio::time::timeout(timeout, support::get(addr, "/"))
+            .await
+            .expect("GET / must complete well within 30s");
+    let (sub_status, _sub_headers, sub_body) =
+        tokio::time::timeout(timeout, support::get(addr, "/sub/"))
+            .await
+            .expect("GET /sub/ must complete well within 30s");
+
+    let _ = shutdown_tx.send(());
+    tokio::time::timeout(timeout, server)
+        .await
+        .expect("server must shut down within 30s -- a hang here is a lost wakeup in the dispatch/drain path")
+        .expect("the server task must not panic")
+        .expect("run() must return Ok on a clean shutdown");
+
+    assert_eq!(root_status, 200);
+    let root_vars = parse_vars(&root_body);
+    let root_str = root.to_str().expect("fixture root must be valid UTF-8");
+    assert_eq!(
+        root_vars.get("DOCUMENT_URI").map(String::as_str),
+        Some("/index.php")
+    );
+    assert_eq!(root_vars.get("PATH_INFO").map(String::as_str), Some(""));
+    assert_eq!(
+        root_vars.get("SCRIPT_NAME").map(String::as_str),
+        Some("/index.php")
+    );
+    assert_eq!(
+        root_vars.get("SCRIPT_FILENAME").map(String::as_str),
+        Some(format!("{root_str}/index.php")).as_deref()
+    );
+
+    assert_eq!(sub_status, 200);
+    let sub_vars = parse_vars(&sub_body);
+    assert_eq!(
+        sub_vars.get("DOCUMENT_URI").map(String::as_str),
+        Some("/sub/index.php")
+    );
+    assert_eq!(sub_vars.get("PATH_INFO").map(String::as_str), Some(""));
+    assert_eq!(
+        sub_vars.get("SCRIPT_NAME").map(String::as_str),
+        Some("/sub/index.php")
+    );
+    assert_eq!(
+        sub_vars.get("SCRIPT_FILENAME").map(String::as_str),
+        Some(format!("{root_str}/sub/index.php")).as_deref()
+    );
+}
