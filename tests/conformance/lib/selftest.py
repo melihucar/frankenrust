@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import difflib
 import io
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -262,23 +263,27 @@ def check_frankenrust_mismatch_fails_the_run(corpus: dict) -> list[str]:
 
     Asserting on main() rather than on replay_frankenrust() is the whole point
     of this check. The regression surface is the caller, not the helper: main()
-    owns the image_exists() branch that decides whether the comparison happens
-    at all, and the total_failures.extend() that decides whether its verdict
-    reaches the exit code. An earlier version of this check called the helper
-    directly and stayed green -- 5/5, rc 0 -- under both mutations it exists to
-    catch: reverting the branch to a print, and deleting the extend(). Since no
-    frankenrust:bench exists on any host yet, the gate's own replay takes the
-    else-branch and never executes that wiring either, so nothing but this
-    check covers the one edge that has to hold: helper result -> exit code.
+    owns the frankenrust_leg_enabled() branch that decides whether the leg
+    runs at all, the image_exists() branch nested inside it that decides
+    whether the comparison happens or hard-fails, and the total_failures.
+    extend() that decides whether the comparison's verdict reaches the exit
+    code. An earlier version of this check called the helper directly and
+    stayed green -- 5/5, rc 0 -- under both mutations it exists to catch:
+    reverting the branch to a print, and deleting the extend(). Since
+    FRANKENRUST_LEG_ENABLED defaults to False and no frankenrust:bench exists
+    on any host yet, the gate's own replay never executes that wiring either,
+    so nothing but this check covers the two edges that have to hold: leg
+    enabled -> comparison runs, and helper result -> exit code.
 
     This does not wait for #15 to build frankenrust:bench. main()'s frankenrust
-    leg is pointed at the upstream image by patching FRANKENRUST_BENCH_IMAGE
-    (main() reads it at call time for both the existence probe and the replay)
-    and given one deliberately-corrupted golden. The upstream leg is stubbed
-    out rather than run: it is not what is under test, and against the same
-    corrupted golden its own failures would drive main() to 1 on their own --
-    masking a dropped extend() and reporting a green that means nothing. It
-    also halves the containers this check starts.
+    leg is forced on by patching FRANKENRUST_LEG_ENABLED, then pointed at the
+    upstream image by patching FRANKENRUST_BENCH_IMAGE (main() reads both at
+    call time -- see frankenrust_leg_enabled() and replay_frankenrust()'s
+    docstrings) and given one deliberately-corrupted golden. The upstream leg
+    is stubbed out rather than run: it is not what is under test, and against
+    the same corrupted golden its own failures would drive main() to 1 on
+    their own -- masking a dropped extend() and reporting a green that means
+    nothing. It also halves the containers this check starts.
 
     Everything patched is restored in `finally`, and the corrupted golden lives
     in a throwaway temp directory, so the real golden/ is never written to and
@@ -302,6 +307,7 @@ def check_frankenrust_mismatch_fails_the_run(corpus: dict) -> list[str]:
         common.GOLDEN_DIR,
         common.load_corpus,
         common.image_exists,
+        replay.FRANKENRUST_LEG_ENABLED,
         replay.FRANKENRUST_BENCH_IMAGE,
         replay.replay_upstream,
     )
@@ -314,6 +320,7 @@ def check_frankenrust_mismatch_fails_the_run(corpus: dict) -> list[str]:
             # Not a blanket True: main() must probe for the same image it then
             # replays against, or the branch it takes is not the one shipped.
             common.image_exists = lambda image: image == upstream_image
+            replay.FRANKENRUST_LEG_ENABLED = True
             replay.FRANKENRUST_BENCH_IMAGE = upstream_image
             replay.replay_upstream = lambda _corpus: (1, [], [])
             with contextlib.redirect_stdout(captured):
@@ -323,6 +330,7 @@ def check_frankenrust_mismatch_fails_the_run(corpus: dict) -> list[str]:
                 common.GOLDEN_DIR,
                 common.load_corpus,
                 common.image_exists,
+                replay.FRANKENRUST_LEG_ENABLED,
                 replay.FRANKENRUST_BENCH_IMAGE,
                 replay.replay_upstream,
             ) = saved
@@ -504,6 +512,7 @@ def check_skipped_case_not_counted_as_compared(corpus: dict) -> list[str]:
     saved = (
         common.load_corpus,
         common.image_exists,
+        replay.FRANKENRUST_LEG_ENABLED,
         replay.FRANKENRUST_BENCH_IMAGE,
         replay.replay_upstream,
     )
@@ -511,6 +520,7 @@ def check_skipped_case_not_counted_as_compared(corpus: dict) -> list[str]:
     try:
         common.load_corpus = lambda: mini_corpus
         common.image_exists = lambda image: image == upstream_image
+        replay.FRANKENRUST_LEG_ENABLED = True
         replay.FRANKENRUST_BENCH_IMAGE = upstream_image
         replay.replay_upstream = lambda _corpus: (1, [], [])
         with contextlib.redirect_stdout(captured):
@@ -519,6 +529,7 @@ def check_skipped_case_not_counted_as_compared(corpus: dict) -> list[str]:
         (
             common.load_corpus,
             common.image_exists,
+            replay.FRANKENRUST_LEG_ENABLED,
             replay.FRANKENRUST_BENCH_IMAGE,
             replay.replay_upstream,
         ) = saved
@@ -545,6 +556,114 @@ def check_skipped_case_not_counted_as_compared(corpus: dict) -> list[str]:
     return problems
 
 
+# A tag docker cannot plausibly have built locally -- used to force
+# common.image_exists() to report absent without needing to fabricate or
+# remove a real image.
+_FRANKENRUST_NONEXISTENT_IMAGE = "frankenrust-conformance-selftest-does-not-exist:none"
+
+
+def check_frankenrust_leg_enabled_with_missing_image_fails() -> list[str]:
+    """Enabled leg + missing image must fail replay.main(), not skip it.
+
+    Issue #199: the frankenrust leg used to arm itself off whatever
+    `frankenrust:bench` happened to exist on the host, so there was no way to
+    ask for the leg and be told "no" -- it was either silently off (image
+    absent) or silently on (image present, on whichever worktree happened to
+    build it first). FRANKENRUST_LEG_ENABLED makes "on" explicit; this pins
+    the other half, that "on" with nothing to replay against is a hard
+    failure, per the module docstring's "never exits 0 while skipping the
+    corpus" promise -- the same promise check_frankenrust_mismatch_fails_the_run
+    protects for a mismatch rather than a missing image.
+
+    Container-free: replay_upstream is stubbed, and FRANKENRUST_BENCH_IMAGE
+    is repointed at a tag docker cannot have built, so common.image_exists()
+    runs for real -- a single `docker image inspect`, not a `docker run` --
+    and reports absent without this check needing to remove a real image
+    first.
+    """
+    saved = (
+        replay.FRANKENRUST_LEG_ENABLED,
+        replay.FRANKENRUST_BENCH_IMAGE,
+        replay.replay_upstream,
+    )
+    captured = io.StringIO()
+    try:
+        replay.FRANKENRUST_LEG_ENABLED = True
+        replay.FRANKENRUST_BENCH_IMAGE = _FRANKENRUST_NONEXISTENT_IMAGE
+        replay.replay_upstream = lambda _corpus: (1, [], [])
+        with contextlib.redirect_stdout(captured):
+            rc = replay.main()
+    finally:
+        (
+            replay.FRANKENRUST_LEG_ENABLED,
+            replay.FRANKENRUST_BENCH_IMAGE,
+            replay.replay_upstream,
+        ) = saved
+
+    output = captured.getvalue()
+    problems = []
+    if rc == 0:
+        problems.append(
+            "replay.main() exited 0 with the frankenrust leg enabled and "
+            f"{_FRANKENRUST_NONEXISTENT_IMAGE!r} missing -- an enabled leg with nothing "
+            "to replay against must fail the run, not skip it. main() said:\n"
+            + _indent(output)
+        )
+    if replay.FRANKENRUST_MISSING_IMAGE_MARKER not in output:
+        problems.append(
+            f"replay.main() did not report {replay.FRANKENRUST_MISSING_IMAGE_MARKER!r} "
+            "for an enabled leg with a missing image. main() said:\n" + _indent(output)
+        )
+    return problems
+
+
+def check_frankenrust_leg_disabled_prints_reason() -> list[str]:
+    """The default disabled leg must say why, not just go quiet.
+
+    Issue #199 requires a reader of the gate log be able to tell "deliberately
+    off, owned by #159/#170" from "quietly not running". This drives
+    replay.main() with the leg at its default (disabled) and asserts the
+    reason line -- naming both blocking issues -- appears in its output.
+
+    FRANKENRUST_CONFORMANCE is popped from the environment for the duration
+    of the check (and restored after) so the result does not depend on
+    whether the developer running this happens to have it exported: the env
+    override exists so someone can force the leg on locally, and this check
+    has to hold regardless of whether they have. replay_upstream is stubbed
+    for the same reason as its neighbour above: exercising the disabled
+    branch needs no container.
+    """
+    saved = (replay.FRANKENRUST_LEG_ENABLED, replay.replay_upstream)
+    had_env = "FRANKENRUST_CONFORMANCE" in os.environ
+    saved_env = os.environ.pop("FRANKENRUST_CONFORMANCE", None)
+    captured = io.StringIO()
+    try:
+        replay.FRANKENRUST_LEG_ENABLED = False
+        replay.replay_upstream = lambda _corpus: (1, [], [])
+        with contextlib.redirect_stdout(captured):
+            rc = replay.main()
+    finally:
+        replay.FRANKENRUST_LEG_ENABLED, replay.replay_upstream = saved
+        if had_env:
+            os.environ["FRANKENRUST_CONFORMANCE"] = saved_env
+
+    output = captured.getvalue()
+    problems = []
+    if rc != 0:
+        problems.append(
+            "replay.main() exited non-zero with the frankenrust leg disabled and the "
+            "(stubbed) upstream leg clean -- a disabled leg must never fail the run. "
+            "main() said:\n" + _indent(output)
+        )
+    if replay.FRANKENRUST_DISABLED_REASON not in output:
+        problems.append(
+            "replay.main() did not print why the frankenrust leg is disabled -- expected "
+            f"{replay.FRANKENRUST_DISABLED_REASON!r} in its output. main() said:\n"
+            + _indent(output)
+        )
+    return problems
+
+
 def main() -> int:
     corpus = common.load_corpus()
 
@@ -561,6 +680,14 @@ def main() -> int:
         (
             "skipped case not counted as compared",
             lambda: check_skipped_case_not_counted_as_compared(corpus),
+        ),
+        (
+            "frankenrust leg enabled with missing image fails",
+            lambda: check_frankenrust_leg_enabled_with_missing_image_fails(),
+        ),
+        (
+            "frankenrust leg disabled prints reason",
+            lambda: check_frankenrust_leg_disabled_prints_reason(),
         ),
     ]
 

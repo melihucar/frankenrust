@@ -4,9 +4,19 @@
 Always replays against the pinned upstream image and fails on any mismatch
 -- that makes the harness self-testing with no Rust in the tree: if the
 corpus is not deterministic, upstream disagrees with its own goldens and
-this exits non-zero. If a `frankenrust:bench` image exists locally, also
-replays against it and fails on mismatch; today that image does not exist,
-so that half is a no-op (logged, not silently skipped).
+this exits non-zero.
+
+The frankenrust leg is gated by FRANKENRUST_LEG_ENABLED below, not by
+whether a `frankenrust:bench` image happens to exist. Docker images are
+host-global: probing for the image meant the first worktree on a daemon
+that built it armed this branch for every other worktree on the same host,
+including runs that never touched tests/ or crates/ (#199). The default is
+False -- frankenrust fails every non-skipped case today on header casing
+(#159) and independently on chunked-encoding framing (#170) -- and lives in
+git so a reviewer sees the decision in the diff. Set
+FRANKENRUST_CONFORMANCE=1 to force the leg on locally. When the leg is
+enabled, a missing image is a hard failure, not a skip: see the "Never
+exits 0" rule below.
 
 Never exits 0 while skipping the corpus: if a target can't be reached, that
 is a failure, not a skip.
@@ -25,6 +35,7 @@ Usage: python3 replay.py
 from __future__ import annotations
 
 import difflib
+import os
 import sys
 from pathlib import Path
 
@@ -33,6 +44,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common
 
 FRANKENRUST_BENCH_IMAGE = "frankenrust:bench"
+
+# Whether the frankenrust leg participates in this run. False until #159
+# (the byte-exact writer that fixes header casing and wire order) and #170
+# (chunked-encoding framing) land -- until both do, every non-skipped case
+# in the corpus fails on line 2 (measured in #199). This default lives here,
+# in git, rather than being inferred from whatever images happen to exist on
+# the host running the gate. Flip to True once #159 and #170 land; until
+# then, override locally with FRANKENRUST_CONFORMANCE=1 -- see
+# frankenrust_leg_enabled() below.
+FRANKENRUST_LEG_ENABLED = False
+
+# Printed when the leg is enabled (FRANKENRUST_LEG_ENABLED or
+# FRANKENRUST_CONFORMANCE=1) but FRANKENRUST_BENCH_IMAGE is not present
+# locally. This harness never exits 0 while skipping the corpus (see the
+# module docstring), so this is folded into total_failures, not printed and
+# swallowed the way the old "not found locally" line was.
+FRANKENRUST_MISSING_IMAGE_MARKER = "frankenrust leg is enabled but"
+
+# Printed when the leg is disabled (the default). Names the issues blocking
+# it so a reader of the gate log can tell "deliberately off" from "quietly
+# not running".
+FRANKENRUST_DISABLED_REASON = (
+    "frankenrust leg disabled by default -- blocked on #159 (header casing "
+    "and wire order) and #170 (chunked-encoding framing); see #199. Set "
+    "FRANKENRUST_CONFORMANCE=1 to force it on locally."
+)
+
+
+def frankenrust_leg_enabled() -> bool:
+    """FRANKENRUST_LEG_ENABLED, overridable per-run via FRANKENRUST_CONFORMANCE=1.
+
+    Reads FRANKENRUST_LEG_ENABLED as a module attribute at call time rather
+    than closing over it, for the same reason replay_frankenrust()'s
+    docstring gives for FRANKENRUST_BENCH_IMAGE: it is lib/selftest.py's
+    injection point, patching the module attribute directly so the checks
+    there exercise the real branch in main() rather than a helper nothing
+    calls the same way.
+    """
+    return FRANKENRUST_LEG_ENABLED or os.environ.get("FRANKENRUST_CONFORMANCE") == "1"
 
 
 def diff_text(expected: bytes, actual: bytes) -> str:
@@ -196,13 +246,22 @@ def main() -> int:
     total_failures.extend(failures)
     total_skipped.extend(skipped)
 
-    if common.image_exists(FRANKENRUST_BENCH_IMAGE):
-        compared, failures, skipped = replay_frankenrust(corpus, FRANKENRUST_BENCH_IMAGE)
-        total_compared += compared
-        total_failures.extend(failures)
-        total_skipped.extend(skipped)
+    if frankenrust_leg_enabled():
+        if common.image_exists(FRANKENRUST_BENCH_IMAGE):
+            compared, failures, skipped = replay_frankenrust(corpus, FRANKENRUST_BENCH_IMAGE)
+            total_compared += compared
+            total_failures.extend(failures)
+            total_skipped.extend(skipped)
+        else:
+            total_failures.append(
+                f"{FRANKENRUST_MISSING_IMAGE_MARKER} {FRANKENRUST_BENCH_IMAGE} does not "
+                f"exist locally -- this harness never exits 0 while skipping the corpus, "
+                f"so an enabled leg with no image to replay against is a failure, not a "
+                f"skip; build the image, or disable the leg (unset FRANKENRUST_CONFORMANCE "
+                f"and/or set FRANKENRUST_LEG_ENABLED back to False)"
+            )
     else:
-        print(f"--- {FRANKENRUST_BENCH_IMAGE} not found locally, nothing to compare against it")
+        print(f"--- {FRANKENRUST_DISABLED_REASON}")
 
     for name, target_name, reason in total_skipped:
         print(f"--- skipped {name} against {target_name}: {reason}")

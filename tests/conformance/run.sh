@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Replays the golden HTTP corpus against upstream (always) and against
-# frankenrust:bench (if that image exists) and diffs the normalised response
+# frankenrust:bench (if the frankenrust leg is enabled -- see
+# FRANKENRUST_LEG_ENABLED in lib/replay.py, off by default and blocked on
+# #159/#170 -- and that image exists) and diffs the normalised response
 # against tests/conformance/golden/*.http. Wired into every non-bootstrap
 # gate profile by scripts/gate.sh. The actual work lives in lib/replay.py;
 # this script just locates python3 and hands off to it, and turns "can't
