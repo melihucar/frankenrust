@@ -13,6 +13,7 @@ import ast
 import contextlib
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -3357,6 +3358,58 @@ def check_guard_root_writes_revert_is_serialised_against_merges() -> int:
     return bad
 
 
+def check_implementer_transcript_path_resolves_from_a_worktree() -> int:
+    """A path a prompt names must resolve from the cwd that prompt runs in.
+
+    Implementers run with cwd=<worktree> -- `invoke()` does
+    `Popen(..., cwd=str(wt))` -- and logs/ is gitignored and lives at
+    ORCH/logs, a *sibling* of ORCH/worktrees. So no logs/ directory exists
+    anywhere inside a worktree. The preserved-attempt salvage step shipped
+    pointing at `logs/<N>/`, which is ENOENT from there: an agent that follows
+    it reads an empty directory, concludes the failed attempt left no trace,
+    and then judges ~1,500 lines of preserved code having never seen the
+    findings that sank it -- defeating the "evidence, not a restore" rule that
+    step exists to enforce.
+
+    unblocker.md carries the same unresolvable spelling and survives only
+    because the loop injects an absolute logdir next to it ("absolute path;
+    you are in a worktree"). The implementer's `extra` carries just the
+    previous gate failure, and is empty on exactly the re-claim-after-rescope
+    path the salvage step is for -- so here the prompt text is the whole
+    mechanism, and it is checked here because a Markdown file has no other
+    executable surface for a gate to test.
+
+    The required prefix is derived from the loop's own constants rather than
+    hardcoded, so relocating logs/ or nesting worktrees one level deeper fails
+    this check instead of leaving a stale `../../` blessed. It is a relation
+    between two paths under the same ROOT, so it yields the same answer
+    whether the gate runs in the main checkout or inside a worktree.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    rel = os.path.relpath(loop.LOGS, loop.WORKTREES / "0").replace(os.sep, "/")
+    text = (ROOT / "orchestrator" / "prompts" / "implementer.md").read_text()
+    bad = 0
+
+    if f"{rel}/" not in text:
+        bad += fail(
+            f"prompts/implementer.md never names `{rel}/` -- the only spelling "
+            "of the transcript directory that resolves from an implementer's "
+            "cwd, which is a worktree and not the main checkout")
+
+    # Naming the canonical location too is useful, but only if the prompt also
+    # says it is somewhere the agent is not standing.
+    unresolvable = sorted({m for m in re.findall(r"`([^`]*logs/[^`]*)`", text)
+                           if not m.startswith(("..", "/"))})
+    if unresolvable and "main checkout" not in text:
+        bad += fail(
+            f"prompts/implementer.md names {unresolvable} but never says they "
+            "live in the main checkout -- from a worktree those are ENOENT, "
+            "and an agent reads that as 'the attempt left no trace'")
+    return bad
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
@@ -3392,4 +3445,5 @@ if __name__ == "__main__":
              + check_guard_root_writes_restores_a_renamed_away_tracked_file()
              + check_guard_root_writes_detects_a_failed_revert_of_a_rename_source()
              + check_root_dirty_set_does_not_read_a_git_failure_as_clean()
-             + check_guard_root_writes_revert_is_serialised_against_merges() else 0)
+             + check_guard_root_writes_revert_is_serialised_against_merges()
+             + check_implementer_transcript_path_resolves_from_a_worktree() else 0)

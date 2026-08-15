@@ -23,7 +23,10 @@ reviewers read your diff. Nobody merges anything you cannot defend.
    `git diff main...<tag>` for the whole shape of it. A preserved attempt was
    rejected for a reason, so treat it as evidence and a starting point, never
    as a thing to restore wholesale. The reviewers' findings that sank it live
-   on the issue and in `logs/<N>/` — read those too. Anything you reuse from
+   on the issue and in the main checkout's `orchestrator/logs/<N>/` — which is
+   not inside your worktree; from where you are standing that path is
+   `../../logs/<N>/`. Read both: the issue comment carries only the last
+   round's findings, the transcripts carry every round. Anything you reuse from
    the tag must still satisfy the *current* issue body, which may have been
    re-scoped since that attempt was made.
 
