@@ -2736,6 +2736,25 @@ def check_root_dirty_set_parses_porcelain_z() -> int:
             bad += fail(f"a desynced record produced a garbage path key -- "
                         f"e.g. '/def.md' resolves outside the repo entirely "
                         f"via ROOT / '/def.md': {garbage} in {dirty}")
+
+        # Consuming the rename record's second field is what keeps the stream
+        # in sync; RETURNING it is what lets a stray rename in ROOT be undone.
+        # The source path is the tracked file that just left the working tree,
+        # and git reports it nowhere else -- drop it and a stray `git mv` of a
+        # prompt file reads as a plain untracked addition, so nothing restores
+        # it. Kept on its own channel so root_dirty_set() still yields exactly
+        # one entry per status record, which is the contract #185 and #186
+        # consume.
+        _, renamed_from = loop._root_status(repo)
+        for src, kind in (("abc/def.md", "unstaged rename (column two)"),
+                          ("c.md", "staged rename (column one)")):
+            if src not in renamed_from:
+                bad += fail(f"the source path of the {kind} was consumed to stay "
+                            f"in sync but never returned, so nothing can restore "
+                            f"it: {renamed_from}")
+        if set(renamed_from) - {"abc/def.md", "c.md"}:
+            bad += fail(f"a non-rename record contributed a bogus source path: "
+                        f"{renamed_from}")
     return bad
 
 
@@ -2991,6 +3010,353 @@ def check_guard_root_writes_ignores_concurrent_merge() -> int:
     return bad
 
 
+def check_guard_root_writes_restores_a_renamed_away_tracked_file() -> int:
+    """A stray write that git reports as a RENAME must still restore the
+    tracked file it moved away from.
+
+    A rename record in `git status --porcelain -z` carries two paths, and the
+    second one -- the path the file used to live at -- appears nowhere else in
+    the output. A parser that consumes that field to stay in sync but throws
+    it away reports only the NEW path, which is untracked, so the guard files
+    the whole event under `not_reverted`, reverts nothing, and records no
+    root_write_revert_failed either (there was nothing in `reverted` to
+    verify). The event reads in the journal as "an untracked stray, correctly
+    left alone per #186" while ROOT/orchestrator/prompts/reviewer.md is simply
+    gone -- after which prompt_for() raises FileNotFoundError for every
+    subsequent issue in the run, surfacing as work_crash attributed to
+    whichever issue was unlucky enough to be next.
+
+    All three shapes an agent produces this in are covered, because git
+    reports them in different columns and only one of them is a shape any
+    other check constructs:
+
+      * `git mv <old> <new>`                  -> `R ` (column one)
+      * `mv` on disk then `git add -A`        -> `R ` (column one)
+      * `mv` on disk then `git add -N <new>`  -> ` R` (column two)
+
+    A plain `mv` with no git command at all is NOT rename-detected -- git
+    reports ` D <old>` and `?? <new>`, two ordinary records -- so it is the
+    one shape that passes even with the source path discarded. It is included
+    anyway to pin that the fix did not regress it.
+
+    The new path must survive on disk in every case: it is untracked, and
+    untracked disposition is #186's, not this guard's.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    real_record, real_log = loop.record, loop.log
+    events: list[tuple[str, dict]] = []
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+
+    old, new = "orchestrator/prompts/reviewer.md", "orchestrator/prompts/stolen.md"
+    # Long enough that git's similarity heuristic calls the move a rename
+    # rather than an unrelated add plus delete.
+    head = "".join(f"reviewer instruction {n}\n" for n in range(40))
+
+    def staged_mv(repo: Path) -> None:
+        _guard_sh(repo, "mv", old, new)
+
+    def disk_mv_then_add_all(repo: Path) -> None:
+        (repo / old).rename(repo / new)
+        _guard_sh(repo, "add", "-A")
+
+    def disk_mv_then_intent_to_add(repo: Path) -> None:
+        (repo / old).rename(repo / new)
+        _guard_sh(repo, "add", "-N", new)
+
+    def disk_mv_only(repo: Path) -> None:
+        (repo / old).rename(repo / new)
+
+    bad = 0
+    try:
+        for label, mutate in (("git mv", staged_mv),
+                              ("mv + git add -A", disk_mv_then_add_all),
+                              ("mv + git add -N", disk_mv_then_intent_to_add),
+                              ("mv, no git command", disk_mv_only)):
+            events.clear()
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                _guard_init(repo)
+                (repo / "orchestrator" / "prompts").mkdir(parents=True)
+                (repo / old).write_text(head)
+                _guard_sh(repo, "add", "-A")
+                _guard_sh(repo, "commit", "-q", "-m", "base")
+
+                with loop.guard_root_writes("135", "fix.2", root=repo):
+                    mutate(repo)
+
+                if not (repo / old).exists():
+                    bad += fail(f"[{label}] a rename-detected stray write left the "
+                                f"tracked {old} deleted in ROOT -- the rename "
+                                f"record's source path was parsed but discarded, "
+                                f"so nothing ever restored it, and prompt_for() "
+                                f"now raises for the rest of the run: {events}")
+                elif (repo / old).read_text() != head:
+                    bad += fail(f"[{label}] {old} was not restored to HEAD's "
+                                f"content: {(repo / old).read_text()!r}")
+                root_writes = [f for e, f in events if e == "root_write"]
+                if not root_writes:
+                    bad += fail(f"[{label}] a rename-detected stray write was not "
+                                f"journalled at all: {events}")
+                elif old not in root_writes[0].get("reverted", []):
+                    bad += fail(f"[{label}] the renamed-away tracked path was not "
+                                f"journalled as reverted: {root_writes[0]}")
+                if not (repo / new).exists():
+                    bad += fail(f"[{label}] the untracked new path was removed from "
+                                f"disk -- that disposition belongs to #186")
+                if any(e == "root_write_revert_failed" for e, _ in events):
+                    bad += fail(f"[{label}] a revert that worked was journalled as "
+                                f"having failed: {events}")
+    finally:
+        loop.record, loop.log = real_record, real_log
+    return bad
+
+
+def check_guard_root_writes_detects_a_failed_revert_of_a_rename_source() -> int:
+    """A `git checkout HEAD --` that fails on a RENAME-SHAPED stray must still
+    be journalled as `root_write_revert_failed`.
+
+    root_dirty_set() deliberately excludes a rename's *source* path from its
+    dict -- it is the second field of the new path's record, not a record of
+    its own (see root_dirty_set()'s own docstring). The post-checkout
+    verification used to key on root_dirty_set() alone, so for exactly the
+    path _root_fingerprints() goes out of its way to recover, a failed
+    checkout was invisible to it: the source path was never "still dirty"
+    under root_dirty_set(), `failed` came back empty, and the revert was
+    journalled as successful while the tracked file stayed missing from ROOT.
+    prompt_for() then raises FileNotFoundError for every subsequent issue in
+    the run, with the journal insisting the revert worked.
+
+    The checkout is forced to fail (simulating ENOSPC or a contended
+    `.git/index.lock`) by monkeypatching `loop.git`, not by exhausting real
+    disk or lock state, so this is deterministic. A plain (non-rename)
+    tracked stray is forced to fail too, as a control: that shape was already
+    caught by root_dirty_set() alone, so it must stay caught.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    real_record, real_log, real_git = loop.record, loop.log, loop.git
+    events: list[tuple[str, dict]] = []
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+
+    old, new = "orchestrator/prompts/reviewer.md", "orchestrator/prompts/stolen.md"
+    plain = "orchestrator/prompts/unblocker.md"
+    # Long enough that git's similarity heuristic calls the move a rename
+    # rather than an unrelated add plus delete.
+    head = "".join(f"reviewer instruction {n}\n" for n in range(40))
+
+    def failing_checkout(args: list[str], cwd: Path = loop.ROOT) -> tuple[int, str]:
+        if args[:1] == ["checkout"] and args[-1] in (old, plain):
+            return 1, "simulated checkout failure (e.g. ENOSPC or a contended lock)"
+        return real_git(args, cwd)
+
+    bad = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _guard_init(repo)
+            (repo / "orchestrator" / "prompts").mkdir(parents=True)
+            (repo / old).write_text(head)
+            (repo / plain).write_text("unblocker\n")
+            _guard_sh(repo, "add", "-A")
+            _guard_sh(repo, "commit", "-q", "-m", "base")
+
+            loop.git = failing_checkout
+            with loop.guard_root_writes("135", "fix.2", root=repo):
+                _guard_sh(repo, "mv", old, new)
+                (repo / plain).write_text("POISONED\n")
+
+            revert_failed = [f for e, f in events if e == "root_write_revert_failed"]
+            if not revert_failed:
+                bad += fail(f"a forced checkout failure on a rename-shaped stray "
+                            f"(and a plain one) was not journalled as a failed "
+                            f"revert at all: {events}")
+            else:
+                failed_paths = set(revert_failed[0].get("paths", []))
+                if old not in failed_paths:
+                    bad += fail(f"the rename SOURCE path's failed revert was not "
+                                f"reported -- root_dirty_set() excludes rename "
+                                f"sources by contract, so the verification "
+                                f"silently passed while {old} stayed missing from "
+                                f"ROOT: {revert_failed[0]}")
+                if plain not in failed_paths:
+                    bad += fail(f"the control (non-rename) failed revert regressed: "
+                                f"{revert_failed[0]}")
+            if (repo / old).exists():
+                bad += fail(f"{old} unexpectedly exists on disk even though its "
+                            f"checkout was forced to fail -- test setup is wrong")
+    finally:
+        loop.git, loop.record, loop.log = real_git, real_record, real_log
+    return bad
+
+
+def check_root_dirty_set_does_not_read_a_git_failure_as_clean() -> int:
+    """`git status` failing must raise, not return `{}`.
+
+    An empty dict is what a genuinely clean tree returns, so swallowing the
+    exit code makes a failed capture indistinguishable from "nothing is
+    dirty". In guard_root_writes() the *before* capture is the baseline that
+    decides what counts as a stray, so an empty baseline means every path
+    already dirty in ROOT is a stray write -- and the guard answers a stray
+    write with `git checkout HEAD --`, which discards uncommitted content that
+    exists in no commit, no index and no reflog. Eleven of the twelve blocking
+    findings across six earlier review rounds on this change were in that
+    class ("destroys content no agent wrote"); this is the same class reached
+    through the tracked branch.
+
+    root_dirty_set() is also the shared primitive #185 and #186 build on, so
+    the unchecked exit code would propagate into both.
+
+    Second half: when a capture does fail, the guard must degrade to doing
+    nothing rather than to reverting everything -- and must not take the
+    agent stage down with it, since a transient git error is not a reason to
+    lose an hour of agent work.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    bad = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            dirty = loop.root_dirty_set(Path(tmp))     # not a git repository
+        except RuntimeError:
+            pass
+        else:
+            bad += fail(f"root_dirty_set() reported a failed `git status` as a "
+                        f"clean tree ({dirty!r}) -- in guard_root_writes()'s "
+                        f"before-capture that arms a revert against every "
+                        f"already-dirty path in ROOT")
+
+    real_record, real_log = loop.record, loop.log
+    real_fingerprints = loop._root_fingerprints
+    events: list[tuple[str, dict]] = []
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _guard_init(repo)
+            (repo / "a.md").write_text("committed\n")
+            _guard_sh(repo, "add", "-A")
+            _guard_sh(repo, "commit", "-q", "-m", "base")
+            # ROOT as #185's preflight leaves it: dirty, with local work that
+            # lives in no commit and no index.
+            (repo / "a.md").write_text("legit uncommitted local work\n")
+            (repo / "scratch.md").write_text("legit untracked local work\n")
+
+            calls: list[int] = []
+
+            def failing_once(root: Path = loop.ROOT) -> dict[str, str]:
+                calls.append(1)
+                if len(calls) == 1:
+                    raise RuntimeError("simulated `git status` failure")
+                return real_fingerprints(root)
+
+            loop._root_fingerprints = failing_once
+            # The agent touches nothing in ROOT.
+            with loop.guard_root_writes("135", "fix.1", root=repo):
+                pass
+
+            if (repo / "a.md").read_text() != "legit uncommitted local work\n":
+                bad += fail("a failed before-capture let the guard revert a tracked "
+                            "path no agent had touched, destroying uncommitted "
+                            "content that exists in no commit and no reflog")
+            if not (repo / "scratch.md").exists():
+                bad += fail("a failed before-capture cost an untracked file that "
+                            "no agent wrote")
+            if any(e == "root_write" for e, _ in events):
+                bad += fail(f"a failed capture was journalled as a stray write "
+                            f"against an innocent issue: {events}")
+    finally:
+        loop._root_fingerprints = real_fingerprints
+        loop.record, loop.log = real_record, real_log
+    return bad
+
+
+def check_guard_root_writes_revert_is_serialised_against_merges() -> int:
+    """The revert must hold `_merge_lock` while it writes ROOT's index.
+
+    `git checkout HEAD -- <path>` takes ROOT/.git/index.lock, and git does not
+    retry a contended lock -- it exits 1 with "Unable to create
+    '.git/index.lock': File exists". merge_worktree holds `_merge_lock` across
+    its `git merge --ff-only` in ROOT, and that lock is the only thing
+    serialising writers there: it is not held by agent stages, which run in
+    the other MAX_PARALLEL worker threads. So an unsynchronised revert can
+    kill a merge that is landing at that instant. merge_worktree returns False
+    for that with no record() of its own, and _work then reports it as
+    "rebase conflict or gate regression against latest main" -- a diagnosis
+    that is false, and that burns an attempt (or blocks the issue outright at
+    MAX_ATTEMPTS) on work that had already passed the gate and both reviewers.
+
+    Retrying the checkout would not fix it: the victim of the race is the
+    merge, not the revert, so only mutual exclusion helps.
+
+    Asserted by holding `_merge_lock` from this thread and requiring the
+    revert to block -- the deterministic form of the race, rather than a
+    timing-dependent one that passes whenever the scheduler is kind. The
+    read-only captures deliberately stay OUTSIDE the lock: they use
+    `--no-optional-locks`, which is already safe against a concurrent merge,
+    and serialising them would put every stage boundary behind a lock that
+    merge_worktree can hold for a full GATE_TIMEOUT.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    real_record, real_log = loop.record, loop.log
+    events: list[tuple[str, dict]] = []
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    bad = 0
+    held = False
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _guard_init(repo)
+            (repo / "reviewer.md").write_text("original\n")
+            _guard_sh(repo, "add", "-A")
+            _guard_sh(repo, "commit", "-q", "-m", "base")
+
+            loop._merge_lock.acquire()
+            held = True
+            done = threading.Event()
+
+            def stage() -> None:
+                with loop.guard_root_writes("135", "fix.1", root=repo):
+                    (repo / "reviewer.md").write_text("original\nsix stray lines\n")
+                done.set()
+
+            worker = threading.Thread(target=stage, daemon=True)
+            worker.start()
+            if done.wait(2.0):
+                bad += fail("guard_root_writes() reverted a stray write to ROOT "
+                            "without holding _merge_lock -- `git checkout HEAD --` "
+                            "takes ROOT/.git/index.lock, so it can kill a "
+                            "concurrent `git merge --ff-only` in merge_worktree, "
+                            "which _work then misreports as a rebase conflict")
+            loop._merge_lock.release()
+            held = False
+
+            if not done.wait(60):
+                bad += fail("guard_root_writes() never completed after _merge_lock "
+                            "was released -- the revert is deadlocked")
+            worker.join(5)
+            content = (repo / "reviewer.md").read_text()
+            if content != "original\n":
+                bad += fail(f"the serialised revert did not restore HEAD's "
+                            f"content: {content!r}")
+            if not any(e == "root_write" for e, _ in events):
+                bad += fail(f"the serialised revert was not journalled: {events}")
+    finally:
+        if held:
+            loop._merge_lock.release()
+        loop.record, loop.log = real_record, real_log
+    return bad
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
@@ -3022,4 +3388,8 @@ if __name__ == "__main__":
              + check_guard_root_writes_reverts_tracked_stray()
              + check_guard_root_writes_catches_stray_on_already_dirty_path()
              + check_guard_root_writes_leaves_untracked_stray_on_disk()
-             + check_guard_root_writes_ignores_concurrent_merge() else 0)
+             + check_guard_root_writes_ignores_concurrent_merge()
+             + check_guard_root_writes_restores_a_renamed_away_tracked_file()
+             + check_guard_root_writes_detects_a_failed_revert_of_a_rename_source()
+             + check_root_dirty_set_does_not_read_a_git_failure_as_clean()
+             + check_guard_root_writes_revert_is_serialised_against_merges() else 0)

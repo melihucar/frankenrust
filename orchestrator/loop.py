@@ -599,7 +599,20 @@ def publish_main(tid: str) -> None:
 
 # --- ROOT guard ---------------------------------------------------------------
 def root_dirty_set(root: Path = ROOT) -> dict[str, str]:
-    """path -> XY status code for every dirty path in `root`.
+    """path -> XY status code for every dirty path in `root`: one entry per
+    status record, which is the contract #185 (the merge path) and #186
+    (untracked-stray disposition) consume.
+
+    _root_status() does the parse. The rename/copy *source* paths it also
+    recovers are deliberately not merged in here -- they are the second field
+    of another path's record, not records of their own -- so a caller that
+    needs them must ask for them by name.
+    """
+    return _root_status(root)[0]
+
+
+def _root_status(root: Path = ROOT) -> tuple[dict[str, str], dict[str, str]]:
+    """(path -> XY, rename/copy source path -> its record's XY) for `root`.
 
     Shared plumbing: #185 (the merge path) and #186 (untracked-stray
     disposition) both need this same parse. Get it right once, here.
@@ -624,6 +637,18 @@ def root_dirty_set(root: Path = ROOT) -> dict[str, str]:
     fragment of the old path, missing its leading directory component) to
     whatever consumes this dict next.
 
+    Consuming that second field is necessary but not sufficient: it must also
+    be *returned*, on the second channel. For a stray rename in ROOT the old
+    path is the tracked file that has just been removed from the working tree,
+    and it appears nowhere else in `git status` output -- so throwing it away
+    makes `git mv orchestrator/prompts/reviewer.md <anything>` read as a pure
+    untracked addition. guard_root_writes() would then revert nothing, leave
+    reviewer.md deleted in the main checkout, and prompt_for() would raise
+    FileNotFoundError for every subsequent issue in the run. Verified against
+    git 2.54 for all three ways an agent produces one: `git mv`, `mv` then
+    `git add -A` (both `R ` in column one), and `mv` then `git add -N` (` R`
+    in column two).
+
     `--no-optional-locks` matters as much as `-z` does. Plain `git status`
     opportunistically refreshes and *writes* the index, taking
     `<root>/.git/index.lock` -- and this runs from a worker thread while
@@ -635,12 +660,26 @@ def root_dirty_set(root: Path = ROOT) -> dict[str, str]:
     `-uall` so an untracked directory is listed file-by-file rather than
     collapsed into one `dir/` record, whose collapsing boundary would
     otherwise move whenever an unrelated merge changes what is inside it.
+
+    Raises RuntimeError if git fails, rather than reporting the empty stdout
+    that comes with it as a clean tree. Every caller reads "clean" as "nothing
+    to do", and for guard_root_writes()'s *before* capture that inverts into
+    something much worse than a no-op: an empty baseline makes every path
+    already dirty in ROOT look like a stray write this stage just made, and
+    the guard reverts each of them with `git checkout HEAD --`. That discards
+    uncommitted working-tree content that exists in no commit, no index and no
+    reflog -- destroying content no agent wrote, which is the exact failure
+    class that ended six earlier review rounds on this change.
     """
     proc = subprocess.run(
         ["git", "--no-optional-locks", "status", "--porcelain", "-z", "-uall"],
         cwd=str(root), capture_output=True, text=True,
     )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git status failed in {root}: "
+                           f"{(proc.stdout + proc.stderr).strip()[-500:]}")
     dirty: dict[str, str] = {}
+    renamed_from: dict[str, str] = {}
     fields = proc.stdout.split("\0")
     i = 0
     while i < len(fields):
@@ -650,9 +689,14 @@ def root_dirty_set(root: Path = ROOT) -> dict[str, str]:
             continue
         status, path = rec[:2], rec[3:]
         if status[0] in "RC" or status[1] in "RC":
-            i += 1  # the old path: its own field, with no status of its own
+            # The old path: its own field, with no status of its own. Guarded
+            # against a truncated stream so a missing field cannot key this
+            # dict on "", which `root / ""` resolves back to root itself.
+            if i < len(fields) and fields[i]:
+                renamed_from[fields[i]] = status
+            i += 1
         dirty[path] = status
-    return dirty
+    return dirty, renamed_from
 
 
 def _root_fingerprints(root: Path = ROOT) -> dict[str, str]:
@@ -667,8 +711,19 @@ def _root_fingerprints(root: Path = ROOT) -> dict[str, str]:
     bytes; the status code is folded in too so a mode-only change (same
     bytes, different Y column) still registers.
     """
+    dirty, renamed_from = _root_status(root)
+    # A rename's source path is dirty too -- the file has left the working
+    # tree -- but git reports it only as the second field of the *new* path's
+    # record, never as a record of its own. Fingerprint it alongside, or a
+    # stray `git mv` in ROOT reads as a pure untracked addition and the
+    # tracked file it moved away from is never restored. An explicit record
+    # for the same path wins: if something has since been created where the
+    # file used to be, that file's own status entry describes what is on disk
+    # now, and the rename's does not.
+    for path, status in renamed_from.items():
+        dirty.setdefault(path, status)
     out: dict[str, str] = {}
-    for path, status in root_dirty_set(root).items():
+    for path, status in dirty.items():
         full = root / path
         if full.is_file():
             rc, h = git(["hash-object", "--", path], cwd=root)
@@ -695,8 +750,14 @@ def guard_root_writes(tid: str, tag: str, root: Path = ROOT):
     Tracked paths are reverted with `git checkout HEAD -- <path>`, not the
     two-arg `git checkout -- <path>`: an agent that ran `git add` in ROOT has
     its stray content staged in the index, and the two-arg form restores from
-    there, not from HEAD. `HEAD --` restores from the object database and so
-    cannot destroy anything unrecoverable.
+    there, not from HEAD. `HEAD --` restores from the object database, so what
+    it writes is always recoverable -- but what it *overwrites* need not be.
+    If a strayed-upon path also carried legitimate uncommitted local edits,
+    those go with the stray, because nothing here can tell the two apart once
+    they are in the same file. That is the accepted trade for closing the
+    prompt-poisoning hole, and it is the reason the capture below must never
+    mistake a git failure for a clean ROOT: a false positive here is not a
+    harmless extra checkout, it is data loss.
 
     Untracked paths are left on disk and only journaled, under
     `not_reverted`. Deleting a path that exists in no index, no branch and no
@@ -715,7 +776,18 @@ def guard_root_writes(tid: str, tag: str, root: Path = ROOT):
     tid. The revert itself is correct regardless of which thread performs it;
     only the `issue=` field on the journal record can name the wrong issue.
     """
-    before = _root_fingerprints(root)
+    # A capture that cannot be taken disarms the guard for this stage, and it
+    # says so. The alternative -- treating "git failed" as "ROOT is clean" --
+    # arms a mass revert against every path that was already dirty; and
+    # letting the exception out of __enter__ would kill an agent stage over a
+    # transient git error. Detection is best-effort; destruction is not
+    # allowed to be.
+    try:
+        before = _root_fingerprints(root)
+    except (RuntimeError, OSError) as exc:
+        log(f"    !! could not read ROOT's state before {tag} ({tid}); stray-write "
+            f"detection is off for this stage: {exc}")
+        before = None
     try:
         yield
     finally:
@@ -724,8 +796,15 @@ def guard_root_writes(tid: str, tag: str, root: Path = ROOT):
         # above raised would swallow that exception instead of letting it
         # propagate out of the `with` -- turning a crashed agent invocation
         # into a silent no-op whenever it happened not to touch ROOT.
-        after = _root_fingerprints(root)
-        changed = sorted(p for p, fp in after.items() if before.get(p) != fp)
+        after = None
+        if before is not None:
+            try:
+                after = _root_fingerprints(root)
+            except (RuntimeError, OSError) as exc:
+                log(f"    !! could not read ROOT's state after {tag} ({tid}); a stray "
+                    f"write in this stage would go undetected: {exc}")
+        changed = sorted(p for p, fp in after.items()
+                         if before.get(p) != fp) if after is not None else []
         if changed:
             tracked, untracked = [], []
             for p in changed:
@@ -734,16 +813,61 @@ def guard_root_writes(tid: str, tag: str, root: Path = ROOT):
             log(f"    !! stray write(s) to ROOT during {tag} ({tid}): {changed}")
             record("root_write", issue=tid, stage=tag, paths=changed,
                    reverted=tracked, not_reverted=untracked)
-            for p in tracked:
-                rc, out = git(["checkout", "HEAD", "--", p], cwd=root)
-                if rc != 0:
-                    log(f"    !! git checkout HEAD -- {p} failed in ROOT: {out}")
-            # The ground truth for whether the revert actually stuck, not the
-            # rc above: a checkout that exits 0 but somehow does not restore
-            # the exact HEAD content would otherwise be journalled as a
-            # successful revert while the stray still feeds prompt_for().
-            still_dirty = root_dirty_set(root)
-            failed = [p for p in tracked if p in still_dirty]
+            # `git checkout HEAD -- <path>` takes <root>/.git/index.lock to
+            # rewrite the index entry, and git does not retry a contended
+            # lock. merge_worktree holds _merge_lock across its
+            # `git merge --ff-only` in ROOT, and _merge_lock is the only thing
+            # serialising writers there -- so without this the revert can kill
+            # a concurrent merge outright ("Unable to create
+            # '.git/index.lock': File exists", verified deterministically on
+            # git 2.54). merge_worktree returns False for that with no
+            # record(), and _work then reports it as a rebase conflict or a
+            # gate regression -- a diagnosis that is simply false, burning an
+            # attempt, or blocking outright at MAX_ATTEMPTS, on work that had
+            # already passed the gate and both reviewers. Retrying our own
+            # checkout would not help: the victim of the race is the merge.
+            #
+            # The cost is that this can wait out a whole merge_worktree,
+            # GATE_TIMEOUT included -- paid only on the rare path where a
+            # stray was actually found. No guarded call site is reachable from
+            # merge_worktree, so this non-reentrant Lock cannot deadlock
+            # against itself.
+            with _merge_lock:
+                checkout_failed: set[str] = set()
+                for p in tracked:
+                    rc, out = git(["checkout", "HEAD", "--", p], cwd=root)
+                    if rc != 0:
+                        log(f"    !! git checkout HEAD -- {p} failed in ROOT: {out}")
+                        checkout_failed.add(p)
+                # The ground truth for whether the revert actually stuck is
+                # git's own post-checkout status, not the rc alone: a checkout
+                # that exits 0 but somehow does not restore the exact HEAD
+                # content would otherwise be journalled as a successful revert
+                # while the stray still feeds prompt_for(). A status that will
+                # not run is not evidence that the revert worked, so treat it
+                # as unverified (failed).
+                #
+                # Checked against BOTH channels _root_status() returns, not
+                # root_dirty_set() alone: root_dirty_set() excludes a rename's
+                # *source* path by contract -- it is the second field of the
+                # new path's record, not a record of its own (see its
+                # docstring). A checkout failure on exactly that path -- the
+                # one _root_fingerprints() goes out of its way to recover --
+                # would never show up as still-dirty under root_dirty_set(),
+                # so a failed revert of a renamed-away tracked file was
+                # journalled as having succeeded while the file stayed missing
+                # from ROOT. checkout_failed is folded in too, as a second,
+                # independent signal, so a checkout failure is still caught
+                # even if git's post-failure status ever reads clean.
+                try:
+                    dirty_after, renamed_after = _root_status(root)
+                    failed = [p for p in tracked
+                              if p in checkout_failed
+                              or p in dirty_after
+                              or p in renamed_after]
+                except (RuntimeError, OSError) as exc:
+                    log(f"    !! could not verify the revert in ROOT: {exc}")
+                    failed = tracked
             if failed:
                 log(f"    !! revert of stray ROOT write(s) did not stick: {failed}")
                 record("root_write_revert_failed", issue=tid, stage=tag, paths=failed)
