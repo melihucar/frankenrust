@@ -345,47 +345,129 @@ def check_frankenrust_mismatch_fails_the_run(corpus: dict) -> list[str]:
     return problems
 
 
+def _load_synthetic_corpus(tmp: Path, cases_toml: str) -> tuple[dict | None, Exception | None]:
+    """Run the real common.load_corpus() against a synthetic corpus.toml.
+
+    Repoints common.CORPUS_PATH at a throwaway file -- the same patch-the-
+    module-global shape check_frankenrust_mismatch_fails_the_run uses for
+    GOLDEN_DIR -- so the path under test is the one corpus.toml actually
+    travels: load_corpus() -> validate_corpus(). Calling the validator directly
+    would test a function nothing is obliged to call.
+
+    Returns (corpus, None) on a clean load and (None, exception) otherwise;
+    which of those is correct is the caller's to decide.
+    """
+    path = tmp / "corpus.toml"
+    path.write_text(
+        "[targets.upstream]\n"
+        'image = "unused"\n'
+        "container_port = 80\n"
+        'document_root = "/"\n'
+        'server_software = "Unused"\n'
+        "\n"
+        "[defaults]\n"
+        "headers = []\n"
+        "\n" + cases_toml
+    )
+    saved = common.CORPUS_PATH
+    try:
+        common.CORPUS_PATH = path
+        return common.load_corpus(), None
+    except Exception as e:  # noqa: BLE001 - the caller decides what is acceptable
+        return None, e
+    finally:
+        common.CORPUS_PATH = saved
+
+
+_WELL_FORMED_SKIP = """
+[[cases]]
+name = "reasoned-skip"
+fixture = "x.php"
+method = "GET"
+path = "/x.php"
+skip_targets = ["frankenrust"]
+skip_reason = "selftest control: a skip that is written down loads fine"
+"""
+
+_SKIP_WITHOUT_REASON = """
+[[cases]]
+name = "unreasoned-skip"
+fixture = "x.php"
+method = "GET"
+path = "/x.php"
+skip_targets = ["frankenrust"]
+"""
+
+# TOML makes the bare string as easy to write as the list, and
+# `target_name in "frankenrust-bench"` is a substring match that skips the
+# `frankenrust` target without ever naming it.
+_SKIP_TARGETS_NOT_A_LIST = """
+[[cases]]
+name = "stringly-typed-skip"
+fixture = "x.php"
+method = "GET"
+path = "/x.php"
+skip_targets = "frankenrust-bench"
+skip_reason = "selftest: has a reason, but the targets are not a list"
+"""
+
+
 def check_skip_targets_require_reason() -> list[str]:
-    """A `skip_targets` entry with no `skip_reason` must fail the load.
+    """A malformed or unreasoned `skip_targets` must fail the *load*.
 
     Issue #163: a per-case, per-target skip (added so a case that kills one
     target's server process, e.g. finish-request against frankenrust before
     #14, does not take the whole replay down with it) is a silent "not
     compared" if nothing forces a reason to be written down -- exactly the
-    defect class #141 was filed against, one level down. common.load_corpus()
-    calls common.validate_corpus() for this reason; this check drives that
-    function directly against a synthetic corpus so it needs no golden files,
-    no container and does not depend on the real corpus.toml ever containing
-    a bad entry to exercise the failure path.
+    defect class #141 was filed against, one level down.
+
+    Driving common.load_corpus() rather than common.validate_corpus() is the
+    whole point, for the same reason its neighbour drives main() rather than
+    replay_frankenrust(): the regression surface is the caller. An earlier
+    version of this check called the validator directly and stayed green --
+    7/7, rc 0 -- with `validate_corpus(corpus)` deleted from load_corpus(),
+    after which a `skip_targets` with no reason loaded clean and silently
+    dropped its case from that target's replay. Measured, not assumed.
+
+    The control case is load-bearing too: common.CORPUS_PATH is repointed at a
+    generated file, and tomllib.TOMLDecodeError subclasses ValueError, so
+    without proving a well-formed corpus loads from the same fixture a typo in
+    the generator would satisfy every "must raise" assertion below. Each
+    rejection is matched on its message for the same reason.
     """
-    bad_corpus = {
-        "targets": {
-            "upstream": {
-                "image": "unused",
-                "container_port": 80,
-                "document_root": "/",
-                "server_software": "Unused",
-            }
-        },
-        "defaults": {"headers": []},
-        "cases": [
-            {
-                "name": "unreasoned-skip",
-                "fixture": "x.php",
-                "method": "GET",
-                "path": "/x.php",
-                "skip_targets": ["frankenrust"],
-            }
-        ],
-    }
-    try:
-        common.validate_corpus(bad_corpus)
-    except ValueError:
-        return []
-    return [
-        "common.validate_corpus() accepted a case with skip_targets but no "
-        "skip_reason -- a skip with no reason is a silent pass"
-    ]
+    problems = []
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+
+        corpus, err = _load_synthetic_corpus(tmp_path, _WELL_FORMED_SKIP)
+        if err is not None:
+            problems.append(
+                f"common.load_corpus() rejected a well-formed skip_targets/skip_reason "
+                f"pair: {err!r}. Until this loads, the rejections below prove nothing -- "
+                f"they would also hold if this check's synthetic corpus were unparseable."
+            )
+        elif corpus is not None and not corpus["cases"][0].get("skip_reason"):
+            problems.append(
+                "common.load_corpus() dropped skip_reason from the loaded corpus; "
+                "run_against() reads it back out to print the skip line"
+            )
+
+        for label, cases_toml, expected in (
+            ("skip_targets with no skip_reason", _SKIP_WITHOUT_REASON, "skip_reason"),
+            ("skip_targets as a bare string", _SKIP_TARGETS_NOT_A_LIST, "not a list"),
+        ):
+            _, err = _load_synthetic_corpus(tmp_path, cases_toml)
+            if err is None:
+                problems.append(
+                    f"common.load_corpus() accepted a case with {label} -- that is a "
+                    f"skip nobody wrote down, i.e. a silent pass"
+                )
+            elif not isinstance(err, ValueError) or expected not in str(err):
+                problems.append(
+                    f"common.load_corpus() rejected a case with {label}, but not for that "
+                    f"reason (expected a ValueError mentioning {expected!r}): {err!r}"
+                )
+    return problems
 
 
 def check_skipped_case_not_counted_as_compared(corpus: dict) -> list[str]:
@@ -396,11 +478,17 @@ def check_skipped_case_not_counted_as_compared(corpus: dict) -> list[str]:
     no frankenrust:bench, and stub replay_upstream so its "1 case(s)" is the
     only comparison in the total. Unlike that check, the mini corpus's one
     case is skip_targets = ["frankenrust"] rather than pointed at a corrupted
-    golden -- a case that is skipped must never reach replay_case() at all
-    (there is no golden for it in this run's real golden/ dir, so reaching the
-    comparison would itself fail with "no golden file"), so a clean pass here
-    with the skip reported is the only correct outcome: 0 added to compared,
-    0 failures, the skip line printed, exit 0.
+    golden: the correct outcome is a clean pass with the skip reported -- 0
+    added to compared, 0 failures, the skip line printed, exit 0.
+
+    Note which assertion is load-bearing. The case is `hello`, golden/hello.http
+    exists, and its body carries no server-software string, so a frankenrust leg
+    that ignored skip_targets and compared anyway would *match* the golden and
+    add no failure. Deleting the skip branch is therefore caught by the
+    "1 case(s) compared, 1 skipped" count and the missing skip line, not by a
+    mismatch and not by the exit code -- measured, with that branch stubbed out
+    of run_against(): main() still exited 0, and only those two assertions
+    fired. Anything that weakens them takes the whole check with it.
     """
     case = next((c for c in corpus["cases"] if c["name"] == "hello"), None)
     if case is None:

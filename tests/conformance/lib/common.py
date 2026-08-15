@@ -63,16 +63,33 @@ def load_corpus() -> dict:
 
 
 def validate_corpus(corpus: dict) -> None:
-    """Reject a corpus whose skip_targets carries no reason.
+    """Reject a corpus whose skip_targets is malformed or carries no reason.
 
     A `skip_targets` entry says a case is silently excluded from one target's
     replay; without a `skip_reason` that is indistinguishable from a mistake,
     and issue #141 was filed exactly because a silent "not compared" branch
     stayed green through 11,244 lines of unreviewed Rust. Failing the load is
     what keeps that from happening again at the per-case level.
+
+    The type check is the same defect wearing a different hat. TOML makes
+    `skip_targets = "frankenrust"` exactly as easy to write as the list form,
+    and run_against() asks `target_name in skip_targets` -- against a string
+    that is a substring test, so `skip_targets = "frankenrust-bench"` would
+    silently skip the `frankenrust` target and `skip_targets = "up"` would skip
+    nothing while reading as if it skipped `upstream`. Both directions produce
+    a skip nobody wrote down, so both fail the load.
     """
     for case in corpus.get("cases", []):
         skip_targets = case.get("skip_targets")
+        if skip_targets is None:
+            continue
+        if not isinstance(skip_targets, list):
+            raise ValueError(
+                f"corpus.toml: case {case.get('name')!r} has skip_targets "
+                f"{skip_targets!r}, which is not a list -- run_against() tests "
+                f"`target_name in skip_targets`, so a bare string skips by "
+                f"substring and silently skips targets nobody named"
+            )
         if skip_targets and not case.get("skip_reason"):
             raise ValueError(
                 f"corpus.toml: case {case.get('name')!r} has skip_targets "
