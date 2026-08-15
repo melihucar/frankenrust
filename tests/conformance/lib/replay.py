@@ -96,22 +96,67 @@ def run_against(target_name: str, host: str, port: int, ctx_base, corpus) -> tup
     return compared, failures
 
 
-def replay_upstream(corpus) -> tuple[int, list[str]]:
-    target = corpus["targets"]["upstream"]
-    name, port = common.start_upstream_container(
-        target["image"], target["container_port"]
-    )
-    print(f"--- replaying against upstream ({target['image']}) on host port {port}")
+def replay_container_target(
+    target_name: str,
+    image: str,
+    container_port: int,
+    document_root: str,
+    server_software: str,
+    corpus,
+) -> tuple[int, list[str]]:
+    name, port = common.start_upstream_container(image, container_port)
+    print(f"--- replaying against {target_name} ({image}) on host port {port}")
     try:
         common.wait_for_server("127.0.0.1", port)
         ctx_base = common.NormalizeContext(
-            document_root=target["document_root"],
+            document_root=document_root,
             port=port,
-            server_software=target["server_software"],
+            server_software=server_software,
         )
-        return run_against("upstream", "127.0.0.1", port, ctx_base, corpus)
+        return run_against(target_name, "127.0.0.1", port, ctx_base, corpus)
     finally:
         common.stop_container(name)
+
+
+def replay_upstream(corpus) -> tuple[int, list[str]]:
+    target = corpus["targets"]["upstream"]
+    return replay_container_target(
+        "upstream",
+        target["image"],
+        target["container_port"],
+        target["document_root"],
+        target["server_software"],
+        corpus,
+    )
+
+
+def replay_frankenrust(corpus, image: str = FRANKENRUST_BENCH_IMAGE) -> tuple[int, list[str]]:
+    """Replay against frankenrust:bench, folding failures the same way replay_upstream does.
+
+    corpus.toml has no [targets.frankenrust] yet -- building that image is
+    #15's job, out of scope for this issue (#141). Until it exists, this
+    reuses the upstream target's container_port/document_root (the container
+    that gets started always mounts the same vendor/frankenphp/testdata
+    regardless of which image it runs) and assumes server_software =
+    "FrankenRust"; whoever lands #15 should replace that assumption with a
+    real [targets.frankenrust] section in corpus.toml once the image reports
+    its own SERVER_SOFTWARE string.
+
+    `image` is a parameter, not always FRANKENRUST_BENCH_IMAGE, so
+    lib/selftest.py can drive this exact code path against the upstream image
+    with a deliberately corrupted golden -- proving the branch folds a
+    mismatch into its failure list rather than only printing that it ran,
+    without needing frankenrust:bench to exist.
+    """
+    target = corpus["targets"]["upstream"]
+    return replay_container_target(
+        "frankenrust",
+        image,
+        target["container_port"],
+        target["document_root"],
+        "FrankenRust",
+        corpus,
+    )
 
 
 def main() -> int:
@@ -128,18 +173,10 @@ def main() -> int:
     total_compared += compared
     total_failures.extend(failures)
 
-    # Auto-detect only: issue #4 is scoped to upstream-vs-goldens (there is no
-    # frankenrust:bench image yet, and no Rust in the tree to build one from).
-    # A later issue that adds a frankenrust replay target should make this
-    # branch call run_against(...) and fold its failures into total_failures
-    # the same way replay_upstream does, so a mismatch fails the gate per
-    # "fail on mismatch" above. Until then this is a loud no-op, not a skip
-    # of anything this issue is responsible for verifying.
     if common.image_exists(FRANKENRUST_BENCH_IMAGE):
-        print(
-            f"--- {FRANKENRUST_BENCH_IMAGE} found, but this harness has no replay path for "
-            "it yet (issue #4 scope: upstream only) -- not compared"
-        )
+        compared, failures = replay_frankenrust(corpus)
+        total_compared += compared
+        total_failures.extend(failures)
     else:
         print(f"--- {FRANKENRUST_BENCH_IMAGE} not found locally, nothing to compare against it")
 

@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import difflib
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import common
+import replay
 
 
 def parse_golden(raw: bytes) -> tuple[bytes, list[tuple[str, str]], bytes]:
@@ -234,6 +236,59 @@ def check_concurrent_isolation(corpus: dict) -> list[str]:
     return failures
 
 
+def check_frankenrust_replay_branch_detects_mismatch(corpus: dict) -> list[str]:
+    """replay.py's frankenrust branch must fold a mismatch into total_failures.
+
+    Issue #141: before this fix, replay.py detected a local `frankenrust:bench`
+    image, printed "found, but this harness has no replay path for it yet --
+    not compared", and exited 0 no matter what the container returned. Nine
+    merges landed 11,244 lines of Rust under the `default` gate profile while
+    that branch existed only as a print statement -- a green replay proved
+    only that the pinned upstream image agrees with itself.
+
+    This does not wait for #15 to build frankenrust:bench: replay_frankenrust()
+    takes `image` as a parameter precisely so this check can drive the exact
+    function main() would call, pointed at the upstream image instead, against
+    a golden this check corrupts itself. If replay_frankenrust() is reverted to
+    a print (or its failures stop being returned), this goes red because
+    `failures` comes back empty for a golden that cannot possibly match.
+
+    The real golden directory is never touched: common.GOLDEN_DIR is pointed at
+    a throwaway temp directory containing one deliberately-wrong copy of
+    golden/hello.http for the duration of the call, then restored, so a crash
+    mid-check cannot leave a corrupted golden behind.
+    """
+    case = next(c for c in corpus["cases"] if c["name"] == "hello")
+    mini_corpus = {**corpus, "cases": [case]}
+    upstream_image = corpus["targets"]["upstream"]["image"]
+
+    real_golden = (common.GOLDEN_DIR / "hello.http").read_bytes()
+    corrupted = real_golden + b"\nselftest-injected-corruption\n"
+
+    real_golden_dir = common.GOLDEN_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "hello.http").write_bytes(corrupted)
+        common.GOLDEN_DIR = Path(tmp)
+        try:
+            compared, failures = replay.replay_frankenrust(mini_corpus, image=upstream_image)
+        finally:
+            common.GOLDEN_DIR = real_golden_dir
+
+    problems = []
+    if compared != 1:
+        problems.append(
+            f"replay_frankenrust compared {compared} case(s) against a 1-case corpus -- "
+            "expected exactly 1"
+        )
+    if not any("mismatch" in f for f in failures):
+        problems.append(
+            "replay_frankenrust did not report a mismatch against a golden this check "
+            "deliberately corrupted -- a real mismatch against frankenrust:bench would "
+            "pass the gate silently"
+        )
+    return problems
+
+
 def main() -> int:
     corpus = common.load_corpus()
 
@@ -242,6 +297,10 @@ def main() -> int:
         ("normalisation length-invariant", lambda: check_normalisation_is_length_invariant()),
         ("corpus/golden bijection", lambda: check_corpus_golden_bijection(corpus)),
         ("concurrent isolation", lambda: check_concurrent_isolation(corpus)),
+        (
+            "frankenrust replay branch detects mismatch",
+            lambda: check_frankenrust_replay_branch_detects_mismatch(corpus),
+        ),
     ]
 
     all_failures = []
