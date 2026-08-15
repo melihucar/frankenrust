@@ -59,6 +59,45 @@ RUN set -eux; \
     cargo fmt --version; \
     cargo clippy --version
 
+# Miri (issue #84): the interpreter that catches the class of provenance UB
+# #79 found in RequestArena::alloc, which a normal `cargo test` runs happily
+# and only Miri rejects (see
+# context::tests::arena_pointers_are_writable_not_just_readable). Miri is a
+# nightly-only rustup component, and not every nightly snapshot ships a
+# working build of it -- pinned to a dated release known to have both `miri`
+# and `rust-src` (the latter is what lets Miri build its own instrumented
+# copy of std) rather than floating "nightly" against a build that may break
+# on any given day. Bump this ARG the same way PHP_DIGEST above gets bumped:
+# deliberately, when there is a reason to.
+#
+# Deliberately NOT followed by `cargo miri setup`. Baking Miri's instrumented
+# std into an image layer looks like an obvious ~12s-per-container saving and
+# is in fact a hard failure: rustc-build-sysroot stamps the sysroot with a
+# hash of the rust-src tree (mtimes included), the layer tar round-trip
+# truncates those mtimes to whole seconds, so the hash a container computes
+# can never equal the one the build computed. On a mismatch it does not
+# silently rebuild -- it rebuilds std (paying the 12s anyway), fails to move
+# the result into place (the target dir lives on a lower overlayfs layer, so
+# the final rename is EXDEV), re-reads the stale stamp and aborts with
+# "fatal error: failed to build sysroot: detected a concurrent sysroot build
+# with different settings". Reproduced 5/5 in the image this file builds, with
+# nothing running concurrently; `rm -rf /root/.cache/miri` is what makes it
+# work again. An absent cache is always correct: Miri builds the sysroot into
+# the container's writable layer on first use.
+ARG MIRI_NIGHTLY=nightly-2026-08-14
+RUN set -eux; \
+    rustup toolchain install "$MIRI_NIGHTLY" --profile minimal; \
+    rustup component add miri rust-src --toolchain "$MIRI_NIGHTLY"; \
+    cargo "+$MIRI_NIGHTLY" miri --version
+
+# The pin lives here and nowhere else. scripts/gate.sh's "miri" step reads this
+# rather than repeating "nightly-2026-08-14", so bumping the ARG above cannot
+# leave the gate invoking a toolchain the image no longer has; and because the
+# step expands it with `${MIRI_TOOLCHAIN:?}`, a gate run against an image built
+# from a Dockerfile that predates Miri fails loudly instead of falling back to
+# some other toolchain.
+ENV MIRI_TOOLCHAIN=${MIRI_NIGHTLY}
+
 # libclang-dev is what bindgen (used by #7's build.rs to generate FFI
 # bindings against php.h) needs to parse PHP's headers.
 RUN set -eux; \

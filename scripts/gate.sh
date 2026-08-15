@@ -6,7 +6,7 @@
 #
 # Profiles:
 #   bootstrap   build only — for early tasks that predate the test suite
-#   default     build + clippy + fmt + unit tests + conformance vs FrankenPHP
+#   default     build + clippy + fmt + unit tests + miri + conformance vs FrankenPHP
 #   bench       default, plus the benchmark harness must run end to end
 set -uo pipefail
 
@@ -86,6 +86,62 @@ if [ "$PROFILE" != "bootstrap" ]; then
   step "fmt"     bash scripts/dev.sh cargo fmt --all -- --check
   step "clippy"  bash scripts/dev.sh cargo clippy --workspace --all-targets -- -D warnings
   step "test"    bash scripts/dev.sh cargo test --workspace
+
+  # The one step that can see undefined behaviour. #79 shipped a
+  # RequestArena::alloc that handed C a pointer carrying SharedReadOnly
+  # provenance and let C write through it; build, clippy, test and conformance
+  # were all green on it, because rustc happily executes that UB. Two reviewers
+  # caught it and zero gate steps could have. Only an interpreter that tracks
+  # provenance can, which also means the probe test #79 shipped
+  # (context::tests::arena_pointers_are_writable_not_just_readable) is
+  # decorative without this step: under rustc it passes whether alloc is right
+  # or wrong. See issue #84.
+  #
+  # Why a filter and not `--lib`: Miri interprets MIR and cannot call a real
+  # foreign function, so any test that reaches the C shim or libc is
+  # permanently out — thread::tests re-execs the test binary via
+  # std::process::Command and calls libc::sysinfo, and callbacks::* call into
+  # frankenphp.c (frankenphp_init_persistent_string,
+  # frankenrust_collect_server_vars). The frankenrust-sys *dependency* is not
+  # the obstacle, which is the question #84 asked to settle: its build.rs
+  # (bindgen + cc) runs natively under `cargo miri`, and an extern declaration
+  # that is never called costs nothing, so `cargo miri test -p frankenrust-core`
+  # builds and runs fine. Only the calls are impossible.
+  #
+  # Within context.rs the exclusions are a budget decision, measured, not a
+  # correctness one — the whole module is Miri-clean. All 38 tests below take
+  # 135s wall (209s of test time) on an M-series host. The four excluded
+  # go_quote/go_is_print tests sweep the entire Unicode scalar range against a
+  # Go oracle; under the interpreter they had not finished after 13 minutes.
+  # They are pure byte/char logic with no raw pointer in sight, and `test`
+  # above already runs them, so Miri learns nothing from them it does not
+  # learn from the rest.
+  #
+  # Everything else in context.rs is included rather than allow-listed on
+  # purpose: a new test in this module gets Miri coverage by default, which is
+  # the behaviour worth having when #11's $_SERVER import, #12's go_read_post
+  # buffers and #13's response writer all hand raw pointers to C. Extending
+  # this to callbacks::* is issue #203.
+  step "miri" bash scripts/dev.sh bash -c '
+    set -uo pipefail
+    export MIRIFLAGS=-Zmiri-strict-provenance
+    log=$(mktemp)
+    # The toolchain name comes from the image (docker/frankenrust-dev.Dockerfile
+    # sets MIRI_TOOLCHAIN from its MIRI_NIGHTLY ARG) so the pin lives in exactly
+    # one place; :? makes an image that predates it fail loudly here.
+    cargo "+${MIRI_TOOLCHAIN:?image has no Miri toolchain -- rebuild frankenrust-dev}" \
+      miri test -p frankenrust-core --lib -- \
+      context:: --skip go_quote --skip go_is_print 2>&1 | tee "$log" || exit 1
+    # Fail closed. A libtest filter that matches nothing runs zero tests and
+    # exits 0, so a renamed test or a widened --skip would turn this step into
+    # a 12-second no-op that reports PASS. Name the probe the whole step exists
+    # for and require it to have actually run.
+    grep -q "arena_pointers_are_writable_not_just_readable \.\.\. ok" "$log" || {
+      echo "FAIL: miri never ran the arena provenance probe -- filter or test name changed?" >&2
+      exit 1
+    }
+  '
+
   step "conformance" bash tests/conformance/run.sh
 fi
 
