@@ -704,14 +704,16 @@ SILENT_REVIEW = (
     "is unchanged and the review will be retried."
 )
 
-# Fixed reviewer/agent pairing for a round: index 1 is always claude, index 2
-# is always codex (falling back to claude inside invoke() once codex is out of
-# quota). review_stage() uses this to retry only the reviewer(s) that went
-# silent, and review_summary() uses it to name them in the closing comment.
+# Who was *asked* to review: index 1 is always claude, index 2 is always codex
+# (falling back to claude inside invoke() once codex is out of quota). This is
+# the roster, not the attendance sheet -- review_stage() seeds its results from
+# it so a reviewer that never came back at all still counts as one that owes a
+# verdict, and retries only the indices that went silent. What actually ran is
+# invoke()'s first return value, and that is what names a reviewer in public.
 REVIEWER_AGENTS = {1: "claude", 2: "codex"}
 
 
-def review_summary(verdicts: dict[int, str]) -> str:
+def review_summary(verdicts: dict[int, str], agents: dict[int, str]) -> str:
     """What the closing comment should claim happened, from a round's verdicts.
 
     "Two adversarial reviews" is a claim the morning reader takes on faith; it
@@ -719,16 +721,41 @@ def review_summary(verdicts: dict[int, str]) -> str:
     review_stage()'s retry. #40 got a 1,006-line diff cleared for merge on one
     review while gh.close() was about to record two -- only an unrelated
     rebase conflict stopped it from landing.
+
+    `agents` is who actually ran, captured from invoke(); naming from
+    REVIEWER_AGENTS instead would name who was asked, and those differ exactly
+    when it matters. resolve() turns reviewer 2's "codex" into claude the
+    moment the quota latch is armed, so the table credits the diff to a vendor
+    that never opened it: replaying #40's own verdicts on a latched run,
+    {1: silent, 2: pass} read out as "one adversarial review (codex)" when what
+    happened was claude dying and claude passing. That is #40's false record
+    one field over, and a *stronger* claim than the sentence it replaced.
+    Deriving from what ran also drops the old reliance on codex_ok() at close()
+    time -- a run-global latch another worker can arm twenty minutes after this
+    round's codex reviewer read the diff perfectly well.
     """
-    silent = [REVIEWER_AGENTS[i] for i, v in sorted(verdicts.items()) if v == "silent"]
-    if not silent:
-        return ("two adversarial reviews (claude + codex)" if codex_ok()
-                else "two adversarial reviews, both claude — codex was unavailable")
-    reported = [REVIEWER_AGENTS[i] for i, v in sorted(verdicts.items()) if v != "silent"]
-    who = " and ".join(reported) if reported else "no reviewer"
-    return (f"one adversarial review ({who}); the other reviewer was killed by "
-            f"the {AGENT_TIMEOUT // 60}-minute timeout (or crashed) and did not "
-            "report, even after a retry")
+    def name(i: int) -> str:
+        return agents.get(i) or "an agent that did not identify itself"
+
+    if not verdicts:
+        # Only an empty round gets here: review_stage returns no verdicts when
+        # there is no diff left to review, which a fixer can produce by
+        # reverting one to nothing under a gate that passes on an empty tree.
+        # Claiming reviews of a diff nobody was shown is the same false record
+        # pointing the other way.
+        return "no adversarial review — there was no diff left to review"
+    reported = [name(i) for i, v in sorted(verdicts.items()) if v != "silent"]
+    if not any(v == "silent" for v in verdicts.values()):
+        seen = sorted(set(reported))
+        return (f"two adversarial reviews ({' + '.join(seen)})" if len(seen) > 1
+                else f"two adversarial reviews, both {seen[0]} — codex was unavailable")
+    if not reported:
+        return ("no adversarial review at all: every reviewer was killed by the "
+                f"{AGENT_TIMEOUT // 60}-minute timeout (or crashed) and did not "
+                "report, even after a retry")
+    return (f"one adversarial review ({' and '.join(reported)}); the other reviewer "
+            f"was killed by the {AGENT_TIMEOUT // 60}-minute timeout (or crashed) "
+            "and did not report, even after a retry")
 
 
 def review_outcome(results: dict[int, str]) -> tuple[str | None, dict[int, str]]:
@@ -766,7 +793,7 @@ def review_outcome(results: dict[int, str]) -> tuple[str | None, dict[int, str]]
 
 
 def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
-                  tag: str) -> tuple[str | None, dict[int, str]]:
+                  tag: str) -> tuple[str | None, dict[int, str], dict[int, str]]:
     """Two adversarial reviewers, independent contexts, diff only.
 
     Reviewers run with cwd=wt and full tool access, and reviewer.md tells them
@@ -784,21 +811,45 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
     as silence and asks for it twice, so only reviewers review_outcome actually
     classified as silent -- never one that blocked -- are re-run.
 
-    Returns (blocking text or None, the final round's verdicts). The caller
-    needs the verdicts too: a round that is still one-sided after the retry is
-    not blocking, but the merge that follows must say one review happened, not
-    two (#139) -- and only the verdicts carry that.
+    Returns (blocking text or None, the final round's verdicts, the agent that
+    actually ran each index). The caller needs all three: a round that is still
+    one-sided after the retry is not blocking, but the merge that follows must
+    say one review happened, not two (#139), and must name the model that did
+    it -- and only the verdicts and the agents carry that.
     """
     diff = worktree_diff(wt)
     if not diff.strip():
-        return None, {}
+        return None, {}, {}
     (logdir / f"diff.{tag}.patch").write_text(diff)
     p = prompt_for("reviewer", issue, f"\n## The diff\n```diff\n{diff[:120000]}\n```\n")
 
-    results: dict[int, str] = {}
+    # Seeded from the roster rather than filled in by whoever survives. invoke()
+    # is the one Popen site in this file with no FileNotFoundError guard, so a
+    # renamed or not-yet-installed agent binary (or an OSError on fork under
+    # load) raises out of one() and kills only that thread. An index that never
+    # reaches `results` never reaches `verdicts` either, and a reviewer that is
+    # *absent* reads as neither "silent" nor a block: it is not retried, and
+    # review_summary sees no silence to disclose, so the issue closes claiming
+    # two reviews when one ran. Absence is the most complete form of the thing
+    # this stage exists to notice, so the roster decides who owed a verdict.
+    results: dict[int, str] = {i: "" for i in REVIEWER_AGENTS}
+    agents: dict[int, str] = {}
 
     def one(idx: int, agent: str, rtag: str) -> None:
-        _, _, text = invoke(agent, wt, p, logdir, rtag, role="reviewer")
+        try:
+            use, _, text = invoke(agent, wt, p, logdir, rtag, role="reviewer")
+        except Exception as exc:  # noqa: BLE001
+            # Nothing above this catches a reviewer thread's exception, so the
+            # only trace would be a traceback on the loop's stderr and nothing
+            # in the journal the retrospective reads. results[idx] keeps its
+            # seeded "", so this reviewer is silent and gets its retry.
+            log(f"    !! reviewer {idx} ({agent}) {rtag} raised: {exc!r}")
+            record("agent_error", agent=agent, tag=rtag, rc=None, reason=repr(exc))
+            return
+        # The agent that ran, not the one requested: invoke() returns claude in
+        # codex's slot once the quota latch is armed, and review_summary must
+        # name whoever actually read the diff.
+        agents[idx] = use
         results[idx] = text
 
     def run_round(idxs: dict[int, str], rtag: str) -> None:
@@ -842,7 +893,7 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
         run_round(silent, f"{tag}.retry")
         blocking, verdicts = score(f"{tag}.retry")
 
-    return blocking, verdicts
+    return blocking, verdicts, agents
 
 
 def resolve_question(issue: gh.Issue, wt: Path, logdir: Path, critique: str) -> bool:
@@ -1060,7 +1111,8 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
                        "broke nothing; it is not evidence of work.")
             continue
 
-        blocking, verdicts = review_stage(issue, wt, logdir, str(attempt))
+        # `reviewers`, not `agents`: `agents` above is the implementer rotation.
+        blocking, verdicts, reviewers = review_stage(issue, wt, logdir, str(attempt))
         if blocking:
             log(f"    xx review BLOCKED #{issue.number}")
             # Head, not tail. review_outcome puts "## Reviewer N" at the front of
@@ -1083,7 +1135,8 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             # attempt the fixed string "Reviewers still blocking after the fix
             # pass" -- which names no defect, so attempts 2 and 3 re-derived
             # from scratch what attempt 1 had already been told, or guessed.
-            still_blocking, verdicts = review_stage(issue, wt, logdir, f"post{attempt}")
+            still_blocking, verdicts, reviewers = review_stage(issue, wt, logdir,
+                                                               f"post{attempt}")
             if still_blocking:
                 record("review_block", issue=issue.number, attempt=attempt,
                        phase="post-fix", excerpt=still_blocking[:1500])
@@ -1098,8 +1151,9 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             # once codex is walled off it is two runs of one model -- a weaker
             # claim that the morning reader deserves to see on the issue. And
             # if a reviewer was still silent after review_stage()'s retry, this
-            # is one review, not two (#139).
-            reviewed = review_summary(verdicts)
+            # is one review, not two (#139). Both facts come from the round
+            # itself, never from the static roster or a run-global latch.
+            reviewed = review_summary(verdicts, reviewers)
             gh.close(issue.number,
                      f"Merged as `{sha}` after {attempt} attempt(s), gate `{issue.gate}`, "
                      f"and {reviewed}.")

@@ -491,6 +491,22 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
     by tag: a silent reviewer 1 must be retried exactly once, into a
     `review1.<tag>.retry` tag, before the merge path is reached -- and a
     reviewer that passed on the first round must never be re-invoked.
+
+    Two further shapes, each a defect the reviewers of this change caught and
+    no test did:
+
+      * The closing comment must name the agent that *ran*, not the one the
+        REVIEWER_AGENTS roster asked for. resolve() turns reviewer 2's "codex"
+        into claude the instant the quota latch is armed, so naming from the
+        roster credits the diff to a vendor that never opened it -- on a
+        latched run, #40's own {1: silent, 2: pass} read out as "one
+        adversarial review (codex)" when claude died and claude passed. The
+        stub therefore resolves its return value exactly as invoke() does.
+      * A reviewer whose invoke() *raises* -- a renamed agent binary is a bare
+        Popen FileNotFoundError, and invoke() is the one Popen site with no
+        guard -- must be retried and disclosed like any other reviewer that
+        did not report. It used to be absent from `results` rather than silent
+        in it, so it was neither.
     """
     sys.path.insert(0, str(ROOT / "orchestrator"))
     import gh
@@ -512,17 +528,34 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
     issue = gh.Issue(number=139, title="a reviewer killed by the timeout", body="body")
 
     real_invoke, real_record, real_log = loop.invoke, loop.record, loop.log
-    loop.record = lambda event, **f: None
+    real_codex_ok = loop.codex_ok
+    # Captured rather than dropped: a reviewer that dies has to leave evidence
+    # in the journal the retrospective reads, not just a traceback on stderr.
+    events: list[tuple[str, dict]] = []
+    loop.record = lambda event, **f: events.append((event, f))
     loop.log = lambda msg: None
 
-    def run_case(script: dict[str, str]) -> tuple[tuple, list[str]]:
+    def run_case(script: dict, latched: bool = False) -> tuple[tuple, list[str]]:
+        """Script a round by tag. A BaseException value is raised, not returned.
+
+        `latched` pins codex_ok() rather than inheriting FR_CODEX_DISABLED from
+        whatever the ambient run happens to be, so both sides of the fallback
+        are covered deterministically.
+        """
         calls: list[str] = []
+        events.clear()
 
         def stub(agent, wt, prompt, logdir, tag, role="implementer", escalate=False):
             calls.append(tag)
-            return agent, 0, script.get(tag, "")
+            scripted = script.get(tag, "")
+            if isinstance(scripted, BaseException):
+                raise scripted
+            # invoke()'s first return value is the agent that ran *after*
+            # resolve()'s codex->claude fallback, not the one requested.
+            return loop.resolve(agent, "reviewer")[0], 0, scripted
 
         loop.invoke = stub
+        loop.codex_ok = lambda: not latched
         with tempfile.TemporaryDirectory() as tmp:
             wt = Path(tmp) / "repo"
             make_repo(wt)
@@ -535,7 +568,7 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
     try:
         # Reviewer 1 goes silent on the first pass, then blocks on the retry.
         # Reviewer 2 passes immediately and must not be re-invoked.
-        (blocking, verdicts), calls = run_case({
+        (blocking, verdicts, reviewers), calls = run_case({
             "review1.1": "",
             "review2.1": "Looks correct.\nVERDICT: PASS",
             "review1.1.retry": "Found a real defect.\n\nVERDICT: BLOCK",
@@ -556,12 +589,14 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
         # Reviewer 1 stays silent even after the retry. The round must not
         # block -- review_outcome's classification of "one silent, one
         # passing" is not itself the bug -- but it must come back marked as
-        # one review, not two, for _work() to hand to gh.close().
-        (blocking, verdicts), calls = run_case({
+        # one review, not two, for _work() to hand to gh.close(), and it must
+        # credit the review to the agent that actually produced it.
+        still_silent = {
             "review1.1": "",
             "review2.1": "Looks correct.\nVERDICT: PASS",
             "review1.1.retry": "",
-        })
+        }
+        (blocking, verdicts, reviewers), calls = run_case(still_silent)
         if blocking:
             bad += fail(f"a reviewer still silent after its one retry must "
                         f"not block a diff the other reviewer passed: {blocking!r}")
@@ -571,13 +606,83 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
         if verdicts != {1: "silent", 2: "pass"}:
             bad += fail(f"final verdicts do not show reviewer 1 as still "
                         f"silent: {verdicts}")
-        summary = loop.review_summary(verdicts)
+        summary = loop.review_summary(verdicts, reviewers)
         if "two adversarial" in summary or "one adversarial review" not in summary:
             bad += fail(f"review_summary() must say one review happened, not "
                         f"two, when a reviewer stayed silent through the "
                         f"retry: {summary!r}")
+        if "codex" not in summary:
+            bad += fail(f"codex really did produce the surviving review here "
+                        f"and must be named: {summary!r}")
+
+        # The same round with the codex quota latch armed. Slot 2 is claude,
+        # so the surviving review is claude's and the sentence must say so:
+        # telling the morning reader a second vendor read a diff it never saw
+        # is #40's false record one field over.
+        (blocking, verdicts, reviewers), calls = run_case(still_silent, latched=True)
+        if reviewers != {1: "claude", 2: "claude"}:
+            bad += fail(f"review_stage must report the agents that ran, and "
+                        f"under the latch both slots are claude -- a reviewer "
+                        f"that timed out still returns from invoke(): {reviewers}")
+        summary = loop.review_summary(verdicts, reviewers)
+        if "codex" in summary or "claude" not in summary:
+            bad += fail(f"with codex walled off, the surviving reviewer was "
+                        f"claude; the closing comment must not credit codex: "
+                        f"{summary!r}")
+
+        # A reviewer that dies hard rather than quietly: invoke() raises, the
+        # thread unwinds, and nothing ever assigns results[1]. It must still
+        # count as a reviewer that owes a verdict -- retried, and its BLOCK on
+        # the retry honoured.
+        (blocking, verdicts, reviewers), calls = run_case({
+            "review1.1": FileNotFoundError(2, "No such file or directory: 'claude'"),
+            "review2.1": "Looks correct.\nVERDICT: PASS",
+            "review1.1.retry": "Found a real defect.\n\nVERDICT: BLOCK",
+        })
+        if calls.count("review1.1.retry") != 1:
+            bad += fail(f"a reviewer whose invoke() raised was not retried; it "
+                        f"is absent from the verdicts, not silent in them: {calls}")
+        if not blocking or "VERDICT: BLOCK" not in blocking:
+            bad += fail(f"the retry of a hard-dead reviewer produced a BLOCK "
+                        f"that did not block the diff: {blocking!r}")
+        if not [f for e, f in events
+                if e == "agent_error" and f.get("tag") == "review1.1"]:
+            bad += fail(f"a reviewer that raised left nothing in the journal "
+                        f"but a traceback on stderr: {events}")
+
+        # ...and if it dies both times, the merge is one review, not two.
+        (blocking, verdicts, reviewers), calls = run_case({
+            "review1.1": FileNotFoundError(2, "No such file or directory: 'claude'"),
+            "review2.1": "Looks correct.\nVERDICT: PASS",
+            "review1.1.retry": OSError("fork failed"),
+        })
+        if blocking:
+            bad += fail(f"a hard-dead reviewer must not block a diff the other "
+                        f"reviewer passed: {blocking!r}")
+        if verdicts != {1: "silent", 2: "pass"}:
+            bad += fail(f"a reviewer whose invoke() raised must appear in the "
+                        f"verdicts as silent, not vanish from them: {verdicts}")
+        summary = loop.review_summary(verdicts, reviewers)
+        if "two adversarial" in summary:
+            bad += fail(f"a round where one reviewer never ran at all closed "
+                        f"claiming two adversarial reviews: {summary!r}")
+
+        # review_summary reads the round, never a run-global latch: codex may
+        # have reviewed this diff perfectly well and been walled off by another
+        # worker twenty minutes later, and it must still be credited.
+        loop.codex_ok = lambda: False
+        both = {1: "pass", 2: "pass"}
+        summary = loop.review_summary(both, {1: "claude", 2: "codex"})
+        if "claude + codex" not in summary:
+            bad += fail(f"codex reviewed this round and was latched off after "
+                        f"it; the closing comment must still credit it: {summary!r}")
+        summary = loop.review_summary(both, {1: "claude", 2: "claude"})
+        if "both claude" not in summary:
+            bad += fail(f"two claude reviewers must not be reported as "
+                        f"cross-vendor review: {summary!r}")
     finally:
         loop.invoke, loop.record, loop.log = real_invoke, real_record, real_log
+        loop.codex_ok = real_codex_ok
     return bad
 
 
