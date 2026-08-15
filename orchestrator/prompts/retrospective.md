@@ -23,7 +23,7 @@ Events: `merged`, `blocked`, `gate_fail`, `review_block`, `critic_revise`,
 `recovery_exhausted`, `rebase_conflict`, `merge_regate_fail`,
 `agent_fallback`, `agent_timeout`, `agent_error`, `work_crash`, `reclaimed`,
 `low_disk`, `empty_diff`, `review_diversity_lost`, `retrospective`, `retro_error`, `self_restart`,
-`journal_reset`.
+`journal_reset`, `root_write`, `root_write_revert_failed`.
 
 `recovery_exhausted` is the most serious event in that list and the easiest to
 miss, because by definition nothing after it fails: an issue other work depends

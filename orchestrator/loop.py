@@ -36,6 +36,7 @@ boundary. scripts/check_orchestrator.py is what keeps that survivable.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -596,6 +597,158 @@ def publish_main(tid: str) -> None:
     record("pushed", issue=tid)
 
 
+# --- ROOT guard ---------------------------------------------------------------
+def root_dirty_set(root: Path = ROOT) -> dict[str, str]:
+    """path -> XY status code for every dirty path in `root`.
+
+    Shared plumbing: #185 (the merge path) and #186 (untracked-stray
+    disposition) both need this same parse. Get it right once, here.
+
+    Parsed from `git --no-optional-locks status --porcelain -z -uall`, not by
+    splitting `--porcelain` on newlines. The `-z` record format is NOT
+    `--porcelain` with newlines swapped for NULs: with `-z` git emits no
+    quoting at all (the reason to use it -- paths with spaces or non-ASCII
+    bytes arrive raw), and a rename/copy is TWO NUL-terminated fields, new
+    path first, with no ` -> `:
+
+        non-z:  R  t.md -> "a b.md"
+        -z:     'R  a b.md' NUL 't.md' NUL
+
+    A `split('\\0')` loop that assumes one path per record reads the old path
+    (`t.md`) back as a bogus, status-less record. And the rename indicator can
+    be reported in EITHER column -- git >=2.18 detects unstaged renames with
+    the `R` in column two, verified on git 2.54:
+    `' R abc/xyz.md\\0abc/def.md\\0'` -- so the extra field must be consumed
+    whenever EITHER column is `R`/`C`, not just column one. Keying only on
+    column one desyncs the rest of the stream and hands a garbage path (a
+    fragment of the old path, missing its leading directory component) to
+    whatever consumes this dict next.
+
+    `--no-optional-locks` matters as much as `-z` does. Plain `git status`
+    opportunistically refreshes and *writes* the index, taking
+    `<root>/.git/index.lock` -- and this runs from a worker thread while
+    another worker may be mid-`git merge --ff-only` in ROOT inside
+    merge_worktree. Measured on git 2.54 with concurrent
+    `git status --porcelain -z` as the only other git activity: plain
+    `git status` failed 7/30 concurrent merges; `--no-optional-locks`, 0/30.
+
+    `-uall` so an untracked directory is listed file-by-file rather than
+    collapsed into one `dir/` record, whose collapsing boundary would
+    otherwise move whenever an unrelated merge changes what is inside it.
+    """
+    proc = subprocess.run(
+        ["git", "--no-optional-locks", "status", "--porcelain", "-z", "-uall"],
+        cwd=str(root), capture_output=True, text=True,
+    )
+    dirty: dict[str, str] = {}
+    fields = proc.stdout.split("\0")
+    i = 0
+    while i < len(fields):
+        rec = fields[i]
+        i += 1
+        if not rec:
+            continue
+        status, path = rec[:2], rec[3:]
+        if status[0] in "RC" or status[1] in "RC":
+            i += 1  # the old path: its own field, with no status of its own
+        dirty[path] = status
+    return dirty
+
+
+def _root_fingerprints(root: Path = ROOT) -> dict[str, str]:
+    """Per-path content fingerprint for every currently-dirty path in `root`.
+
+    guard_root_writes() diffs this before/after a stage. root_dirty_set()'s
+    XY code alone is not a safe diff key: #185's preflight deliberately
+    leaves ROOT dirty for the whole run, so a path already ` M` before a stage
+    and still ` M` after compares equal under a status-code delta, hiding any
+    amount of stray content written to it -- reviewers reproduced this
+    against occurrence 2's own shape. `git hash-object` names the actual
+    bytes; the status code is folded in too so a mode-only change (same
+    bytes, different Y column) still registers.
+    """
+    out: dict[str, str] = {}
+    for path, status in root_dirty_set(root).items():
+        full = root / path
+        if full.is_file():
+            rc, h = git(["hash-object", "--", path], cwd=root)
+            content = h if rc == 0 else "<unreadable>"
+        else:
+            content = "<absent>"          # deleted, or a directory/gitlink entry
+        out[path] = f"{status}:{content}"
+    return out
+
+
+@contextlib.contextmanager
+def guard_root_writes(tid: str, tag: str, root: Path = ROOT):
+    """Detect, journal and revert a worktree-stage agent's stray writes to ROOT.
+
+    agent_cmd() runs claude with --dangerously-skip-permissions and no cwd
+    confinement, so an agent standing in a worktree can still write into the
+    main checkout. prompt_for() reads shared.md/<role>.md from ROOT on every
+    subsequent invocation, so a stray write to a tracked prompt file changes
+    what every later stage in the run is told -- no gate, no reviewer, no
+    commit, no journal entry. Bracket every worktree agent stage with this so
+    a stray write is caught the cycle it happens in, not discovered days later
+    as unexplained prompt drift.
+
+    Tracked paths are reverted with `git checkout HEAD -- <path>`, not the
+    two-arg `git checkout -- <path>`: an agent that ran `git add` in ROOT has
+    its stray content staged in the index, and the two-arg form restores from
+    there, not from HEAD. `HEAD --` restores from the object database and so
+    cannot destroy anything unrecoverable.
+
+    Untracked paths are left on disk and only journaled, under
+    `not_reverted`. Deleting a path that exists in no index, no branch and no
+    object database is not reversible the way a tracked checkout is; #186
+    owns what happens to it.
+
+    Keyed on _root_fingerprints(), a content diff, not on root_dirty_set()'s
+    status codes -- see that function's docstring for why a status-code delta
+    would ship disarmed on every path that was already dirty when the run
+    started.
+
+    Attribution to `tid` is best-effort, and that is a deliberate simplification,
+    not an oversight: under MAX_PARALLEL > 1, two worker threads can bracket
+    ROOT at once, and both observe a stray write made by either one --
+    whichever recaptures first reverts it and journals it against its own
+    tid. The revert itself is correct regardless of which thread performs it;
+    only the `issue=` field on the journal record can name the wrong issue.
+    """
+    before = _root_fingerprints(root)
+    try:
+        yield
+    finally:
+        # No early `return` in this block, deliberately: this is a generator
+        # under @contextlib.contextmanager, so a `return` here while the body
+        # above raised would swallow that exception instead of letting it
+        # propagate out of the `with` -- turning a crashed agent invocation
+        # into a silent no-op whenever it happened not to touch ROOT.
+        after = _root_fingerprints(root)
+        changed = sorted(p for p, fp in after.items() if before.get(p) != fp)
+        if changed:
+            tracked, untracked = [], []
+            for p in changed:
+                rc, _ = git(["cat-file", "-e", f"HEAD:{p}"], cwd=root)
+                (tracked if rc == 0 else untracked).append(p)
+            log(f"    !! stray write(s) to ROOT during {tag} ({tid}): {changed}")
+            record("root_write", issue=tid, stage=tag, paths=changed,
+                   reverted=tracked, not_reverted=untracked)
+            for p in tracked:
+                rc, out = git(["checkout", "HEAD", "--", p], cwd=root)
+                if rc != 0:
+                    log(f"    !! git checkout HEAD -- {p} failed in ROOT: {out}")
+            # The ground truth for whether the revert actually stuck, not the
+            # rc above: a checkout that exits 0 but somehow does not restore
+            # the exact HEAD content would otherwise be journalled as a
+            # successful revert while the stray still feeds prompt_for().
+            still_dirty = root_dirty_set(root)
+            failed = [p for p in tracked if p in still_dirty]
+            if failed:
+                log(f"    !! revert of stray ROOT write(s) did not stick: {failed}")
+                record("root_write_revert_failed", issue=tid, stage=tag, paths=failed)
+
+
 # --- stages ------------------------------------------------------------------
 def worktree_diff(wt: Path) -> str:
     """Everything the agent changed -- committed or not, tracked or not.
@@ -993,15 +1146,20 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
     # Cross-model on purpose: two instances of one model reviewing a diff behave
     # closer to one reviewer than to two. Once codex is out of quota both become
     # Opus, losing vendor diversity but keeping independent contexts.
-    run_round(REVIEWER_AGENTS, tag)
-    blocking, verdicts = score(tag)
+    #
+    # Reviewers run cwd=wt, not cwd=ROOT, but full tool access means nothing
+    # stops one from cd-ing there and writing -- guard the whole bracket,
+    # including the silent-reviewer retry below, in one go.
+    with guard_root_writes(str(issue.number), f"review.{tag}"):
+        run_round(REVIEWER_AGENTS, tag)
+        blocking, verdicts = score(tag)
 
-    silent = {i: a for i, a in REVIEWER_AGENTS.items() if verdicts.get(i) == "silent"}
-    if silent and not any(v == "block" for v in verdicts.values()):
-        log(f"    -> #{issue.number} retrying silent reviewer(s) "
-            f"{sorted(silent.values())} ({tag})")
-        run_round(silent, f"{tag}.retry")
-        blocking, verdicts = score(f"{tag}.retry")
+        silent = {i: a for i, a in REVIEWER_AGENTS.items() if verdicts.get(i) == "silent"}
+        if silent and not any(v == "block" for v in verdicts.values()):
+            log(f"    -> #{issue.number} retrying silent reviewer(s) "
+                f"{sorted(silent.values())} ({tag})")
+            run_round(silent, f"{tag}.retry")
+            blocking, verdicts = score(f"{tag}.retry")
 
     return blocking, verdicts, agents
 
@@ -1021,8 +1179,9 @@ def resolve_question(issue: gh.Issue, wt: Path, logdir: Path, critique: str) -> 
         extra += (f"\n# This issue has already been re-scoped {rounds} times.\n"
                   "REWRITE is no longer available to you. Decide PROCEED or "
                   "CLOSE, and justify it.\n")
-    _, _, out = invoke("claude", wt, prompt_for("resolver", issue, extra),
-                       logdir, f"resolve.{rounds}", role="resolver")
+    with guard_root_writes(str(issue.number), f"resolve.{rounds}"):
+        _, _, out = invoke("claude", wt, prompt_for("resolver", issue, extra),
+                           logdir, f"resolve.{rounds}", role="resolver")
 
     if "RESOLUTION: PROCEED" in out:
         gh.comment(issue.number, f"**Resolver: the objection does not hold.**\n\n{out[-30000:]}")
@@ -1095,8 +1254,9 @@ def recover_blocked() -> int:
                      f"# Its transcripts\n\n`{logdir}` in the main checkout "
                      f"(absolute path; you are in a worktree).\n"
                      f"Rescue {issue.recoveries + 1} of {MAX_RECOVERIES}.\n")
-            _, _, out = invoke("claude", wt, prompt_for("unblocker", issue, extra),
-                               logdir, f"unblock.{issue.recoveries}", role="unblocker")
+            with guard_root_writes(tid, f"unblock.{issue.recoveries}"):
+                _, _, out = invoke("claude", wt, prompt_for("unblocker", issue, extra),
+                                   logdir, f"unblock.{issue.recoveries}", role="unblocker")
 
             if "RECOVERY: CLOSE" in out:
                 gh.close(issue.number,
@@ -1170,8 +1330,9 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
     # the implementer did and no reviewer has any reason to question it.
     critic_snapshot = snapshot_worktree(wt)
     try:
-        used, _, critique = invoke(issue.agent, wt, prompt_for("critic", issue),
-                                   logdir, "critic", role="critic")
+        with guard_root_writes(tid, "critic"):
+            used, _, critique = invoke(issue.agent, wt, prompt_for("critic", issue),
+                                       logdir, "critic", role="critic")
         if "VERDICT: REVISE" in critique:
             log(f"    ?? #{issue.number} questioned by the critic")
             record("critic_revise", issue=issue.number, title=issue.title,
@@ -1195,9 +1356,10 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
         if failure:
             extra = ("\n# The previous attempt FAILED\nFix the root cause; do not "
                      f"paper over it.\n\n```\n{failure[-6000:]}\n```\n")
-        invoke(agent, wt, prompt_for("implementer", issue, extra), logdir,
-               f"impl.{attempt}", role="implementer",
-               escalate=(attempt >= MAX_ATTEMPTS))
+        with guard_root_writes(tid, f"impl.{attempt}"):
+            invoke(agent, wt, prompt_for("implementer", issue, extra), logdir,
+                   f"impl.{attempt}", role="implementer",
+                   escalate=(attempt >= MAX_ATTEMPTS))
 
         rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
                        logdir / f"gate.{attempt}.log")
@@ -1233,8 +1395,9 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             # former and nothing could count them.
             record("review_block", issue=issue.number, attempt=attempt,
                    phase="initial", excerpt=blocking[:1500])
-            invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"), logdir,
-                   f"fix.{attempt}", role="fixer")
+            with guard_root_writes(tid, f"fix.{attempt}"):
+                invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"), logdir,
+                       f"fix.{attempt}", role="fixer")
             rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
                            logdir / f"gate.fix.{attempt}.log")
             if rc != 0:

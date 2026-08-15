@@ -2642,6 +2642,355 @@ def check_post_fix_empty_diff_does_not_merge() -> int:
     return bad
 
 
+def check_root_dirty_set_parses_porcelain_z() -> int:
+    """`loop.root_dirty_set()` must survive `git status --porcelain -z`'s actual
+    record format, not the format a naive port of the non-`-z` parser expects.
+
+    #168: an agent standing in a worktree can write into the main checkout,
+    and prompt_for() reads its prompts from there on every subsequent
+    invocation -- so a stray write to a tracked prompt file is fed to every
+    later stage, ungated. root_dirty_set() is the parser the detector is
+    built on, and it is shared with #185 (the merge path) and #186 (untracked
+    strays), so a parsing bug here is not local to this issue.
+
+    The `-z` record format is NOT `--porcelain` with newlines swapped for
+    NULs: with `-z` git emits no quoting at all, and a rename/copy is TWO
+    NUL-terminated fields, new path first, with no ` -> `. A `split('\\0')`
+    loop that assumes one path per record reads the old path back as a bogus,
+    status-less record and -- worse -- desyncs every record after it.
+
+    Exercised against real git, not a canned string: rename detection
+    behaviour (which column carries `R`, whether the old path even appears)
+    is git's, not this test's, to define, and the two rename shapes below
+    were independently verified against the installed git before being
+    written into this test:
+
+    - a STAGED rename (`git mv`), which reports `R ` -- R in column one, and
+    - an UNSTAGED rename ("renamed in work tree"), which git only reports
+      when the new path has been `git add -N`'d (intent-to-add) -- without
+      that, git treats the old path as merely deleted and the new path as
+      merely untracked, no rename at all. Reported as ` R` -- R in column
+      TWO, which is the shape a parser keyed on column one alone gets wrong:
+      keying only on column one desyncs the rest of the stream and hands a
+      garbage path (missing its leading directory component, or reading
+      "/def.md" as `ROOT / "/def.md"` -- outside the repository entirely) to
+      whatever consumes this dict next.
+
+    Also covers a path containing a space, which -z's raw (unquoted) output
+    is the reason to use it at all.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    def sh(cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=cwd, check=True,
+                              capture_output=True, text=True).stdout
+
+    bad = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        sh(repo, "init", "-q", "-b", "main")
+        sh(repo, "config", "user.email", "check_orchestrator@example.com")
+        sh(repo, "config", "user.name", "check_orchestrator")
+
+        # Large and varied enough that git's similarity heuristic treats the
+        # move as a rename rather than an unrelated add+delete.
+        content = "".join(f"line {n}\n" for n in range(30))
+        (repo / "abc").mkdir()
+        (repo / "abc" / "def.md").write_text(content)
+        (repo / "c.md").write_text("c file\nsecond line\nthird line\n")
+        sh(repo, "add", "-A")
+        sh(repo, "commit", "-q", "-m", "base")
+
+        # unstaged rename ("renamed in work tree"): move on disk, then
+        # intent-to-add the new path so git's index-vs-worktree diff has
+        # something to compare the deleted old path against.
+        (repo / "abc" / "def.md").rename(repo / "abc" / "xyz.md")
+        sh(repo, "add", "-N", "abc/xyz.md")
+
+        # staged rename, onto a path with a space in it.
+        sh(repo, "mv", "c.md", "d file.md")
+
+        # untracked, with a space.
+        (repo / "new file.md").write_text("scratch\n")
+
+        dirty = loop.root_dirty_set(repo)
+
+        if dirty.get("abc/xyz.md") != " R":
+            bad += fail(f"unstaged rename (R in column two) parsed as "
+                        f"{dirty.get('abc/xyz.md')!r}, not ' R': {dirty}")
+        if "abc/def.md" in dirty:
+            bad += fail(f"the OLD path of the unstaged rename leaked into "
+                        f"the dict as its own status-less entry: {dirty}")
+        if dirty.get("d file.md") != "R ":
+            bad += fail(f"staged rename (R in column one) parsed as "
+                        f"{dirty.get('d file.md')!r}, not 'R ': {dirty}")
+        if "c.md" in dirty:
+            bad += fail(f"the OLD path of the staged rename leaked into "
+                        f"the dict as its own status-less entry: {dirty}")
+        if dirty.get("new file.md") != "??":
+            bad += fail(f"untracked path containing a space parsed as "
+                        f"{dirty.get('new file.md')!r}, not '??': {dirty}")
+        garbage = [k for k in dirty if k.startswith("/") or not k]
+        if garbage:
+            bad += fail(f"a desynced record produced a garbage path key -- "
+                        f"e.g. '/def.md' resolves outside the repo entirely "
+                        f"via ROOT / '/def.md': {garbage} in {dirty}")
+    return bad
+
+
+def _guard_init(cwd: Path) -> None:
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=cwd, check=True)
+    subprocess.run(["git", "config", "user.email", "check_orchestrator@example.com"],
+                   cwd=cwd, check=True)
+    subprocess.run(["git", "config", "user.name", "check_orchestrator"], cwd=cwd, check=True)
+
+
+def _guard_sh(cwd: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout
+
+
+def check_guard_root_writes_reverts_tracked_stray() -> int:
+    """A stray write to a TRACKED path in ROOT during a worktree agent stage
+    must be detected, journalled with the path, and reverted to HEAD.
+
+    #168, occurrence 1 and 2: agent_cmd() runs claude with
+    --dangerously-skip-permissions and no cwd confinement, so an agent
+    standing in a worktree can still write into the main checkout, and
+    prompt_for() reads ROOT's tracked prompt files on every later invocation.
+    guard_root_writes() is the bracket that catches this.
+
+    Covers both ways the stray content can end up on disk: a plain write, and
+    a write followed by the agent running `git add` on it in ROOT. The second
+    case is why the revert must be `git checkout HEAD -- <path>` and not the
+    two-arg `git checkout -- <path>`: the two-arg form restores from the
+    index, which is exactly where a `git add`-ed stray lives, so it would
+    restore the stray instead of discarding it.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    real_record, real_log = loop.record, loop.log
+    events: list[tuple[str, dict]] = []
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    bad = 0
+    try:
+        # Plain write, never staged.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _guard_init(repo)
+            (repo / "reviewer.md").write_text("original\n")
+            _guard_sh(repo, "add", "-A")
+            _guard_sh(repo, "commit", "-q", "-m", "base")
+
+            with loop.guard_root_writes("135", "fix.1", root=repo):
+                (repo / "reviewer.md").write_text("original\nsix stray lines\n")
+
+            content = (repo / "reviewer.md").read_text()
+            if content != "original\n":
+                bad += fail(f"a stray write to a tracked ROOT path was not "
+                            f"reverted to HEAD's content: {content!r}")
+            root_writes = [f for e, f in events if e == "root_write"]
+            if not root_writes:
+                bad += fail(f"a stray write to a tracked ROOT path was not "
+                            f"journalled at all: {events}")
+            elif root_writes[0].get("paths") != ["reviewer.md"]:
+                bad += fail(f"root_write did not name the stray path: {root_writes[0]}")
+            elif root_writes[0].get("reverted") != ["reviewer.md"]:
+                bad += fail(f"root_write did not record the path as reverted: "
+                            f"{root_writes[0]}")
+            if any(e == "root_write_revert_failed" for e, _ in events):
+                bad += fail(f"a revert that worked was journalled as having failed: {events}")
+
+        # Stray write, then the agent runs `git add` on it in ROOT.
+        events.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _guard_init(repo)
+            (repo / "reviewer.md").write_text("original\n")
+            _guard_sh(repo, "add", "-A")
+            _guard_sh(repo, "commit", "-q", "-m", "base")
+
+            with loop.guard_root_writes("135", "fix.1", root=repo):
+                (repo / "reviewer.md").write_text("original\nsix stray lines\n")
+                _guard_sh(repo, "add", "-A")   # the stray is now in the index too
+
+            content = (repo / "reviewer.md").read_text()
+            if content != "original\n":
+                bad += fail(f"a `git add`-ed stray was not reverted -- the "
+                            f"two-arg `checkout --` form (which restores from "
+                            f"the index) was used instead of `checkout HEAD --`: "
+                            f"{content!r}")
+    finally:
+        loop.record, loop.log = real_record, real_log
+    return bad
+
+
+def check_guard_root_writes_catches_stray_on_already_dirty_path() -> int:
+    """A stray write to a path that was ALREADY dirty before the stage began
+    must still be detected -- this is occurrence 2's own shape, and it is the
+    one case a status-code-keyed delta cannot see.
+
+    #185's preflight deliberately leaves ROOT dirty for the whole run, so a
+    tracked path that is ` M` before a guarded stage and still ` M` after
+    compares equal under a delta keyed on root_dirty_set()'s XY code alone --
+    which would let unbounded stray content land on exactly the paths that
+    were already dirty at cmd_run, disarmed for the entire run. This is not
+    hypothetical: reviewer.md carrying #135's own uncommitted lines, present
+    on no branch, is exactly this shape. guard_root_writes() must key on a
+    content fingerprint instead.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    real_record, real_log = loop.record, loop.log
+    events: list[tuple[str, dict]] = []
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    bad = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _guard_init(repo)
+            (repo / "reviewer.md").write_text("v1\n")
+            _guard_sh(repo, "add", "-A")
+            _guard_sh(repo, "commit", "-q", "-m", "base")
+
+            # Dirty BEFORE the stage starts -- pre-existing, uncommitted
+            # residue, same status code ("M") the stray write below will
+            # leave it at.
+            (repo / "reviewer.md").write_text("v1\nlocal-dirt\n")
+
+            with loop.guard_root_writes("135", "fix.2", root=repo):
+                (repo / "reviewer.md").write_text("v1\nlocal-dirt\nsix stray lines\n")
+
+            content = (repo / "reviewer.md").read_text()
+            if content != "v1\n":
+                bad += fail(f"a stray write appended to an already-dirty tracked "
+                            f"path was not detected/reverted: {content!r}")
+            if not any(e == "root_write" for e, _ in events):
+                bad += fail("a status-code-only delta hid a stray write to a path "
+                            "that was dirty before the stage began -- this is "
+                            "occurrence 2's own shape and it is the case this "
+                            "check exists to pin")
+    finally:
+        loop.record, loop.log = real_record, real_log
+    return bad
+
+
+def check_guard_root_writes_leaves_untracked_stray_on_disk() -> int:
+    """An UNTRACKED stray in ROOT must be journalled with its path and left
+    alone -- no unlink, no shutil.rmtree, no git reset.
+
+    #168 is scoped to tracked paths only. Six reviewer rounds on the
+    predecessor attempts found eleven of twelve blocking findings against
+    code that deleted untracked content no agent wrote -- ignore-rule changes
+    landing from a concurrent merge, untracked-directory collapsing, a
+    pre-existing untracked file merely modified, a parser desync producing an
+    unlink target outside the repo. Disposition of untracked strays belongs
+    to #186. This pins the boundary: detect and journal, never delete.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    real_record, real_log = loop.record, loop.log
+    events: list[tuple[str, dict]] = []
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    bad = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _guard_init(repo)
+            (repo / "a.md").write_text("base\n")
+            _guard_sh(repo, "add", "-A")
+            _guard_sh(repo, "commit", "-q", "-m", "base")
+
+            with loop.guard_root_writes("135", "fix.1", root=repo):
+                (repo / "scratch.md").write_text("an agent's untracked stray\n")
+
+            if not (repo / "scratch.md").exists():
+                bad += fail("an untracked stray was removed from disk -- that "
+                            "disposition belongs to #186, not this guard")
+            elif (repo / "scratch.md").read_text() != "an agent's untracked stray\n":
+                bad += fail("an untracked stray's content was altered")
+            root_writes = [f for e, f in events if e == "root_write"]
+            if not root_writes:
+                bad += fail(f"an untracked stray was not journalled at all: {events}")
+            elif "scratch.md" not in root_writes[0].get("not_reverted", []):
+                bad += fail(f"an untracked stray was journalled but not under "
+                            f"not_reverted: {root_writes[0]}")
+            if any(e == "root_write_revert_failed" for e, _ in events):
+                bad += fail(f"an untracked stray -- which is never reverted -- "
+                            f"was journalled as a FAILED revert: {events}")
+    finally:
+        loop.record, loop.log = real_record, real_log
+    return bad
+
+
+def check_guard_root_writes_ignores_concurrent_merge() -> int:
+    """A merge landing in ROOT between the pre- and post-stage capture must
+    not be misread as a stray write, and the merged content must survive.
+
+    This is the case that separates a dirty-set-delta implementation from a
+    tree-snapshot one, and it is not optional: `_merge_lock` (loop.py) is
+    acquired inside merge_worktree and nowhere else, so it serialises merges
+    against each other but NOT against agent stages running in the other
+    MAX_PARALLEL worker threads. With AGENT_TIMEOUT=3600, a merge landing in
+    ROOT mid-stage is the common case, not an edge case.
+
+    A `git write-tree`/`read-tree --reset -u` snapshot approach fails this:
+    write-tree reflects the current index, and a fast-forward merge advances
+    HEAD (and the index) to a new tree even though the working directory
+    ends up clean -- so a before/after tree-hash comparison sees a change
+    that isn't a stray write, the post-stage diff contains every file the
+    other worker's merge landed, and `read-tree --reset -u` back to the
+    pre-merge tree would rewrite ROOT's working tree to pre-merge content
+    while HEAD stays at the merged commit, corrupting the checkout for every
+    other worker. A dirty-set delta has none of this: a fast-forward merge
+    leaves `git status` clean before and after, so it contributes nothing to
+    the delta.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+
+    real_record, real_log = loop.record, loop.log
+    events: list[tuple[str, dict]] = []
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    bad = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            _guard_init(repo)
+            (repo / "a.md").write_text("base\n")
+            _guard_sh(repo, "add", "-A")
+            _guard_sh(repo, "commit", "-q", "-m", "base")
+            _guard_sh(repo, "checkout", "-q", "-b", "feature")
+            (repo / "other.md").write_text("v2, from another worker's merge\n")
+            _guard_sh(repo, "add", "-A")
+            _guard_sh(repo, "commit", "-q", "-m", "concurrent work")
+            _guard_sh(repo, "checkout", "-q", "main")
+
+            with loop.guard_root_writes("135", "fix.1", root=repo):
+                # Simulates another worker's merge_worktree landing in ROOT
+                # while this stage's agent is still running.
+                _guard_sh(repo, "merge", "--ff-only", "feature")
+
+            if any(e == "root_write" for e, _ in events):
+                bad += fail(f"a concurrent fast-forward merge in ROOT was "
+                            f"misdetected as a stray write: {events}")
+            merged = (repo / "other.md")
+            if not merged.exists() or merged.read_text() != "v2, from another worker's merge\n":
+                bad += fail("the concurrent merge's content did not survive in "
+                            "ROOT's working tree after the guard ran")
+    finally:
+        loop.record, loop.log = real_record, real_log
+    return bad
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
@@ -2668,4 +3017,9 @@ if __name__ == "__main__":
              + check_reviewer_diff_not_silently_truncated()
              + check_reviewer_patch_file_is_complete_and_applies()
              + check_post_fix_empty_diff_does_not_merge()
-             + check_rolling_pool_abandons_safely() + check_rolling_pool() else 0)
+             + check_rolling_pool_abandons_safely() + check_rolling_pool()
+             + check_root_dirty_set_parses_porcelain_z()
+             + check_guard_root_writes_reverts_tracked_stray()
+             + check_guard_root_writes_catches_stray_on_already_dirty_path()
+             + check_guard_root_writes_leaves_untracked_stray_on_disk()
+             + check_guard_root_writes_ignores_concurrent_merge() else 0)
