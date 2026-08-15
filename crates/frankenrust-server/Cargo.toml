@@ -5,6 +5,26 @@ edition.workspace = true
 publish.workspace = true
 description = "Async side: hyper HTTP/1.1 listener and the async<->pthread bridge to the PHP thread pool."
 
+[lib]
+name = "frankenrust_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "frankenrust-server"
 path = "src/main.rs"
+
+[dependencies]
+frankenrust-core = { path = "../frankenrust-core" }
+# HTTP/1.1 only (docs/ARCHITECTURE.md's three-layer split) -- no TLS/HTTP2/HTTP3
+# features enabled.
+hyper = { version = "1", features = ["server", "client", "http1"] }
+# `TokioIo`: the adapter between `tokio::net::TcpStream` and hyper 1.x's own
+# `Read`/`Write` traits, needed on both the server accept loop and (in tests)
+# the client side of a round trip.
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time", "io-util", "test-util"] }

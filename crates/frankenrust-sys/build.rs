@@ -345,6 +345,11 @@ fn main() {
         // pthread inside `go_frankenphp_main_thread_is_ready`, after PHP
         // module startup has parsed php.ini.
         .allowlist_function("frankenphp_get_current_memory_limit")
+        // #13's grant, per #110: threadregular.go:50's `updateContext(false)`
+        // call, made from `beforeScriptExecution`'s `TransitionComplete`
+        // branch on the PHP pthread that owns `thread_index`, immediately
+        // after a handler swap and before `waitForRequest`.
+        .allowlist_function("frankenphp_update_local_thread_context")
         // PHP includes stdlib.h unconditionally. These declarations keep
         // cross-boundary allocations paired with C's allocator without adding
         // a second hand-written FFI surface in frankenrust-core.
