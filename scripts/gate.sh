@@ -26,16 +26,16 @@ step() {
 }
 
 # Fail closed: an agent that deletes the test suite must not get a green gate.
-# Rust tests live under crates/*/src and crates/*/tests (there is no top-level
-# src/), so both greps below scan `tests crates`, not `tests src`.
-step "test-suite-intact" bash -c '
-  [ -d tests ] || { echo "tests/ is missing"; exit 1; }
-  n=$(grep -rl "#\[test\]\|#\[tokio::test\]" tests crates 2>/dev/null | wc -l | tr -d " ")
-  min=$(cat .gate/min-test-files 2>/dev/null || echo 0)
-  [ "$n" -ge "$min" ] || { echo "test files: $n < required $min"; exit 1; }
-  ! grep -rn "#\[ignore\]" tests crates 2>/dev/null | grep -v "GATE-OK" || {
-    echo "found #[ignore] without a GATE-OK justification"; exit 1; }
-'
+# `cargo test` on a tree with no tests passes in green, so this is the only
+# step that can see it. The check and the floor's rationale live in
+# check_test_suite.sh; it is a separate script rather than an inline body
+# because its two greps are pure pattern-matching over source text -- a pattern
+# that silently matches nothing produces a *green* gate, which is exactly the
+# failure two reviewers found here by hand (#58). Its negative cases run first,
+# so the patterns are gate-enforced rather than eyeballed. No Rust toolchain,
+# so it runs in every profile.
+step "test-suite-intact" bash -c 'bash scripts/check_test_suite.sh --selftest \
+  && bash scripts/check_test_suite.sh'
 
 # The orchestrator can now merge changes to itself and restart into them, so a
 # broken loop.py would end the run with no human around to restart it. This is
