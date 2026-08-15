@@ -68,13 +68,30 @@ mod tests {
     use crate::callbacks::output::go_ub_write;
     use crate::context::{CompletionSignal, FlushError, Request, RequestContext, ResponseSink};
 
-    // See output.rs's `tests` module doc comment for why these indices must
-    // be small and distinct from every other file's slice of the
-    // process-global `CONTEXT_SLOTS`: misc.rs uses 1-4, output.rs uses
-    // 100-116, input.rs uses 120-127, servervars.rs uses 60-76. This file's
-    // own indices live in a disjoint range.
-    const IDX_FINISH_CLOSES_AND_IS_IDEMPOTENT: usize = 130;
-    const IDX_FINISH_THEN_UB_WRITE_REPORTS_CACHED_SNAPSHOT: usize = 131;
+    // See misc.rs's `tests` module doc comment for why these indices must be
+    // small and distinct from every other file's slice of the process-global
+    // `CONTEXT_SLOTS`: misc.rs uses 1-4, servervars.rs uses 60-76, output.rs
+    // uses 100-116, input.rs uses 120-**131**. This file's own indices start
+    // above all of that.
+    //
+    // Do not size input.rs's range by reading its `IDX_*` block, which stops
+    // at 127, nor its range comment, which is stale: its last four indices
+    // (128, 129, 130, 131) are function-local `const IDX` declared inside the
+    // `go_read_cookies_*` test bodies. Claiming 130/131 here on the strength
+    // of that block is exactly the bug this range replaces -- two tests then
+    // `set`/`clear` one slot concurrently in the same test binary. The
+    // survey that finds every claimant, in any file, is:
+    //
+    //     rg -n 'usize = [0-9]+' crates/frankenrust-core/src
+    const IDX_FINISH_CLOSES_AND_IS_IDEMPOTENT: usize = 132;
+    const IDX_FINISH_THEN_UB_WRITE_REPORTS_CACHED_SNAPSHOT: usize = 133;
+    /// An index no test in the workspace ever calls `CONTEXT_SLOTS.set` for.
+    /// It is a *neighbour* of the two above rather than some large "obviously
+    /// unused" number on purpose: `ContextSlots::slot` grows the table densely
+    /// up to the index asked for and never reclaims, so a far-away index buys
+    /// no extra collision-freedom and only costs resident memory (misc.rs's
+    /// tests module comment measures this).
+    const IDX_FINISH_NO_CONTEXT: usize = 134;
 
     /// A [`ResponseSink`] that only records what was written to it -- enough
     /// to prove a post-finish `go_ub_write` never reaches the sink at all,
@@ -151,7 +168,7 @@ mod tests {
     fn finish_php_request_with_no_context_does_not_abort() {
         // No slot installed at all -- must be a no-op, not the abort-stub
         // behaviour this callback used to have.
-        go_frankenphp_finish_php_request(IDX_FINISH_CLOSES_AND_IS_IDEMPOTENT + 1000);
+        go_frankenphp_finish_php_request(IDX_FINISH_NO_CONTEXT);
     }
 
     #[test]
