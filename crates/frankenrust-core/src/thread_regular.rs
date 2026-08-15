@@ -336,12 +336,14 @@ static QUEUED_REGULAR_THREADS: AtomicI64 = AtomicI64::new(0);
 /// drained, though: unlike upstream's `ErrNotRunning`
 /// (`frankenphp.go:402-404`), an empty [`REGULAR_THREADS`] with a live
 /// [`SHARED_REQUEST_CHANNEL`] receiver (a `'static` that outlives any one
-/// pool) falls through to a blocking send that then parks forever. Not
-/// reachable through `frankenrust-server`'s own `run`, which never dispatches
-/// past its own drain -- but this function is `pub` on a library crate, so
-/// that safety is caller discipline, not something the type system enforces.
-/// Filed as #174 (point 2), together with (point 1) the missing
-/// `runtime.Gosched()` yield this port does apply, just below.
+/// pool) falls through to a blocking send that then parks forever.
+/// `frankenrust-server`'s own `run` never *starts* a dispatch after its drain,
+/// but that is weaker than it sounds: a client that disconnects mid-request
+/// makes hyper drop the `handle` future while the `spawn_blocking` task it
+/// spawned still owns the [`RequestContext`], and that orphan can reach the
+/// send below after `drain_php_threads` has already retired the pool. Filed as
+/// #174 (point 2), together with (point 1) the missing `runtime.Gosched()`
+/// yield this port does apply, just below.
 pub fn handle_request_with_regular_php_threads(mut work: RequestContext) {
     // `runtime.Gosched()` (`:140`), reproduced as `yield_now`: safe here
     // because this function's own doc comment establishes it never runs on a

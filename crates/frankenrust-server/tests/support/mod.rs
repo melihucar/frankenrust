@@ -6,6 +6,13 @@
 //! Not a `tests/*.rs` file of its own -- `tests/support/mod.rs` is Cargo's
 //! convention for a module shared by other integration test binaries
 //! (`tests/foo.rs`, `tests/bar.rs`) without becoming a test binary itself.
+// That convention compiles this file separately into *each* test binary, so an
+// item any one binary does not happen to call is dead code from that binary's
+// point of view -- `tests/keepalive_shutdown.rs` drives its connection by hand
+// (holding it open across shutdown is the whole point of that test) and so
+// never calls `get`. The alternative to this allow is duplicating the shared
+// helpers per binary, which is what the shared module exists to avoid.
+#![allow(dead_code)]
 use std::net::SocketAddr;
 use std::path::PathBuf;
 

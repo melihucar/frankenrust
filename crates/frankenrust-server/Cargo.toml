@@ -25,6 +25,11 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time", "io-util"] }
+# `EMFILE`/`ENFILE` in the accept loop's retry classification: `std` maps
+# neither to a named `io::ErrorKind` on stable, so the raw errno is the only
+# way to tell fd exhaustion (recoverable) from a dead listener (not). Already a
+# direct dependency of frankenrust-core, so this adds an edge, not a crate.
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time", "io-util", "test-util"] }

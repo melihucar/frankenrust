@@ -9,6 +9,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -37,6 +38,27 @@ pub struct ServerConfig {
     pub php_ini: HashMap<String, String>,
 }
 
+/// How long shutdown lets already-accepted connections finish after every one
+/// of them has been told to stop reusing itself
+/// ([`http1::Connection::graceful_shutdown`]), before abandoning the
+/// stragglers and moving on to the PHP drain.
+///
+/// A deadline is required, not decorative: `graceful_shutdown` waits for the
+/// *in-flight request* to finish, and an in-flight request here means a PHP
+/// script, which can run arbitrarily long. Without a bound, one runaway script
+/// wedges `run` forever and `drain_php_threads` -- which has its own 30s grace
+/// period followed by a force-kill (`thread.rs`'s `drain_generation`) -- is
+/// never reached to cut it short. Matched to that same 30s so the two phases
+/// read as one budget rather than two arbitrary numbers.
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Backoff bounds for a *recoverable* `accept()` failure, mirroring the
+/// 5ms-doubling-to-1s retry in Go's `net/http.Server.Serve` -- which is what
+/// hosts upstream's `ServeHTTP`, and which likewise does not let a transient
+/// accept error kill the server.
+const INITIAL_ACCEPT_BACKOFF: Duration = Duration::from_millis(5);
+const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+
 /// Boots `config.num_threads` PHP threads as regular threads (upstream's
 /// `frankenphp.go:316-329`, with `workerThreadCount` fixed at zero -- worker
 /// mode is #14's), then serves `listener` until `shutdown` resolves, then
@@ -46,6 +68,11 @@ pub struct ServerConfig {
 /// source so tests can trigger it explicitly (`tokio::signal::ctrl_c()` for
 /// the real binary, a oneshot for a test harness that wants a clean,
 /// deterministic stop after its own requests complete).
+///
+/// "Drains every PHP thread before returning" is unconditional, including on
+/// the `Err` return: an accept error this loop cannot retry still unwinds
+/// through the drain rather than leaving the pool live with TSRM never torn
+/// down.
 pub async fn run(
     listener: TcpListener,
     config: ServerConfig,
@@ -69,35 +96,161 @@ pub async fn run(
     let mut connections = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
 
+    // Flips `false` -> `true` exactly once, at shutdown. Every connection task
+    // holds a receiver and reacts by calling `graceful_shutdown()` on its own
+    // `Connection`. A `watch` rather than a broadcast because the payload is a
+    // latch, not a stream: a connection accepted before the flip is guaranteed
+    // to observe it (it subscribed first), and one accepted after cannot exist
+    // -- the accept loop has already broken.
+    let (graceful_tx, _) = tokio::sync::watch::channel(false);
+    let mut accept_backoff = INITIAL_ACCEPT_BACKOFF;
+    // An accept error we cannot retry still has to unwind through the drain
+    // below rather than `?`-ing straight out of `run` and leaving the whole
+    // PHP pool live with TSRM never torn down.
+    let mut fatal: Option<std::io::Error> = None;
+
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, remote_addr) = accepted?;
+                let (stream, remote_addr) = match accepted {
+                    Ok(accepted) => {
+                        accept_backoff = INITIAL_ACCEPT_BACKOFF;
+                        accepted
+                    }
+                    Err(err) if is_transient_accept_error(&err) => {
+                        // ECONNABORTED (client RST between SYN and accept),
+                        // EINTR, or fd exhaustion: all recoverable, none of
+                        // them a reason to kill a running server. Back off so
+                        // a persistent EMFILE cannot spin the accept loop hot.
+                        eprintln!(
+                            "frankenrust: accept failed ({err}); retrying in {accept_backoff:?}"
+                        );
+                        tokio::select! {
+                            () = tokio::time::sleep(accept_backoff) => {}
+                            () = &mut shutdown => break,
+                        }
+                        accept_backoff = (accept_backoff * 2).min(MAX_ACCEPT_BACKOFF);
+                        continue;
+                    }
+                    Err(err) => {
+                        fatal = Some(err);
+                        break;
+                    }
+                };
                 let document_root = Arc::clone(&document_root);
+                let mut graceful_rx = graceful_tx.subscribe();
                 connections.spawn(async move {
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |req| {
                         handle(req, Arc::clone(&document_root), remote_addr)
                     });
-                    if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                        eprintln!("frankenrust: connection error: {err}");
+                    let mut conn =
+                        std::pin::pin!(http1::Builder::new().serve_connection(io, service));
+                    // hyper's `Connection` future resolves only when the
+                    // *peer* closes or the connection errors, and HTTP/1.1
+                    // keep-alive is the default with no idle timeout -- so an
+                    // idle-but-open connection (every browser, pooled client
+                    // and reverse proxy between requests) would otherwise pin
+                    // this task forever and make the join below unbounded.
+                    // `graceful_shutdown()` is the API that fixes exactly
+                    // that: finish the in-flight request, then close.
+                    let mut signalled = false;
+                    loop {
+                        tokio::select! {
+                            result = conn.as_mut() => {
+                                if let Err(err) = result {
+                                    eprintln!("frankenrust: connection error: {err}");
+                                }
+                                return;
+                            }
+                            // Disarmed after firing: `changed()` on an
+                            // already-observed value would park forever, but
+                            // if `graceful_tx` is ever dropped it returns
+                            // `Err` immediately, which without the guard would
+                            // spin this loop hot.
+                            changed = graceful_rx.changed(), if !signalled => {
+                                let _ = changed;
+                                signalled = true;
+                                conn.as_mut().graceful_shutdown();
+                            }
+                        }
                     }
                 });
+            }
+            // `JoinSet` never removes a finished task's entry on its own --
+            // only `join_next`/`try_join_next`/`abort_all`/`Drop` do -- so
+            // without this arm the set grows by one task allocation per
+            // connection served, for the entire lifetime of the server.
+            Some(joined) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(err) = joined {
+                    eprintln!("frankenrust: connection task failed: {err}");
+                }
             }
             () = &mut shutdown => break,
         }
     }
 
-    // Stop accepting; let every in-flight connection finish on its own.
+    // Stop accepting, then tell every live connection to finish its in-flight
+    // request and close instead of waiting on a peer that may never hang up.
     drop(listener);
-    while connections.join_next().await.is_some() {}
+    let _ = graceful_tx.send(true);
 
-    // `drain_php_threads` (thread.rs, #10) is idempotent-safe to call once
-    // every connection above has returned its response -- no request can
-    // still be in flight past this point.
+    let drained = tokio::time::timeout(CONNECTION_DRAIN_TIMEOUT, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        eprintln!(
+            "frankenrust: {} connection(s) still in flight after {CONNECTION_DRAIN_TIMEOUT:?}; \
+             abandoning them so the PHP pool can be drained",
+            connections.len()
+        );
+        // Cancelling a connection task drops its `handle` future; the
+        // `spawn_blocking` dispatch it may have orphaned still owns the
+        // `RequestContext`, and the `drain_php_threads` below force-kills the
+        // PHP thread executing it. See #174 for the residual window this
+        // shares with an ordinary mid-request client disconnect.
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
+
+    // `drain_php_threads` (thread.rs, #10) is reached on *every* exit from the
+    // loop above -- clean shutdown, transient-accept-error-then-shutdown, and
+    // fatal accept error alike -- which is what this function's doc comment
+    // promises. The `fatal` detour below exists only so that promise holds.
     frankenrust_core::thread::drain_php_threads();
 
-    Ok(())
+    match fatal {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Whether an `accept()` failure is one a running server should retry rather
+/// than die on.
+///
+/// Go's `net/http.Server.Serve` -- the host of upstream's `ServeHTTP` --
+/// retries temporary accept errors with a backoff instead of returning, and
+/// this is the list that matters in practice: a peer that RSTs between SYN and
+/// `accept()` (`ECONNABORTED`, and `ECONNRESET` on the platforms that report it
+/// that way), a signal (`EINTR`), and process- or system-wide fd exhaustion
+/// (`EMFILE`/`ENFILE`), which is transient because the fds in use are freed as
+/// connections close.
+///
+/// `EMFILE`/`ENFILE` are matched on the raw errno because `std` maps neither to
+/// a named [`std::io::ErrorKind`] on stable -- they arrive as
+/// `ErrorKind::Uncategorized`, which is itself unnameable, so `raw_os_error` is
+/// the only stable way to tell them from a genuine failure.
+fn is_transient_accept_error(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+    ) || matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
 /// Binds `addr` and hands the listener to [`run`]. Split out of `run` so a
@@ -202,4 +355,51 @@ async fn handle(
 fn path_bytes(path: &std::path::Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The accept loop's survival hinges on this classification, and the two
+    /// errnos that matter most (`EMFILE`/`ENFILE`) are unreachable from an
+    /// integration test without exhausting the test process's own fd table --
+    /// so they are pinned here instead. A regression that dropped either back
+    /// into the fatal branch would kill a live server on fd pressure.
+    #[test]
+    fn fd_exhaustion_and_aborted_handshakes_are_retryable_accept_errors() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            assert!(
+                is_transient_accept_error(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno} (fd exhaustion) must not terminate the accept loop"
+            );
+        }
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            assert!(
+                is_transient_accept_error(&std::io::Error::from(kind)),
+                "{kind:?} must not terminate the accept loop"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genuinely_broken_listener_is_not_retryable() {
+        // Retrying forever on an unrecoverable listener would spin instead of
+        // shutting down, so the transient set must stay a set, not a blanket.
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::AddrNotAvailable,
+        ] {
+            assert!(
+                !is_transient_accept_error(&std::io::Error::from(kind)),
+                "{kind:?} must surface as a fatal accept error"
+            );
+        }
+    }
 }
