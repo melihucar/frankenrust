@@ -130,7 +130,7 @@ def replay_upstream(corpus) -> tuple[int, list[str]]:
     )
 
 
-def replay_frankenrust(corpus, image: str = FRANKENRUST_BENCH_IMAGE) -> tuple[int, list[str]]:
+def replay_frankenrust(corpus, image: str) -> tuple[int, list[str]]:
     """Replay against frankenrust:bench, folding failures the same way replay_upstream does.
 
     corpus.toml has no [targets.frankenrust] yet -- building that image is
@@ -142,11 +142,14 @@ def replay_frankenrust(corpus, image: str = FRANKENRUST_BENCH_IMAGE) -> tuple[in
     real [targets.frankenrust] section in corpus.toml once the image reports
     its own SERVER_SOFTWARE string.
 
-    `image` is a parameter, not always FRANKENRUST_BENCH_IMAGE, so
-    lib/selftest.py can drive this exact code path against the upstream image
-    with a deliberately corrupted golden -- proving the branch folds a
-    mismatch into its failure list rather than only printing that it ran,
-    without needing frankenrust:bench to exist.
+    `image` is a required parameter rather than a default of
+    FRANKENRUST_BENCH_IMAGE so that main() below reads that constant at call
+    time -- for the existence probe and for this call, from the same lookup.
+    That is the injection point lib/selftest.py uses to point main()'s whole
+    frankenrust leg at the upstream image and drive it against a deliberately
+    corrupted golden, proving the branch compares (and that main() folds its
+    verdict into the exit code) without needing frankenrust:bench to exist.
+    A default argument would be bound at def time and could not be redirected.
     """
     target = corpus["targets"]["upstream"]
     return replay_container_target(
@@ -174,7 +177,7 @@ def main() -> int:
     total_failures.extend(failures)
 
     if common.image_exists(FRANKENRUST_BENCH_IMAGE):
-        compared, failures = replay_frankenrust(corpus)
+        compared, failures = replay_frankenrust(corpus, FRANKENRUST_BENCH_IMAGE)
         total_compared += compared
         total_failures.extend(failures)
     else:

@@ -20,7 +20,9 @@ Usage: python3 selftest.py
 
 from __future__ import annotations
 
+import contextlib
 import difflib
+import io
 import sys
 import tempfile
 from pathlib import Path
@@ -29,6 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import common
 import replay
+
+
+def _indent(text: str) -> str:
+    """Inset captured sub-run output so it reads as evidence, not as this run's."""
+    return "\n".join("      | " + line for line in text.splitlines())
 
 
 def parse_golden(raw: bytes) -> tuple[bytes, list[tuple[str, str]], bytes]:
@@ -236,8 +243,15 @@ def check_concurrent_isolation(corpus: dict) -> list[str]:
     return failures
 
 
-def check_frankenrust_replay_branch_detects_mismatch(corpus: dict) -> list[str]:
-    """replay.py's frankenrust branch must fold a mismatch into total_failures.
+# run_against() labels the frankenrust target's mismatches with this text.
+# Grepping main()'s output for it -- rather than only for a non-zero exit --
+# is what proves the failure that failed the run came from the frankenrust
+# leg specifically, and not from somewhere else in main().
+FRANKENRUST_MISMATCH_MARKER = "mismatch against frankenrust golden"
+
+
+def check_frankenrust_mismatch_fails_the_run(corpus: dict) -> list[str]:
+    """A frankenrust golden mismatch must drive replay.main() to a non-zero exit.
 
     Issue #141: before this fix, replay.py detected a local `frankenrust:bench`
     image, printed "found, but this harness has no replay path for it yet --
@@ -246,45 +260,87 @@ def check_frankenrust_replay_branch_detects_mismatch(corpus: dict) -> list[str]:
     that branch existed only as a print statement -- a green replay proved
     only that the pinned upstream image agrees with itself.
 
-    This does not wait for #15 to build frankenrust:bench: replay_frankenrust()
-    takes `image` as a parameter precisely so this check can drive the exact
-    function main() would call, pointed at the upstream image instead, against
-    a golden this check corrupts itself. If replay_frankenrust() is reverted to
-    a print (or its failures stop being returned), this goes red because
-    `failures` comes back empty for a golden that cannot possibly match.
+    Asserting on main() rather than on replay_frankenrust() is the whole point
+    of this check. The regression surface is the caller, not the helper: main()
+    owns the image_exists() branch that decides whether the comparison happens
+    at all, and the total_failures.extend() that decides whether its verdict
+    reaches the exit code. An earlier version of this check called the helper
+    directly and stayed green -- 5/5, rc 0 -- under both mutations it exists to
+    catch: reverting the branch to a print, and deleting the extend(). Since no
+    frankenrust:bench exists on any host yet, the gate's own replay takes the
+    else-branch and never executes that wiring either, so nothing but this
+    check covers the one edge that has to hold: helper result -> exit code.
 
-    The real golden directory is never touched: common.GOLDEN_DIR is pointed at
-    a throwaway temp directory containing one deliberately-wrong copy of
-    golden/hello.http for the duration of the call, then restored, so a crash
-    mid-check cannot leave a corrupted golden behind.
+    This does not wait for #15 to build frankenrust:bench. main()'s frankenrust
+    leg is pointed at the upstream image by patching FRANKENRUST_BENCH_IMAGE
+    (main() reads it at call time for both the existence probe and the replay)
+    and given one deliberately-corrupted golden. The upstream leg is stubbed
+    out rather than run: it is not what is under test, and against the same
+    corrupted golden its own failures would drive main() to 1 on their own --
+    masking a dropped extend() and reporting a green that means nothing. It
+    also halves the containers this check starts.
+
+    Everything patched is restored in `finally`, and the corrupted golden lives
+    in a throwaway temp directory, so the real golden/ is never written to and
+    a crash mid-check cannot leave a corrupted golden behind. main()'s output is
+    captured rather than printed: it is a deliberate failure and would otherwise
+    read, in the gate log, as a real conformance failure a few lines above the
+    real run's output.
     """
-    case = next(c for c in corpus["cases"] if c["name"] == "hello")
+    case = next((c for c in corpus["cases"] if c["name"] == "hello"), None)
+    if case is None:
+        return [
+            "corpus.toml has no case named 'hello' -- this check needs one cheap case to "
+            "replay; repoint it at another case rather than leaving it unable to run"
+        ]
     mini_corpus = {**corpus, "cases": [case]}
     upstream_image = corpus["targets"]["upstream"]["image"]
 
-    real_golden = (common.GOLDEN_DIR / "hello.http").read_bytes()
-    corrupted = real_golden + b"\nselftest-injected-corruption\n"
+    corrupted = (common.GOLDEN_DIR / "hello.http").read_bytes() + b"\nselftest-corruption\n"
 
-    real_golden_dir = common.GOLDEN_DIR
+    saved = (
+        common.GOLDEN_DIR,
+        common.load_corpus,
+        common.image_exists,
+        replay.FRANKENRUST_BENCH_IMAGE,
+        replay.replay_upstream,
+    )
+    captured = io.StringIO()
     with tempfile.TemporaryDirectory() as tmp:
         (Path(tmp) / "hello.http").write_bytes(corrupted)
-        common.GOLDEN_DIR = Path(tmp)
         try:
-            compared, failures = replay.replay_frankenrust(mini_corpus, image=upstream_image)
+            common.GOLDEN_DIR = Path(tmp)
+            common.load_corpus = lambda: mini_corpus
+            # Not a blanket True: main() must probe for the same image it then
+            # replays against, or the branch it takes is not the one shipped.
+            common.image_exists = lambda image: image == upstream_image
+            replay.FRANKENRUST_BENCH_IMAGE = upstream_image
+            replay.replay_upstream = lambda _corpus: (1, [])
+            with contextlib.redirect_stdout(captured):
+                rc = replay.main()
         finally:
-            common.GOLDEN_DIR = real_golden_dir
+            (
+                common.GOLDEN_DIR,
+                common.load_corpus,
+                common.image_exists,
+                replay.FRANKENRUST_BENCH_IMAGE,
+                replay.replay_upstream,
+            ) = saved
 
+    output = captured.getvalue()
     problems = []
-    if compared != 1:
+    if rc == 0:
         problems.append(
-            f"replay_frankenrust compared {compared} case(s) against a 1-case corpus -- "
-            "expected exactly 1"
+            "replay.main() exited 0 while its frankenrust leg replayed against a golden "
+            "this check deliberately corrupted. A real frankenrust:bench mismatch would "
+            "pass the gate silently -- main() must call the frankenrust replay and fold "
+            "its failures into total_failures. main() said:\n" + _indent(output)
         )
-    if not any("mismatch" in f for f in failures):
+    if FRANKENRUST_MISMATCH_MARKER not in output:
         problems.append(
-            "replay_frankenrust did not report a mismatch against a golden this check "
-            "deliberately corrupted -- a real mismatch against frankenrust:bench would "
-            "pass the gate silently"
+            f"replay.main() never reported {FRANKENRUST_MISMATCH_MARKER!r} against a golden "
+            "this check deliberately corrupted: either the frankenrust branch did not run, "
+            "or its failures were computed and discarded. main() said:\n" + _indent(output)
         )
     return problems
 
@@ -298,8 +354,8 @@ def main() -> int:
         ("corpus/golden bijection", lambda: check_corpus_golden_bijection(corpus)),
         ("concurrent isolation", lambda: check_concurrent_isolation(corpus)),
         (
-            "frankenrust replay branch detects mismatch",
-            lambda: check_frankenrust_replay_branch_detects_mismatch(corpus),
+            "frankenrust mismatch fails the run",
+            lambda: check_frankenrust_mismatch_fails_the_run(corpus),
         ),
     ]
 
