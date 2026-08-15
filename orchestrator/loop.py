@@ -1253,6 +1253,25 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
                 failure = ("The fixer's changes did not satisfy the reviewers. "
                            f"Their findings on the FIXED diff:\n\n{still_blocking}")
                 continue
+            # review_stage() opens with `if not diff.strip(): return None, {},
+            # {}` -- correct in isolation, there is nothing to review -- but
+            # that makes an empty diff here read as an unopposed pass:
+            # `still_blocking` is falsy and nothing above catches it. A fixer
+            # answering a blocking review it cannot satisfy by reverting the
+            # implementer's work to nothing is a plausible response, not a
+            # hostile one, and the gate passes on the empty tree same as ever.
+            # Mirrors the guard on the initial diff above -- same failure, one
+            # branch over -- so this diff never reaches merge_worktree(),
+            # which would commit it with --allow-empty and let the issue close
+            # on zero reviewer verdicts.
+            if not worktree_diff(wt).strip():
+                log(f"    xx #{issue.number} attempt {attempt} fixer left nothing to merge")
+                record("empty_diff", issue=issue.number, attempt=attempt,
+                       agent=agent, phase="post-fix")
+                failure = ("The fixer removed the work rather than fixing it. "
+                           "The gate passing on an empty diff means only that "
+                           "nothing is broken; it is not evidence of a fix.")
+                continue
 
         if merge_worktree(tid, logdir, issue.gate):
             _, sha = git(["rev-parse", "--short", "HEAD"])

@@ -2522,6 +2522,126 @@ def check_reviewer_patch_file_is_complete_and_applies() -> int:
         loop.invoke, loop.record, loop.log = saved
 
 
+def check_post_fix_empty_diff_does_not_merge() -> int:
+    """A fixer that reverts its diff to nothing must not merge an empty commit.
+
+    #166. review_stage() opens with `if not diff.strip(): return None, {}, {}`
+    -- correct in isolation, there is nothing to review. The *initial* review
+    at loop.py:1217 is guarded against this (an implementer that changed
+    nothing spends the attempt), but the post-fix review right after it was
+    not: a fixer answering a blocking review by reverting the implementer's
+    work to nothing produces an empty diff, `review_stage(f"post{attempt}")`
+    reports it as `(None, {}, {})`, `still_blocking` is falsy, and control
+    fell straight through to `merge_worktree()` -- which commits with
+    `--allow-empty` -- and then `gh.close()`, recording the issue as merged
+    with zero reviewer verdicts on the merged content.
+
+    Drives `_work()` itself, for real, against a throwaway git repo: `invoke`
+    is stubbed by role (critic PROCEEDs; the implementer writes a file; both
+    reviewers BLOCK; the fixer deletes the file it just wrote, exactly the
+    "revert rather than fix" response the issue is about); `run` (the gate)
+    always reports success; `merge_worktree` is stubbed to a counter so a call
+    to it is unambiguous regardless of what it would have done to a fake
+    `main`. `MAX_ATTEMPTS` is pinned to 1: the fixer's revert is
+    deterministic and reproduces on every attempt, so one is enough to prove
+    the guard fires and cheaper than watching it fire three times.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import gh
+    import loop
+
+    def sh(wt: Path, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=wt, check=True, capture_output=True, text=True)
+
+    def make_repo(wt: Path) -> None:
+        wt.mkdir(parents=True, exist_ok=True)
+        sh(wt, "init", "-q", "-b", "main")
+        sh(wt, "config", "user.email", "check_orchestrator@example.com")
+        sh(wt, "config", "user.name", "check_orchestrator")
+        (wt / "a.txt").write_text("base\n")
+        sh(wt, "add", "-A")
+        sh(wt, "commit", "-q", "-m", "base")
+        sh(wt, "checkout", "-q", "-b", "issue/166")
+
+    issue = gh.Issue(number=166, title="a fixer that reverts to nothing",
+                     body="Gate: bootstrap\nAgent: claude\n")
+
+    class FakeGh:
+        def __init__(self) -> None:
+            self.closed: list[tuple[int, str]] = []
+            self.blocked: list[tuple[int, str]] = []
+
+        def comment(self, n: int, body: str) -> None:
+            pass
+
+        def close(self, n: int, summary: str) -> None:
+            self.closed.append((n, summary))
+
+        def block(self, n: int, why: str) -> None:
+            self.blocked.append((n, why))
+
+    fake_gh = FakeGh()
+    merges: list[str] = []
+    events: list[tuple[str, dict]] = []
+
+    saved = {name: getattr(loop, name) for name in
+             ("invoke", "run", "record", "log", "gh", "merge_worktree", "MAX_ATTEMPTS")}
+
+    def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer", escalate=False):
+        use = loop.resolve(agent, role, escalate)[0]
+        if role == "critic":
+            return use, 0, "Nothing wrong with this issue.\n\nVERDICT: PROCEED"
+        if role == "implementer":
+            (wt / "feature.txt").write_text("the implementer's work\n")
+            return use, 0, "implemented"
+        if role == "fixer":
+            # The plausible response to a blocking review it cannot satisfy:
+            # undo the work rather than fix it.
+            (wt / "feature.txt").unlink(missing_ok=True)
+            return use, 0, "reverted"
+        if role == "reviewer":
+            return use, 0, "This changes nothing safely.\n\nVERDICT: BLOCK"
+        raise AssertionError(f"unexpected role {role!r} (tag {tag!r})")
+
+    loop.invoke = fake_invoke
+    loop.run = lambda cmd, wt, timeout, log_path=None: (0, "")
+    loop.record = lambda event, **f: events.append((event, f))
+    loop.log = lambda msg: None
+    loop.gh = fake_gh
+    loop.merge_worktree = lambda tid, logdir, gate: (merges.append(tid) or True)
+    loop.MAX_ATTEMPTS = 1
+
+    bad = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "repo"
+            make_repo(wt)
+            logdir = Path(tmp) / "logs"
+            logdir.mkdir()
+            loop._work(issue, "166", wt, logdir)
+
+        if merges:
+            bad += fail(f"_work() reached merge_worktree() on a post-fix round "
+                        f"whose diff the fixer had reverted to nothing: {merges}")
+        if fake_gh.closed:
+            bad += fail(f"_work() closed #166 as merged after a post-fix round "
+                        f"with an empty diff and zero reviewer verdicts on the "
+                        f"merged content: {fake_gh.closed}")
+        if not fake_gh.blocked:
+            bad += fail("_work() neither merged nor blocked #166 -- the attempt "
+                        "must be spent, not silently dropped")
+        empty_post_fix = [f for e, f in events
+                          if e == "empty_diff" and f.get("phase") == "post-fix"]
+        if not empty_post_fix:
+            bad += fail(f"no empty_diff event recorded with phase='post-fix' -- "
+                        f"the post-fix path has no guard against a fixer that "
+                        f"reverts its diff to nothing: {events}")
+    finally:
+        for name, val in saved.items():
+            setattr(loop, name, val)
+    return bad
+
+
 if __name__ == "__main__":
     bad = check_parses()
     if bad:                      # do not try to run code that does not parse
@@ -2547,4 +2667,5 @@ if __name__ == "__main__":
              + check_retro_final_does_not_inherit_a_stale_report()
              + check_reviewer_diff_not_silently_truncated()
              + check_reviewer_patch_file_is_complete_and_applies()
+             + check_post_fix_empty_diff_does_not_merge()
              + check_rolling_pool_abandons_safely() + check_rolling_pool() else 0)
