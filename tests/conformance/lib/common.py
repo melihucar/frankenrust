@@ -57,7 +57,28 @@ def container_name(host_port: int) -> str:
 
 def load_corpus() -> dict:
     with open(CORPUS_PATH, "rb") as f:
-        return tomllib.load(f)
+        corpus = tomllib.load(f)
+    validate_corpus(corpus)
+    return corpus
+
+
+def validate_corpus(corpus: dict) -> None:
+    """Reject a corpus whose skip_targets carries no reason.
+
+    A `skip_targets` entry says a case is silently excluded from one target's
+    replay; without a `skip_reason` that is indistinguishable from a mistake,
+    and issue #141 was filed exactly because a silent "not compared" branch
+    stayed green through 11,244 lines of unreviewed Rust. Failing the load is
+    what keeps that from happening again at the per-case level.
+    """
+    for case in corpus.get("cases", []):
+        skip_targets = case.get("skip_targets")
+        if skip_targets and not case.get("skip_reason"):
+            raise ValueError(
+                f"corpus.toml: case {case.get('name')!r} has skip_targets "
+                f"{skip_targets!r} but no skip_reason -- a skip with no reason "
+                f"is a silent pass, the same defect class #141 was filed against"
+            )
 
 
 @dataclass

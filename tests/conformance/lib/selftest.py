@@ -315,7 +315,7 @@ def check_frankenrust_mismatch_fails_the_run(corpus: dict) -> list[str]:
             # replays against, or the branch it takes is not the one shipped.
             common.image_exists = lambda image: image == upstream_image
             replay.FRANKENRUST_BENCH_IMAGE = upstream_image
-            replay.replay_upstream = lambda _corpus: (1, [])
+            replay.replay_upstream = lambda _corpus: (1, [], [])
             with contextlib.redirect_stdout(captured):
                 rc = replay.main()
         finally:
@@ -345,6 +345,118 @@ def check_frankenrust_mismatch_fails_the_run(corpus: dict) -> list[str]:
     return problems
 
 
+def check_skip_targets_require_reason() -> list[str]:
+    """A `skip_targets` entry with no `skip_reason` must fail the load.
+
+    Issue #163: a per-case, per-target skip (added so a case that kills one
+    target's server process, e.g. finish-request against frankenrust before
+    #14, does not take the whole replay down with it) is a silent "not
+    compared" if nothing forces a reason to be written down -- exactly the
+    defect class #141 was filed against, one level down. common.load_corpus()
+    calls common.validate_corpus() for this reason; this check drives that
+    function directly against a synthetic corpus so it needs no golden files,
+    no container and does not depend on the real corpus.toml ever containing
+    a bad entry to exercise the failure path.
+    """
+    bad_corpus = {
+        "targets": {
+            "upstream": {
+                "image": "unused",
+                "container_port": 80,
+                "document_root": "/",
+                "server_software": "Unused",
+            }
+        },
+        "defaults": {"headers": []},
+        "cases": [
+            {
+                "name": "unreasoned-skip",
+                "fixture": "x.php",
+                "method": "GET",
+                "path": "/x.php",
+                "skip_targets": ["frankenrust"],
+            }
+        ],
+    }
+    try:
+        common.validate_corpus(bad_corpus)
+    except ValueError:
+        return []
+    return [
+        "common.validate_corpus() accepted a case with skip_targets but no "
+        "skip_reason -- a skip with no reason is a silent pass"
+    ]
+
+
+def check_skipped_case_not_counted_as_compared(corpus: dict) -> list[str]:
+    """A case skipped for a target must not count as compared, fail, or run.
+
+    Same injection point as check_frankenrust_mismatch_fails_the_run: point
+    replay.main()'s frankenrust leg at the pinned upstream image so this needs
+    no frankenrust:bench, and stub replay_upstream so its "1 case(s)" is the
+    only comparison in the total. Unlike that check, the mini corpus's one
+    case is skip_targets = ["frankenrust"] rather than pointed at a corrupted
+    golden -- a case that is skipped must never reach replay_case() at all
+    (there is no golden for it in this run's real golden/ dir, so reaching the
+    comparison would itself fail with "no golden file"), so a clean pass here
+    with the skip reported is the only correct outcome: 0 added to compared,
+    0 failures, the skip line printed, exit 0.
+    """
+    case = next((c for c in corpus["cases"] if c["name"] == "hello"), None)
+    if case is None:
+        return [
+            "corpus.toml has no case named 'hello' -- this check needs one cheap case to "
+            "replay; repoint it at another case rather than leaving it unable to run"
+        ]
+    reason = "selftest: exercising the skip path, not a real defect"
+    skip_case = {**case, "skip_targets": ["frankenrust"], "skip_reason": reason}
+    mini_corpus = {**corpus, "cases": [skip_case]}
+    upstream_image = corpus["targets"]["upstream"]["image"]
+
+    saved = (
+        common.load_corpus,
+        common.image_exists,
+        replay.FRANKENRUST_BENCH_IMAGE,
+        replay.replay_upstream,
+    )
+    captured = io.StringIO()
+    try:
+        common.load_corpus = lambda: mini_corpus
+        common.image_exists = lambda image: image == upstream_image
+        replay.FRANKENRUST_BENCH_IMAGE = upstream_image
+        replay.replay_upstream = lambda _corpus: (1, [], [])
+        with contextlib.redirect_stdout(captured):
+            rc = replay.main()
+    finally:
+        (
+            common.load_corpus,
+            common.image_exists,
+            replay.FRANKENRUST_BENCH_IMAGE,
+            replay.replay_upstream,
+        ) = saved
+
+    output = captured.getvalue()
+    problems = []
+    if rc != 0:
+        problems.append(
+            "replay.main() exited non-zero when the only frankenrust-leg case was skipped "
+            "-- a skip must never be treated as a failure. main() said:\n" + _indent(output)
+        )
+    if "1 case(s) compared, 1 skipped" not in output:
+        problems.append(
+            "replay.main() did not report exactly 1 case(s) compared (the upstream stub's "
+            "count, unchanged by the skip) and 1 skipped -- either the skipped case was "
+            "counted as compared, or the skipped count was not folded into the final line. "
+            "main() said:\n" + _indent(output)
+        )
+    if f"skipped {skip_case['name']} against frankenrust: {reason}" not in output:
+        problems.append(
+            "replay.main() did not print the skipped case, its target and its reason on "
+            "their own line. main() said:\n" + _indent(output)
+        )
+    return problems
+
+
 def main() -> int:
     corpus = common.load_corpus()
 
@@ -356,6 +468,11 @@ def main() -> int:
         (
             "frankenrust mismatch fails the run",
             lambda: check_frankenrust_mismatch_fails_the_run(corpus),
+        ),
+        ("skip_targets requires skip_reason", lambda: check_skip_targets_require_reason()),
+        (
+            "skipped case not counted as compared",
+            lambda: check_skipped_case_not_counted_as_compared(corpus),
         ),
     ]
 

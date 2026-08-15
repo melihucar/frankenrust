@@ -268,6 +268,17 @@ fixture = "finish-request.php"
 method = "GET"
 path = "/finish-request.php"
 query = "i=1"
+skip_targets = ["frankenrust"]
+skip_reason = """
+finish-request.php calls frankenphp_finish_request(), which reaches
+go_frankenphp_finish_php_request (vendor/frankenphp/frankenphp.c:634). In this
+tree that symbol is still issue #7's abort-stub
+(crates/frankenrust-core/src/callbacks/worker.rs:29, abort_stub(...) ->
+std::process::abort()): replaying this case against frankenrust:bench does not
+produce a diff, it kills the server process and every case replayed after it.
+#14 owns implementing the real callback; retire this skip when it lands. The
+upstream replay is unaffected and keeps comparing this case.
+"""
 
 [[cases]]
 name = "server-globals"

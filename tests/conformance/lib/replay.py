@@ -11,6 +11,14 @@ so that half is a no-op (logged, not silently skipped).
 Never exits 0 while skipping the corpus: if a target can't be reached, that
 is a failure, not a skip.
 
+A [[cases]] entry may list a target in `skip_targets` to opt that one target
+out of that one case -- e.g. a case that reaches a callback only one target
+has implemented. common.load_corpus() refuses to load a corpus where
+`skip_targets` is set without a `skip_reason`, so a skip can never be silent;
+every skip is printed with its case, target and reason, and the skipped count
+is reported alongside the compared count so a shrinking comparison is visible
+in the final line rather than hidden inside a smaller "compared" number.
+
 Usage: python3 replay.py
 """
 
@@ -56,13 +64,23 @@ def replay_case(host: str, port: int, case: dict, defaults: list, ctx_base) -> l
     return renderings
 
 
-def run_against(target_name: str, host: str, port: int, ctx_base, corpus) -> tuple[int, list[str]]:
+def run_against(
+    target_name: str, host: str, port: int, ctx_base, corpus
+) -> tuple[int, list[str], list[tuple[str, str, str]]]:
     defaults = corpus["defaults"]["headers"]
     failures: list[str] = []
+    skipped: list[tuple[str, str, str]] = []
     compared = 0
 
     for case in corpus["cases"]:
         name = case["name"]
+
+        if target_name in case.get("skip_targets", []):
+            # common.validate_corpus() guarantees skip_reason is present
+            # whenever skip_targets is non-empty -- see load_corpus().
+            skipped.append((name, target_name, case["skip_reason"]))
+            continue
+
         golden_path = common.GOLDEN_DIR / f"{name}.http"
         if not golden_path.exists():
             failures.append(f"{name}: no golden file at {golden_path}")
@@ -93,7 +111,7 @@ def run_against(target_name: str, host: str, port: int, ctx_base, corpus) -> tup
 
         compared += 1
 
-    return compared, failures
+    return compared, failures, skipped
 
 
 def replay_container_target(
@@ -103,7 +121,7 @@ def replay_container_target(
     document_root: str,
     server_software: str,
     corpus,
-) -> tuple[int, list[str]]:
+) -> tuple[int, list[str], list[tuple[str, str, str]]]:
     name, port = common.start_upstream_container(image, container_port)
     print(f"--- replaying against {target_name} ({image}) on host port {port}")
     try:
@@ -118,7 +136,7 @@ def replay_container_target(
         common.stop_container(name)
 
 
-def replay_upstream(corpus) -> tuple[int, list[str]]:
+def replay_upstream(corpus) -> tuple[int, list[str], list[tuple[str, str, str]]]:
     target = corpus["targets"]["upstream"]
     return replay_container_target(
         "upstream",
@@ -130,7 +148,7 @@ def replay_upstream(corpus) -> tuple[int, list[str]]:
     )
 
 
-def replay_frankenrust(corpus, image: str) -> tuple[int, list[str]]:
+def replay_frankenrust(corpus, image: str) -> tuple[int, list[str], list[tuple[str, str, str]]]:
     """Replay against frankenrust:bench, folding failures the same way replay_upstream does.
 
     corpus.toml has no [targets.frankenrust] yet -- building that image is
@@ -170,28 +188,40 @@ def main() -> int:
         return 1
 
     total_failures: list[str] = []
+    total_skipped: list[tuple[str, str, str]] = []
     total_compared = 0
 
-    compared, failures = replay_upstream(corpus)
+    compared, failures, skipped = replay_upstream(corpus)
     total_compared += compared
     total_failures.extend(failures)
+    total_skipped.extend(skipped)
 
     if common.image_exists(FRANKENRUST_BENCH_IMAGE):
-        compared, failures = replay_frankenrust(corpus, FRANKENRUST_BENCH_IMAGE)
+        compared, failures, skipped = replay_frankenrust(corpus, FRANKENRUST_BENCH_IMAGE)
         total_compared += compared
         total_failures.extend(failures)
+        total_skipped.extend(skipped)
     else:
         print(f"--- {FRANKENRUST_BENCH_IMAGE} not found locally, nothing to compare against it")
 
+    for name, target_name, reason in total_skipped:
+        print(f"--- skipped {name} against {target_name}: {reason}")
+
     print()
     if total_failures:
-        print(f"conformance: FAIL -- {len(total_failures)} problem(s) across {total_compared} case(s) compared")
+        print(
+            f"conformance: FAIL -- {len(total_failures)} problem(s) across "
+            f"{total_compared} case(s) compared, {len(total_skipped)} skipped"
+        )
         for f in total_failures:
             print()
             print(f)
         return 1
 
-    print(f"conformance: PASS -- {total_compared} case(s) compared, 0 mismatches")
+    print(
+        f"conformance: PASS -- {total_compared} case(s) compared, "
+        f"{len(total_skipped)} skipped, 0 mismatches"
+    )
     return 0
 
 
