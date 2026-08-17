@@ -95,9 +95,16 @@ python3 orchestrator/loop.py retro     # retrospective on demand
 
 Knobs: `FR_PARALLEL` (3), `FR_ATTEMPTS` (3), `FR_WALLCLOCK` (8h),
 `FR_AGENT_TIMEOUT` (1h/attempt), `FR_MAX_REVISIONS` (2 re-scopes per issue).
-Models: `FR_MODEL_IMPL` (Sonnet), `FR_MODEL_REVIEW`/`FR_MODEL_CRITIC` (Opus).
+Agents: `FR_AGENT_IMPL`/`FR_AGENT_FIX` (opencode), `FR_AGENT_REVIEW` (claude),
+`FR_REVIEWER1` (claude), `FR_REVIEWER2` (opencode), `FR_DUEL_AGENTS`
+(opencode,claude). Models: `FR_MODEL_IMPL` (Sonnet), `FR_MODEL_REVIEW`/
+`FR_MODEL_CRITIC` (Opus) for claude; `FR_OPENCODE_MODEL_*` for opencode (a
+free model by default).
 
-Codex runs on a separate quota. When it runs out mid-run the loop detects it,
+The loop runs three agents: **opencode** (cheap, free models; the default
+implementer/fixer), **claude** (strongest judgement; review, critic, resolver)
+and **codex** (its own quota; opt-in via `Agent: codex`). Codex and opencode
+run on quotas that can run out mid-run. When one does, the loop detects it,
 falls back to Claude for everything remaining, and keeps going.
 
 **You have to start it yourself.** The agents run with permission prompts
@@ -112,11 +119,11 @@ claim ─► critic ─┬─ REVISE ─► resolver ─┬─ REWRITE ─► re
                  │                      ├─ CLOSE   ─► killed, with evidence
                  │                      └─ PROCEED ─┐ (critic overruled)
                  └─ PROCEED ────────────────────────┴─► implementer
-                        │
-                        └─► gate ─┬─ fail ─► retry (≤3, escalating model)
-                                  └─ pass ─► 2 adversarial reviewers
-                                      (claude + codex, independent
-                                       contexts, diff only)
+                         │
+                         └─► gate ─┬─ fail ─► retry (≤3, escalating model)
+                                   └─ pass ─► 2 adversarial reviewers
+                                       (claude + opencode, independent
+                                        contexts, diff only)
                                         ├─ BLOCK ─► fixer ─► re-gate ─► re-review
                                         └─ PASS  ─► rebase, re-gate, merge, close
 ```

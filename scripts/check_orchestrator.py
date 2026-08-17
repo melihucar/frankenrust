@@ -497,11 +497,11 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
     no test did:
 
       * The closing comment must name the agent that *ran*, not the one the
-        REVIEWER_AGENTS roster asked for. resolve() turns reviewer 2's "codex"
-        into claude the instant the quota latch is armed, so naming from the
-        roster credits the diff to a vendor that never opened it -- on a
-        latched run, #40's own {1: silent, 2: pass} read out as "one
-        adversarial review (codex)" when claude died and claude passed. The
+        REVIEWER_AGENTS roster asked for. resolve() turns reviewer 2's
+        "opencode" into claude the instant the quota latch is armed, so naming
+        from the roster credits the diff to a vendor that never opened it -- on
+        a latched run, #40's own {1: silent, 2: pass} read out as "one
+        adversarial review (opencode)" when claude died and claude passed. The
         stub therefore resolves its return value exactly as invoke() does.
       * A reviewer whose invoke() *raises* -- a renamed agent binary is a bare
         Popen FileNotFoundError, and invoke() is the one Popen site with no
@@ -530,6 +530,7 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
 
     real_invoke, real_record, real_log = loop.invoke, loop.record, loop.log
     real_codex_ok = loop.codex_ok
+    real_opencode_ok = loop.opencode_ok
     # Captured rather than dropped: a reviewer that dies has to leave evidence
     # in the journal the retrospective reads, not just a traceback on stderr.
     events: list[tuple[str, dict]] = []
@@ -539,9 +540,9 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
     def run_case(script: dict, latched: bool = False) -> tuple[tuple, list[str]]:
         """Script a round by tag. A BaseException value is raised, not returned.
 
-        `latched` pins codex_ok() rather than inheriting FR_CODEX_DISABLED from
-        whatever the ambient run happens to be, so both sides of the fallback
-        are covered deterministically.
+        `latched` pins codex_ok()/opencode_ok() rather than inheriting the
+        FR_*_DISABLED envs from whatever the ambient run happens to be, so
+        both sides of the fallback are covered deterministically.
         """
         calls: list[str] = []
         events.clear()
@@ -552,11 +553,12 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
             if isinstance(scripted, BaseException):
                 raise scripted
             # invoke()'s first return value is the agent that ran *after*
-            # resolve()'s codex->claude fallback, not the one requested.
+            # resolve()'s cheap-agent->claude fallback, not the one requested.
             return loop.resolve(agent, "reviewer")[0], 0, scripted
 
         loop.invoke = stub
         loop.codex_ok = lambda: not latched
+        loop.opencode_ok = lambda: not latched
         with tempfile.TemporaryDirectory() as tmp:
             wt = Path(tmp) / "repo"
             make_repo(wt)
@@ -612,23 +614,23 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
             bad += fail(f"review_summary() must say one review happened, not "
                         f"two, when a reviewer stayed silent through the "
                         f"retry: {summary!r}")
-        if "codex" not in summary:
-            bad += fail(f"codex really did produce the surviving review here "
+        if "opencode" not in summary:
+            bad += fail(f"opencode really did produce the surviving review here "
                         f"and must be named: {summary!r}")
 
-        # The same round with the codex quota latch armed. Slot 2 is claude,
-        # so the surviving review is claude's and the sentence must say so:
-        # telling the morning reader a second vendor read a diff it never saw
-        # is #40's false record one field over.
+        # The same round with the opencode quota latch armed. Slot 2 is
+        # claude, so the surviving review is claude's and the sentence must
+        # say so: telling the morning reader a second vendor read a diff it
+        # never saw is #40's false record one field over.
         (blocking, verdicts, reviewers), calls = run_case(still_silent, latched=True)
         if reviewers != {1: "claude", 2: "claude"}:
             bad += fail(f"review_stage must report the agents that ran, and "
                         f"under the latch both slots are claude -- a reviewer "
                         f"that timed out still returns from invoke(): {reviewers}")
         summary = loop.review_summary(verdicts, reviewers)
-        if "codex" in summary or "claude" not in summary:
-            bad += fail(f"with codex walled off, the surviving reviewer was "
-                        f"claude; the closing comment must not credit codex: "
+        if "opencode" in summary or "claude" not in summary:
+            bad += fail(f"with opencode walled off, the surviving reviewer was "
+                        f"claude; the closing comment must not credit opencode: "
                         f"{summary!r}")
 
         # A reviewer that dies hard rather than quietly: invoke() raises, the
@@ -684,6 +686,7 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
     finally:
         loop.invoke, loop.record, loop.log = real_invoke, real_record, real_log
         loop.codex_ok = real_codex_ok
+        loop.opencode_ok = real_opencode_ok
     return bad
 
 
@@ -785,7 +788,7 @@ def check_filing_contract_is_stated() -> int:
     only filing guidance the other roles read -- specified none of it, so agents
     filed free-form prose into a queue that parses four structured fields out of
     it. Measured at the time: 15 of 49 open issues had no Gate: and 19 no Agent:,
-    silently inheriting `default` and `codex`. A docs fix that inherits `default`
+    silently inheriting `default` and `opencode`. A docs fix that inherits `default`
     fails a gate it cannot satisfy, three times, and lands in fr:blocked.
 
     Checked as a fenced template rather than by grepping for the field names.
@@ -891,11 +894,144 @@ def check_verdict_parsing() -> int:
             bad += fail(f"a codex run that produced no final message parsed as a "
                         f"verdict: {got[:120]!r}")
 
-    # And the wiring that makes the file exist in the first place.
+    # opencode streams NDJSON events, so the same discipline has a different
+    # shape: the verdict is the last `text` event, and an `error` event must
+    # invalidate whatever text came before it -- opencode exits 0 even on a
+    # failed run, so the log is the only place a quota wall shows up.
+    def opencode_parsed(tmp: Path, events: list[dict], final: str) -> str:
+        log = tmp / "opencode.review2.1.log"
+        log.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+        text, err = loop._final_text(log, "opencode", None)
+        return text if text else f"<no text: {err}>"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        echo = [{"type": "text", "part": {"type": "text",
+                "text": "I will check for VERDICT: BLOCK conditions"}},
+                {"type": "tool", "part": {"type": "tool", "tool": "bash"}}]
+        cases = [
+            ("a PASS whose earlier text quotes BLOCK", echo + [{"type": "text",
+             "part": {"type": "text", "text": "Checked every path. Nothing "
+             "blocking.\n\nVERDICT: PASS"}}], "VERDICT: PASS", "VERDICT: BLOCK"),
+            ("a real BLOCK still blocks", echo + [{"type": "text",
+             "part": {"type": "text", "text": "### leaks a subscriber\nFile: "
+             "a.rs:1\n\nVERDICT: BLOCK"}}], "VERDICT: BLOCK", None),
+            ("a critic PROCEED whose earlier text quotes REVISE", echo +
+             [{"type": "text", "part": {"type": "text", "text": "The spec "
+             "matches the oracle.\n\nVERDICT: PROCEED"}}], "VERDICT: PROCEED",
+             "VERDICT: REVISE"),
+        ]
+        for name, events, want, unwanted in cases:
+            got = opencode_parsed(d, events, "")
+            if want not in got:
+                bad += fail(f"opencode verdict parsing lost {want!r} on "
+                            f"{name}: {got[:120]!r}")
+            if unwanted and unwanted in got:
+                bad += fail(f"opencode verdict parsing read {unwanted!r} out "
+                            f"of {name} -- earlier text events are being read "
+                            "as the verdict")
+
+        # An error event after a clean-looking text event must void the text:
+        # a quota wall is a harness fault, not a finding.
+        got = opencode_parsed(d, echo + [{"type": "error", "error": {
+            "name": "UnknownError",
+            "data": {"message": "Rate limit exceeded, please try again"}}}], "")
+        if "VERDICT" in got:
+            bad += fail(f"an opencode run that ended in an error event parsed "
+                        f"as a verdict: {got[:120]!r}")
+
+        # A dead run -- no text, no error -- is not a verdict either.
+        got = opencode_parsed(d, [{"type": "step_start",
+                                   "part": {"type": "step-start"}}], "")
+        if "VERDICT" in got:
+            bad += fail(f"an opencode run with no final message parsed as a "
+                        f"verdict: {got[:120]!r}")
+
+    # And the wiring that makes the verdicts reachable in the first place.
     cmd = loop.agent_cmd("codex", None, Path("/tmp/fr-last.txt"))
     if "-o" not in cmd or "/tmp/fr-last.txt" not in cmd:
         bad += fail("agent_cmd no longer asks codex for its last message (-o); "
                     "verdicts fall back to transcript scraping")
+    cmd = loop.agent_cmd("opencode", "opencode/deepseek-v4-flash-free",
+                         Path("/tmp/fr-last.txt"))
+    for flag in ("--format", "json", "--auto", "-"):
+        if flag not in cmd:
+            bad += fail(f"agent_cmd no longer asks opencode for its event "
+                        f"stream ({flag}); verdicts are unreadable")
+    if "opencode/deepseek-v4-flash-free" not in cmd:
+        bad += fail("agent_cmd does not pass opencode's model through; every "
+                    "run falls back to the configured default")
+    return bad
+
+
+def check_agent_routing() -> int:
+    """resolve() must route agents to their agents/models, and the defaults
+    must express the intended split: opencode (cheap) for implementation,
+    claude (judgement) for review -- both overridable per role.
+
+    This is the table every stage in the loop trusts: a wrong default here
+    silently moves implementation onto Opus (costs money for no gain) or a
+    reviewer onto a free model (judgement the merge gate relies on), and
+    neither failure leaves a trace in the journal.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+    bad = 0
+
+    if loop.ROLE_AGENT["implementer"] != "opencode":
+        bad += fail("the default implementer must be opencode -- implementation "
+                    "is bulk mechanical work a free model handles: "
+                    f"{loop.ROLE_AGENT['implementer']}")
+    if loop.ROLE_AGENT["reviewer"] != "claude":
+        bad += fail("the default reviewer must be claude -- the merge gate "
+                    "needs the strongest judgement: "
+                    f"{loop.ROLE_AGENT['reviewer']}")
+    if loop.REVIEWER_AGENTS != {1: "claude", 2: "opencode"}:
+        bad += fail("the default review roster must be claude + opencode for "
+                    "cross-model review on a cheap second vendor: "
+                    f"{loop.REVIEWER_AGENTS}")
+
+    # Routing table: (requested, role, escalate, latch_agent, want_agent,
+    # want_model).
+    cases = [
+        ("claude", "implementer", False, None, "claude", loop.MODELS["implementer"]),
+        ("opencode", "implementer", False, None, "opencode",
+         loop.OPENCODE_MODELS["implementer"]),
+        ("opencode", "reviewer", False, None, "opencode",
+         loop.OPENCODE_MODELS["reviewer"]),
+        ("codex", "implementer", False, None, "codex", None),
+        ("claude", "implementer", True, None, "claude", loop.ESCALATED_MODEL),
+        ("opencode", "implementer", True, None, "claude", loop.ESCALATED_MODEL),
+        ("codex", "implementer", True, None, "claude", loop.ESCALATED_MODEL),
+        ("opencode", "implementer", False, "opencode", "claude",
+         loop.MODELS["implementer"]),
+        ("codex", "implementer", False, "codex", "claude",
+         loop.MODELS["implementer"]),
+    ]
+    saved_ok = {a: getattr(loop, f"{a}_ok") for a in ("codex", "opencode")}
+    try:
+        for requested, role, escalate, latch, want_agent, want_model in cases:
+            if latch:
+                getattr(loop, f"disable_{latch}")("routing check")
+            else:
+                loop._disabled_agents = set()
+            agent, model = loop.resolve(requested, role, escalate)
+            if agent != want_agent or model != want_model:
+                bad += fail(f"resolve({requested!r}, {role!r}, escalate={escalate}"
+                            f"{', latched ' + latch if latch else ''}) -> "
+                            f"({agent!r}, {model!r}); want ({want_agent!r}, "
+                            f"{want_model!r})")
+        loop._disabled_agents = set()
+        try:
+            loop.resolve("bogus", "implementer")
+            bad += fail("resolve() accepted an unknown agent instead of "
+                        "failing loudly")
+        except ValueError:
+            pass
+    finally:
+        loop._disabled_agents = set()
+        for a, ok in saved_ok.items():
+            setattr(loop, f"{a}_ok", ok)
     return bad
 
 
@@ -3423,7 +3559,8 @@ if __name__ == "__main__":
              + check_unmerged_work_survives_reclaim()
              + check_filing_contract_is_stated() + check_reviewer_restore()
              + check_priority_leads_the_queue()
-             + check_verdict_parsing() + check_record_repairs_torn_journal()
+             + check_verdict_parsing() + check_agent_routing()
+             + check_record_repairs_torn_journal()
              + check_retro_cycle_survives_restart()
              + check_retro_callers_derive_the_cycle()
              + check_retro_no_clobber() + check_retro_cycle_claim_is_atomic()

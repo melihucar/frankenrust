@@ -24,7 +24,7 @@ Every issue body must contain these lines, exactly:
 
 ```
 Gate: bootstrap
-Agent: codex
+Agent: opencode
 Depends on: #3, #4
 ```
 
@@ -32,7 +32,8 @@ Depends on: #3, #4
   produces no Rust at all) or `default` (build + clippy + fmt + tests +
   conformance). Use `bootstrap` for anything landing before the conformance
   harness exists, or it will fail a gate it cannot possibly satisfy.
-- **Agent** — `codex` for mechanical grind, `claude` for design-heavy work,
+- **Agent** — `opencode` for mechanical grind (the cheap default), `claude`
+  for design-heavy work, `codex` for the separate quota when it is available,
   `duel` for the two or three hardest (agents alternate on failure).
 - **Depends on** — issue numbers whose **behaviour this issue calls into**. Omit
   the line if none. An edge means "I invoke something #N implements", never "I

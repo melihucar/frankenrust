@@ -92,10 +92,30 @@ HEARTBEAT = int(os.environ.get("FR_HEARTBEAT", "60"))
 # retro_thread(). A cycle that merges nothing produces no new evidence.
 # -----------------------------------------------------------------------------
 
-# Implementation is bulk mechanical translation against a spec that already
-# names the files -- Sonnet handles it. Critique, review and fixing are where
-# judgement matters (unsound unsafe, thread-affinity bugs a green suite misses),
-# so those get Opus.
+# Which agent runs which role. The split is deliberate: implementation is bulk
+# mechanical translation against a spec that already names the files, which a
+# cheap opencode model handles; critique, review and fixing are where judgement
+# matters (unsound unsafe, thread-affinity bugs a green suite misses), so those
+# stay on claude. Every role is overridable per-run via FR_AGENT_<ROLE>.
+AGENTS = ("claude", "codex", "opencode")
+ROLE_AGENT = {
+    "implementer": os.environ.get("FR_AGENT_IMPL", "opencode"),
+    "fixer": os.environ.get("FR_AGENT_FIX", "opencode"),
+    "critic": os.environ.get("FR_AGENT_CRITIC", "claude"),
+    "reviewer": os.environ.get("FR_AGENT_REVIEW", "claude"),
+    "planner": os.environ.get("FR_AGENT_PLAN", "claude"),
+    "resolver": os.environ.get("FR_AGENT_RESOLVE", "claude"),
+    "unblocker": os.environ.get("FR_AGENT_UNBLOCK", "claude"),
+    "retro": os.environ.get("FR_AGENT_RETRO", "claude"),
+}
+# The `duel` Agent: alternates implementation between two agents on failure.
+DUEL_AGENTS = [a.strip() for a in os.environ.get("FR_DUEL_AGENTS",
+                                                  "opencode,claude").split(",")]
+
+# Model per role, per agent. claude gets the strong models for the roles where
+# judgement matters; opencode runs whatever FR_OPENCODE_MODEL_<ROLE> names
+# (a free model by default -- the bulk of the work is mechanical and a paid
+# model buys nothing there).
 MODELS = {
     "implementer": os.environ.get("FR_MODEL_IMPL", "claude-sonnet-5"),
     "critic": os.environ.get("FR_MODEL_CRITIC", "claude-opus-5"),
@@ -105,6 +125,9 @@ MODELS = {
     "resolver": os.environ.get("FR_MODEL_RESOLVE", "claude-opus-5"),
     "unblocker": os.environ.get("FR_MODEL_UNBLOCK", "claude-opus-5"),
 }
+OPENCODE_MODELS = {role: os.environ.get(f"FR_OPENCODE_MODEL_{role.upper()}",
+                                        "opencode/deepseek-v4-flash-free")
+                   for role in MODELS}
 # How many times an issue may be re-scoped before the resolver must decide it
 # outright. Without a cap, critic and resolver can hand an issue back and forth
 # forever and it never gets built.
@@ -119,10 +142,11 @@ MAX_RECOVERIES = int(os.environ.get("FR_MAX_RECOVERIES", "2"))
 DRAIN_CONFIRMATIONS = int(os.environ.get("FR_DRAIN_CONFIRMATIONS", "3"))
 ESCALATED_MODEL = os.environ.get("FR_MODEL_ESCALATE", "claude-opus-5")
 
-# Codex runs on a separate quota that will likely run out mid-run. When it does,
-# remaining codex work becomes claude work rather than blocking the queue.
-# Detection is by output pattern; the CLI gives no distinct exit code for it.
-CODEX_LIMIT_PATTERNS = (
+# Codex and opencode run on quotas that can run out mid-run. When one does,
+# its remaining work becomes claude work rather than blocking the queue.
+# Detection is by output pattern; neither CLI gives a distinct exit code for
+# it (opencode exits 0 even on an API error).
+LIMIT_PATTERNS = (
     "usage limit", "rate limit", "rate_limit", "quota", "429",
     "too many requests", "insufficient_quota", "you've hit your",
     "resource_exhausted", "please try again later",
@@ -131,10 +155,14 @@ CODEX_LIMIT_PATTERNS = (
 _merge_lock = threading.Lock()
 _claim_lock = threading.Lock()
 _codex_lock = threading.Lock()
-# Survives re-exec. A quota wall lasts days, but the flag was process-local, so
-# every self-update handed the successor a clean slate and it re-learned the
-# same wall by burning another invocation on it.
-_codex_disabled = os.environ.get("FR_CODEX_DISABLED") == "1"
+# Survives re-exec. A quota wall lasts days, but the flags were process-local,
+# so every self-update handed the successor a clean slate and it re-learned
+# the same wall by burning another invocation on it. FR_<AGENT>_DISABLED is
+# what restart_into_new_code() carries across.
+_disabled_agents: set[str] = {
+    a for a in AGENTS
+    if os.environ.get(f"FR_{a.upper()}_DISABLED") == "1"
+}
 # Issues whose recovery budget is spent, so the terminal log line is printed
 # once rather than on every 30s poll.
 _recovery_exhausted: set[int] = set()
@@ -208,30 +236,50 @@ def record(event: str, **fields) -> None:
             fh.write(json.dumps(rec) + "\n")
 
 
+def _agent_ok(agent: str) -> bool:
+    with _codex_lock:
+        return agent not in _disabled_agents
+
+
 def codex_ok() -> bool:
-    with _codex_lock:
-        return not _codex_disabled
+    return _agent_ok("codex")
 
 
-def disable_codex(reason: str) -> None:
-    global _codex_disabled
+def opencode_ok() -> bool:
+    return _agent_ok("opencode")
+
+
+def _disable_agent(agent: str, reason: str) -> None:
+    global _disabled_agents
     with _codex_lock:
-        if _codex_disabled:
+        if agent in _disabled_agents:
             return
-        _codex_disabled = True
-    os.environ["FR_CODEX_DISABLED"] = "1"    # carried through restart_into_new_code
-    log(f"!! codex disabled for the rest of this run ({reason}); falling back to claude")
+        _disabled_agents = _disabled_agents | {agent}
+    os.environ[f"FR_{agent.upper()}_DISABLED"] = "1"  # survives restart_into_new_code
+    log(f"!! {agent} disabled for the rest of this run ({reason}); falling back to claude")
     # Cross-model review is the reason two reviewers are worth more than one
     # reviewer run twice. Losing it is a change in what a merge means, so it
     # belongs in the journal where the retrospective and the morning review
     # will see it, not only in a log line nobody reads.
-    record("review_diversity_lost", reason=reason)
+    record("review_diversity_lost", agent=agent, reason=reason)
+
+
+def disable_codex(reason: str) -> None:
+    _disable_agent("codex", reason)
+
+
+def disable_opencode(reason: str) -> None:
+    _disable_agent("opencode", reason)
 
 
 def resolve(agent: str, role: str, escalate: bool = False) -> tuple[str, str | None]:
     """Map requested agent+role onto (actual_agent, model)."""
+    if agent not in AGENTS:
+        raise ValueError(f"unknown agent {agent!r} (known: {', '.join(AGENTS)})")
     if agent == "codex" and codex_ok() and not escalate:
         return "codex", None
+    if agent == "opencode" and opencode_ok() and not escalate:
+        return "opencode", OPENCODE_MODELS.get(role, OPENCODE_MODELS["implementer"])
     if escalate:
         return "claude", ESCALATED_MODEL
     return "claude", MODELS.get(role, MODELS["implementer"])
@@ -304,6 +352,19 @@ def agent_cmd(agent: str, model: str | None,
         if model:
             cmd += ["--model", model]
         return cmd
+    if agent == "opencode":
+        # Same stream-json discipline as claude: `--format json` emits one
+        # NDJSON event per line as it happens (proof of life in the log) and
+        # carries API errors as `error` events instead of dying quietly --
+        # opencode exits 0 even when the run failed, so the event stream is
+        # the only place the failure is visible. `--auto` is opencode's answer
+        # to claude's --dangerously-skip-permissions: these run for hours
+        # unwatched and must not stall on a permission prompt. The prompt
+        # comes over stdin (`-`) so we never hit argv limits.
+        cmd = ["opencode", "run", "--format", "json", "--auto"]
+        if model:
+            cmd += ["--model", model]
+        return cmd + ["-"]
     raise ValueError(f"unknown agent {agent!r}")
 
 
@@ -335,6 +396,37 @@ def _final_text(logpath: Path, agent: str,
     cannot read is not evidence of a defect, and treating it as one is the bug
     being fixed here.
     """
+    if agent == "opencode":
+        # `--format json` emits one NDJSON event per line: `text` events
+        # carry the assistant's text parts (the last one is the final
+        # message), `error` events carry API failures. opencode exits 0 even
+        # on a failed run, so the error event is the only way a quota wall
+        # or API error is visible -- without this branch a dead run would
+        # read as a clean verdict.
+        if not logpath.exists():
+            return "", "no log"
+        final, err = "", ""
+        for line in logpath.read_text(errors="replace").splitlines():
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "text":
+                part = ev.get("part") or {}
+                if part.get("text"):
+                    final = part["text"]
+            elif ev.get("type") == "error":
+                e = ev.get("error") or {}
+                err = (e.get("data") or {}).get("message") or e.get("name") or "error"
+                # The run failed; text emitted before the error is not a
+                # verdict and must not be parsed as one.
+                final = ""
+        if not final and not err:
+            # No text and no error event: the process died mid-stream.
+            err = "no final message from opencode (killed or crashed mid-stream)"
+        return final, err
     if agent != "claude":
         if last_message and last_message.exists():
             final = last_message.read_text(errors="replace").strip()
@@ -385,7 +477,11 @@ def agent_env() -> dict[str, str]:
     gate reports as the agent's code being broken, three attempts per issue,
     all night.
     """
-    env = {**os.environ, "FRANKENRUST_AGENT": "1"}
+    env = {**os.environ, "FRANKENRUST_AGENT": "1",
+           # An unattended fleet must not have its toolchain replaced under it:
+           # opencode auto-updates on startup, and a mid-run version change
+           # alters behaviour the reviewers and the gate already judged.
+           "OPENCODE_DISABLE_AUTOUPDATE": "1"}
     have = env.get("PATH", "").split(os.pathsep)
     extra = [str(Path.home() / ".cargo" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
     add = [p for p in extra if p not in have and Path(p).is_dir()]
@@ -398,16 +494,21 @@ def _hit_limit(logpath: Path) -> bool:
     if not logpath.exists():
         return False
     tail = logpath.read_text(errors="replace")[-4000:].lower()
-    return any(p in tail for p in CODEX_LIMIT_PATTERNS)
+    return any(p in tail for p in LIMIT_PATTERNS)
+
+
+# Who a cheap-quota agent falls back to when its quota dies mid-run.
+FALLBACK_AGENT = {"codex": "claude", "opencode": "claude"}
 
 
 def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
            role: str = "implementer", escalate: bool = False) -> tuple[str, int, str]:
     """Run an agent. Returns (agent_used, rc, output_text).
 
-    Prompt goes over stdin so we never hit argv limits. If codex dies on quota
-    it is disabled for the run and the same prompt retried on claude -- a quota
-    wall should cost one wasted invocation, not a whole issue.
+    Prompt goes over stdin so we never hit argv limits. If codex or opencode
+    dies on quota it is disabled for the run and the same prompt retried on
+    claude -- a quota wall should cost one wasted invocation, not a whole
+    issue.
     """
     logdir.mkdir(parents=True, exist_ok=True)
     (logdir / f"prompt.{tag}.md").write_text(prompt)
@@ -417,9 +518,9 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
     lastmsg = logdir / f"{use}.{tag}.final.txt"
     for _ in range(2):
         logpath = logdir / f"{use}.{tag}.log"
-        # Named per agent so the codex run and a claude retry of the same tag
-        # cannot read each other's verdict, and unlinked first so a crashed run
-        # inherits nothing from the attempt before it.
+        # Named per agent so a cheap-agent run and a claude retry of the same
+        # tag cannot read each other's verdict, and unlinked first so a crashed
+        # run inherits nothing from the attempt before it.
         lastmsg = logdir / f"{use}.{tag}.final.txt"
         lastmsg.unlink(missing_ok=True)
         log(f"    -> {use}{f'({model})' if model else ''} {tag} ({wt.name})")
@@ -456,10 +557,11 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
             record("agent_error", agent=use, tag=tag, rc=rc, reason=err)
         # Require BOTH a failure and a quota pattern: "429"/"rate limit" appear
         # legitimately in the output of an agent writing an HTTP server.
-        if use == "codex" and rc != 0 and _hit_limit(logpath):
-            record("agent_fallback", agent="codex", to="claude", tag=tag, rc=rc)
-            disable_codex(f"exit {rc} with a quota pattern")
-            use, model = resolve("codex", role, escalate)
+        if use in FALLBACK_AGENT and rc != 0 and _hit_limit(logpath):
+            to = FALLBACK_AGENT[use]
+            record("agent_fallback", agent=use, to=to, tag=tag, rc=rc)
+            _disable_agent(use, f"exit {rc} with a quota pattern")
+            use, model = resolve(use, role, escalate)
             continue
         break
     return use, rc, text
@@ -981,13 +1083,18 @@ SILENT_REVIEW = (
     "is unchanged and the review will be retried."
 )
 
-# Who was *asked* to review: index 1 is always claude, index 2 is always codex
-# (falling back to claude inside invoke() once codex is out of quota). This is
-# the roster, not the attendance sheet -- review_stage() seeds its results from
-# it so a reviewer that never came back at all still counts as one that owes a
-# verdict, and retries only the indices that went silent. What actually ran is
-# invoke()'s first return value, and that is what names a reviewer in public.
-REVIEWER_AGENTS = {1: "claude", 2: "codex"}
+# Who was *asked* to review: reviewer 1 is always claude, reviewer 2 the
+# cheaper cross-model agent (falling back to claude inside invoke() once its
+# quota dies). Both slots are overridable via FR_REVIEWER1/FR_REVIEWER2. This
+# is the roster, not the attendance sheet -- review_stage() seeds its results
+# from it so a reviewer that never came back at all still counts as one that
+# owes a verdict, and retries only the indices that went silent. What actually
+# ran is invoke()'s first return value, and that is what names a reviewer in
+# public.
+REVIEWER_AGENTS = {
+    1: os.environ.get("FR_REVIEWER1", "claude"),
+    2: os.environ.get("FR_REVIEWER2", "opencode"),
+}
 
 
 def review_summary(verdicts: dict[int, str], agents: dict[int, str]) -> str:
@@ -1001,15 +1108,16 @@ def review_summary(verdicts: dict[int, str], agents: dict[int, str]) -> str:
 
     `agents` is who actually ran, captured from invoke(); naming from
     REVIEWER_AGENTS instead would name who was asked, and those differ exactly
-    when it matters. resolve() turns reviewer 2's "codex" into claude the
+    when it matters. resolve() turns reviewer 2's "opencode" into claude the
     moment the quota latch is armed, so the table credits the diff to a vendor
     that never opened it: replaying #40's own verdicts on a latched run,
-    {1: silent, 2: pass} read out as "one adversarial review (codex)" when what
-    happened was claude dying and claude passing. That is #40's false record
-    one field over, and a *stronger* claim than the sentence it replaced.
-    Deriving from what ran also drops the old reliance on codex_ok() at close()
-    time -- a run-global latch another worker can arm twenty minutes after this
-    round's codex reviewer read the diff perfectly well.
+    {1: silent, 2: pass} read out as "one adversarial review (opencode)" when
+    what happened was claude dying and claude passing. That is #40's false
+    record one field over, and a *stronger* claim than the sentence it
+    replaced. Deriving from what ran also drops the old reliance on
+    codex_ok()/opencode_ok() at close() time -- run-global latches another
+    worker can arm twenty minutes after this round's cheap reviewer read the
+    diff perfectly well.
     """
     def name(i: int) -> str:
         return agents.get(i) or "an agent that did not identify itself"
@@ -1024,8 +1132,16 @@ def review_summary(verdicts: dict[int, str], agents: dict[int, str]) -> str:
     reported = [name(i) for i, v in sorted(verdicts.items()) if v != "silent"]
     if not any(v == "silent" for v in verdicts.values()):
         seen = sorted(set(reported))
-        return (f"two adversarial reviews ({' + '.join(seen)})" if len(seen) > 1
-                else f"two adversarial reviews, both {seen[0]} — codex was unavailable")
+        if len(seen) > 1:
+            return f"two adversarial reviews ({' + '.join(seen)})"
+        # Both surviving reviews came from one vendor. Say who was asked and
+        # never came back, deriving it from the round rather than hardcoding
+        # the vendor: whichever reviewer 2 is configured to be, this is the
+        # sentence that admits it did not read the diff.
+        missing = sorted({a for a in REVIEWER_AGENTS.values()} - set(agents.values()))
+        return (f"two adversarial reviews, both {seen[0]} — "
+                f"{' + '.join(missing)} was unavailable" if missing
+                else f"two adversarial reviews, both {seen[0]}")
     if not reported:
         return ("no adversarial review at all: every reviewer was killed by the "
                 f"{AGENT_TIMEOUT // 60}-minute timeout (or crashed) and did not "
@@ -1180,7 +1296,7 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
     a quota wall -- gets exactly one retry, into a `.retry`-suffixed tag, same
     prompt. That is a harness fault, not a finding, and the cheap correct
     response to a harness fault is to run it again: invoke() already does this
-    one level down for a codex quota wall. Retrying blindly reads a real BLOCK
+    one level down for a cheap-agent quota wall. Retrying blindly reads a real BLOCK
     as silence and asks for it twice, so only reviewers review_outcome actually
     classified as silent -- never one that blocked -- are re-run.
 
@@ -1234,8 +1350,8 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
             record("agent_error", agent=agent, tag=rtag, rc=None, reason=repr(exc))
             return
         # The agent that ran, not the one requested: invoke() returns claude in
-        # codex's slot once the quota latch is armed, and review_summary must
-        # name whoever actually read the diff.
+        # reviewer 2's slot once the quota latch is armed, and review_summary
+        # must name whoever actually read the diff.
         agents[idx] = use
         results[idx] = text
 
@@ -1268,8 +1384,8 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
         return blocking, verdicts
 
     # Cross-model on purpose: two instances of one model reviewing a diff behave
-    # closer to one reviewer than to two. Once codex is out of quota both become
-    # Opus, losing vendor diversity but keeping independent contexts.
+    # closer to one reviewer than to two. Once reviewer 2's quota dies both
+    # become Opus, losing vendor diversity but keeping independent contexts.
     #
     # Reviewers run cwd=wt, not cwd=ROOT, but full tool access means nothing
     # stops one from cd-ing there and writing -- guard the whole bracket,
@@ -1304,7 +1420,7 @@ def resolve_question(issue: gh.Issue, wt: Path, logdir: Path, critique: str) -> 
                   "REWRITE is no longer available to you. Decide PROCEED or "
                   "CLOSE, and justify it.\n")
     with guard_root_writes(str(issue.number), f"resolve.{rounds}"):
-        _, _, out = invoke("claude", wt, prompt_for("resolver", issue, extra),
+        _, _, out = invoke(ROLE_AGENT["resolver"], wt, prompt_for("resolver", issue, extra),
                            logdir, f"resolve.{rounds}", role="resolver")
 
     if "RESOLUTION: PROCEED" in out:
@@ -1379,7 +1495,7 @@ def recover_blocked() -> int:
                      f"(absolute path; you are in a worktree).\n"
                      f"Rescue {issue.recoveries + 1} of {MAX_RECOVERIES}.\n")
             with guard_root_writes(tid, f"unblock.{issue.recoveries}"):
-                _, _, out = invoke("claude", wt, prompt_for("unblocker", issue, extra),
+                _, _, out = invoke(ROLE_AGENT["unblocker"], wt, prompt_for("unblocker", issue, extra),
                                    logdir, f"unblock.{issue.recoveries}", role="unblocker")
 
             if "RECOVERY: CLOSE" in out:
@@ -1472,7 +1588,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
         restore_worktree(wt, critic_snapshot)
 
     failure: str | None = None
-    agents = ["codex", "claude"] if issue.agent == "duel" else [issue.agent]
+    agents = DUEL_AGENTS if issue.agent == "duel" else [issue.agent]
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         agent = agents[(attempt - 1) % len(agents)]
@@ -1564,11 +1680,12 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             _, sha = git(["rev-parse", "--short", "HEAD"])
             # Say which reviewers actually ran. "Two adversarial reviews" reads
             # as cross-model review whether or not that is what happened, and
-            # once codex is walled off it is two runs of one model -- a weaker
-            # claim that the morning reader deserves to see on the issue. And
-            # if a reviewer was still silent after review_stage()'s retry, this
-            # is one review, not two (#139). Both facts come from the round
-            # itself, never from the static roster or a run-global latch.
+            # once reviewer 2 is walled off it is two runs of one model -- a
+            # weaker claim that the morning reader deserves to see on the
+            # issue. And if a reviewer was still silent after review_stage()'s
+            # retry, this is one review, not two (#139). Both facts come from
+            # the round itself, never from the static roster or a run-global
+            # latch.
             reviewed = review_summary(verdicts, reviewers)
             gh.close(issue.number,
                      f"Merged as `{sha}` after {attempt} attempt(s), gate `{issue.gate}`, "
@@ -1591,7 +1708,7 @@ def cmd_seed() -> int:
     wt = ROOT
     p = "\n".join([(PROMPTS / "shared.md").read_text(),
                    (PROMPTS / "planner.md").read_text()])
-    invoke("claude", wt, p, LOGS / "seed", "seed", role="planner")
+    invoke(ROLE_AGENT["planner"], wt, p, LOGS / "seed", "seed", role="planner")
     issues = gh.fetch(label="fr:ready")
     log(f"seeded: {len(issues)} ready issues")
     for i in issues:
@@ -1600,19 +1717,20 @@ def cmd_seed() -> int:
 
 
 def _retro_artifacts(cycle: int) -> list[Path]:
+    retro_agent = ROLE_AGENT["retro"]
     return [
         LOGS / f"retro-{cycle}.md",
         LOGS / "retro" / f"prompt.r{cycle}.md",
-        LOGS / "retro" / f"claude.r{cycle}.log",
-        LOGS / "retro" / f"claude.r{cycle}.final.txt",
+        LOGS / "retro" / f"{retro_agent}.r{cycle}.log",
+        LOGS / "retro" / f"{retro_agent}.r{cycle}.final.txt",
     ]
 
 
 _RETRO_ARTIFACT_PATTERNS = [
     (lambda: LOGS, re.compile(r"^retro-(\d+)\.md$")),
     (lambda: LOGS / "retro", re.compile(r"^prompt\.r(\d+)\.md$")),
-    (lambda: LOGS / "retro", re.compile(r"^claude\.r(\d+)\.log$")),
-    (lambda: LOGS / "retro", re.compile(r"^claude\.r(\d+)\.final\.txt$")),
+    (lambda: LOGS / "retro", re.compile(r"^(\w+)\.r(\d+)\.log$")),
+    (lambda: LOGS / "retro", re.compile(r"^(\w+)\.r(\d+)\.final\.txt$")),
 ]
 
 
@@ -1824,7 +1942,8 @@ def retrospective(cycle: int | str) -> None:
     # analysed. Comparing states rather than deleting keeps the older run's
     # findings on disk.
     before = _report_state(report)
-    _, rc, text = invoke("claude", ROOT, p, LOGS / "retro", f"r{cycle}", role="critic")
+    _, rc, text = invoke(ROLE_AGENT["retro"], ROOT, p, LOGS / "retro",
+                         f"r{cycle}", role="critic")
     # Only a pass that demonstrably produced analysis may advance the
     # watermark. invoke() drops the error reason _final_text() returns
     # alongside its text (see _final_text()/invoke()), so an API-error result
