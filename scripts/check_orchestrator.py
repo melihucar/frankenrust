@@ -497,7 +497,7 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
     no test did:
 
       * The closing comment must name the agent that *ran*, not the one the
-        REVIEWER_AGENTS roster asked for. resolve() turns reviewer 2's
+        REVIEWER_AGENTS roster asked for. resolve() turns either slot's
         "opencode" into claude the instant the quota latch is armed, so naming
         from the roster credits the diff to a vendor that never opened it -- on
         a latched run, #40's own {1: silent, 2: pass} read out as "one
@@ -547,7 +547,8 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
         calls: list[str] = []
         events.clear()
 
-        def stub(agent, wt, prompt, logdir, tag, role="implementer", escalate=False):
+        def stub(agent, wt, prompt, logdir, tag, role="implementer", escalate=False,
+             model=None):
             calls.append(tag)
             scripted = script.get(tag, "")
             if isinstance(scripted, BaseException):
@@ -618,10 +619,11 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
             bad += fail(f"opencode really did produce the surviving review here "
                         f"and must be named: {summary!r}")
 
-        # The same round with the opencode quota latch armed. Slot 2 is
-        # claude, so the surviving review is claude's and the sentence must
-        # say so: telling the morning reader a second vendor read a diff it
-        # never saw is #40's false record one field over.
+        # The same round with the opencode quota latch armed. Both slots
+        # asked for opencode, so both slots fall back to claude, and the
+        # surviving review is claude's -- the sentence must say so: telling
+        # the morning reader a second vendor read a diff it never saw is
+        # #40's false record one field over.
         (blocking, verdicts, reviewers), calls = run_case(still_silent, latched=True)
         if reviewers != {1: "claude", 2: "claude"}:
             bad += fail(f"review_stage must report the agents that ran, and "
@@ -965,59 +967,64 @@ def check_verdict_parsing() -> int:
 
 
 def check_agent_routing() -> int:
-    """resolve() must route agents to their agents/models, and the defaults
-    must express the intended split: opencode (cheap) for implementation,
-    claude (judgement) for review -- both overridable per role.
+    """resolve() must route requested agents to their agents/models.
 
-    This is the table every stage in the loop trusts: a wrong default here
+    The table this exercises is config.py, overlaid with whatever .env / FR_*
+    knobs the ambient run carries -- so every case here requests agents
+    explicitly (routing must hold under any override), and the committed
+    defaults themselves are pinned separately in a subprocess with the
+    environment stripped, by check_config_defaults().
+
+    This is the table every stage in the loop trusts: a wrong route here
     silently moves implementation onto Opus (costs money for no gain) or a
-    reviewer onto a free model (judgement the merge gate relies on), and
-    neither failure leaves a trace in the journal.
+    reviewer onto a model the merge gate never meant to rely on, and neither
+    failure leaves a trace in the journal.
     """
     sys.path.insert(0, str(ROOT / "orchestrator"))
     import loop
     bad = 0
 
-    if loop.ROLE_AGENT["implementer"] != "opencode":
-        bad += fail("the default implementer must be opencode -- implementation "
-                    "is bulk mechanical work a free model handles: "
-                    f"{loop.ROLE_AGENT['implementer']}")
-    if loop.ROLE_AGENT["reviewer"] != "claude":
-        bad += fail("the default reviewer must be claude -- the merge gate "
-                    "needs the strongest judgement: "
-                    f"{loop.ROLE_AGENT['reviewer']}")
-    if loop.REVIEWER_AGENTS != {1: "claude", 2: "opencode"}:
-        bad += fail("the default review roster must be claude + opencode for "
-                    "cross-model review on a cheap second vendor: "
-                    f"{loop.REVIEWER_AGENTS}")
-
     # Routing table: (requested, role, escalate, latch_agent, want_agent,
-    # want_model).
+    # want_model, model_override).
     cases = [
-        ("claude", "implementer", False, None, "claude", loop.MODELS["implementer"]),
+        ("claude", "implementer", False, None, "claude", loop.MODELS["implementer"],
+         None),
         ("opencode", "implementer", False, None, "opencode",
-         loop.OPENCODE_MODELS["implementer"]),
+         loop.OPENCODE_MODELS["implementer"], None),
         ("opencode", "reviewer", False, None, "opencode",
-         loop.OPENCODE_MODELS["reviewer"]),
-        ("codex", "implementer", False, None, "codex", None),
-        ("claude", "implementer", True, None, "claude", loop.ESCALATED_MODEL),
-        ("opencode", "implementer", True, None, "claude", loop.ESCALATED_MODEL),
-        ("codex", "implementer", True, None, "claude", loop.ESCALATED_MODEL),
+         loop.OPENCODE_MODELS["reviewer"], None),
+        ("codex", "implementer", False, None, "codex", None, None),
+        ("claude", "implementer", True, None, "claude", loop.ESCALATED_MODEL, None),
+        ("opencode", "implementer", True, None, "opencode",
+         loop.OPENCODE_ESCALATED_MODEL, None),
+        ("codex", "implementer", True, None, "claude", loop.ESCALATED_MODEL, None),
         ("opencode", "implementer", False, "opencode", "claude",
-         loop.MODELS["implementer"]),
+         loop.MODELS["implementer"], None),
         ("codex", "implementer", False, "codex", "claude",
-         loop.MODELS["implementer"]),
+         loop.MODELS["implementer"], None),
+        # "duel" is a scheduling directive: a stage asking for the issue's
+        # agent without unwrapping the rotation routes to the role default.
+        # The want follows the configured critic, whatever the ambient run
+        # sets it to.
+        ("duel", "critic", False, None, loop.ROLE_AGENT["critic"],
+         (loop.OPENCODE_MODELS["critic"] if loop.ROLE_AGENT["critic"] == "opencode"
+          else loop.MODELS["critic"] if loop.ROLE_AGENT["critic"] == "claude"
+          else None), None),
+        # The duel rotation's model override threads through to opencode only.
+        ("opencode", "implementer", False, None, "opencode", "opencode/hy3-free",
+         "opencode/hy3-free"),
     ]
     saved_ok = {a: getattr(loop, f"{a}_ok") for a in ("codex", "opencode")}
     try:
-        for requested, role, escalate, latch, want_agent, want_model in cases:
+        for requested, role, escalate, latch, want_agent, want_model, override in cases:
             if latch:
                 getattr(loop, f"disable_{latch}")("routing check")
             else:
                 loop._disabled_agents = set()
-            agent, model = loop.resolve(requested, role, escalate)
+            agent, model = loop.resolve(requested, role, escalate, override)
             if agent != want_agent or model != want_model:
                 bad += fail(f"resolve({requested!r}, {role!r}, escalate={escalate}"
+                            f", model={override!r}"
                             f"{', latched ' + latch if latch else ''}) -> "
                             f"({agent!r}, {model!r}); want ({want_agent!r}, "
                             f"{want_model!r})")
@@ -1032,6 +1039,106 @@ def check_agent_routing() -> int:
         loop._disabled_agents = set()
         for a, ok in saved_ok.items():
             setattr(loop, f"{a}_ok", ok)
+    return bad
+
+
+def _clean_env() -> dict:
+    """The ambient environment with every FR_* knob stripped, so config.py's
+    committed defaults are tested, not the run's overrides."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("FR_")}
+    env["FR_ENV_FILE"] = os.devnull  # and ignore orchestrator/.env, if any
+    return env
+
+
+def check_config_defaults() -> int:
+    """config.py's committed defaults must be the all-opencode testing roster.
+
+    Everything runs on opencode's free models while the run tests end to end
+    (claude is quota-starved); claude/codex stay wired -- FR_AGENT_<ROLE>,
+    FR_REVIEWER1/2 and FR_MODEL_<ROLE> restore the implementation-cheap /
+    judgement-strong split the day the quota resets. The check runs in a
+    subprocess with the environment stripped: an ambient .env or exported
+    FR_* knob must not be able to fake a pass.
+    """
+    bad = 0
+    probe = (
+        "import config\n"
+        "t = config.ROLE_AGENT\n"
+        "assert all(a == 'opencode' for a in t.values()), t\n"
+        "assert config.REVIEWER_AGENTS == {1: 'opencode', 2: 'opencode'}, "
+        "config.REVIEWER_AGENTS\n"
+        "assert config.DUEL_AGENTS == ['opencode'], config.DUEL_AGENTS\n"
+        "assert config.DUEL_MODELS == ['opencode/deepseek-v4-flash-free', "
+        "'opencode/hy3-free'], config.DUEL_MODELS\n"
+        "assert config.ESCALATED_MODEL == 'claude-opus-5', "
+        "config.ESCALATED_MODEL\n"
+        "assert config.OPENCODE_ESCALATED_MODEL == "
+        "config.OPENCODE_MODELS['implementer'], "
+        "config.OPENCODE_ESCALATED_MODEL\n"
+    )
+    p = subprocess.run([sys.executable, "-c", probe], cwd=ROOT / "orchestrator",
+                       capture_output=True, text=True, env=_clean_env())
+    if p.returncode != 0:
+        bad += fail("config.py defaults drifted from the all-opencode testing "
+                    f"roster:\n{p.stderr.strip()}")
+    return bad
+
+
+def check_config_overrides() -> int:
+    """Precedence must be env > .env file > config.py defaults, Laravel-style.
+
+    The point of config.py is that the weekly split change is a one-line edit
+    (or a .env value) without touching code: FR_AGENT_PLAN=claude in .env must
+    move planning onto claude, a real environment variable must beat the
+    file, and an unknown agent in either layer must fail at boot, not when
+    the first issue reaches the role.
+    """
+    bad = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        envfile = Path(tmp) / "env"
+        envfile.write_text(
+            "FR_AGENT_PLAN=codex\n"
+            "# a comment line, and a junk line with no '='\n"
+            "FR_MODEL_PLAN=claude-sonnet-5\n"
+            "not-a-knob\n"
+        )
+        probe = (
+            "import config\n"
+            "assert config.ROLE_AGENT['planner'] == 'codex', "
+            "config.ROLE_AGENT['planner']\n"
+            "assert config.MODELS['planner'] == 'claude-sonnet-5', "
+            "config.MODELS['planner']\n"
+            "assert config.REVIEWER_AGENTS == {1: 'opencode', 2: 'opencode'}, "
+            "config.REVIEWER_AGENTS\n"
+        )
+        env = _clean_env()
+        env["FR_ENV_FILE"] = str(envfile)
+        p = subprocess.run([sys.executable, "-c", probe], cwd=ROOT / "orchestrator",
+                           capture_output=True, text=True, env=env)
+        if p.returncode != 0:
+            bad += fail(f".env values must override config.py defaults:\n"
+                        f"{p.stderr.strip()}")
+
+        # A real environment variable beats the file.
+        probe = ("import config\n"
+                 "assert config.ROLE_AGENT['planner'] == 'claude', "
+                 "config.ROLE_AGENT['planner']\n")
+        env["FR_AGENT_PLAN"] = "claude"
+        p = subprocess.run([sys.executable, "-c", probe], cwd=ROOT / "orchestrator",
+                           capture_output=True, text=True, env=env)
+        if p.returncode != 0:
+            bad += fail("a real environment variable must beat the .env file:\n"
+                        f"{p.stderr.strip()}")
+
+        # An unknown agent in the tables must fail at import.
+        env2 = dict(env)
+        env2["FR_AGENT_PLAN"] = "gpt"
+        p = subprocess.run([sys.executable, "-c", "import config"],
+                           cwd=ROOT / "orchestrator", capture_output=True,
+                           text=True, env=env2)
+        if p.returncode == 0:
+            bad += fail("config.py accepted an unknown agent in the tables "
+                        "instead of failing at boot")
     return bad
 
 
@@ -1416,7 +1523,7 @@ def check_retro_through_is_snapshotted_before_invoke() -> int:
             loop.JOURNAL, loop.LOGS = journal, logs
 
             def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
-                            escalate=False):
+                            escalate=False, model=None):
                 # A merge landing while the agent is "running" -- must not be
                 # folded into `through`, which was already taken.
                 with journal.open("a") as fh:
@@ -1611,7 +1718,7 @@ def check_retro_damaged_line_and_tolerant_prompt_command() -> int:
             loop.JOURNAL, loop.LOGS = journal, logs
 
             def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
-                            escalate=False):
+                            escalate=False, model=None):
                 captured["prompt"] = prompt
                 (logs / "retro-2.md").write_text("findings\n")
                 return "claude", 0, "some analysis"
@@ -1726,7 +1833,7 @@ def check_retro_first_pass_still_gets_tolerant_recipe() -> int:
             loop.JOURNAL, loop.LOGS = journal, logs
 
             def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
-                            escalate=False):
+                            escalate=False, model=None):
                 captured["prompt"] = prompt
                 (logs / "retro-1.md").write_text("findings\n")
                 return "claude", 0, "some analysis"
@@ -2564,7 +2671,8 @@ def check_reviewer_patch_file_is_complete_and_applies() -> int:
     prompts: list[str] = []
 
     def fake_invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
-                    role: str = "implementer", escalate: bool = False):
+                    role: str = "implementer", escalate: bool = False,
+                    model: str | None = None):
         # The real invoke's side effects on logdir, verbatim -- these are the
         # files that sit next to the patch the reviewer is pointed at.
         logdir.mkdir(parents=True, exist_ok=True)
@@ -2724,7 +2832,8 @@ def check_post_fix_empty_diff_does_not_merge() -> int:
     saved = {name: getattr(loop, name) for name in
              ("invoke", "run", "record", "log", "gh", "merge_worktree", "MAX_ATTEMPTS")}
 
-    def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer", escalate=False):
+    def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
+                    escalate=False, model=None):
         use = loop.resolve(agent, role, escalate)[0]
         if role == "critic":
             return use, 0, "Nothing wrong with this issue.\n\nVERDICT: PROCEED"
@@ -3560,6 +3669,7 @@ if __name__ == "__main__":
              + check_filing_contract_is_stated() + check_reviewer_restore()
              + check_priority_leads_the_queue()
              + check_verdict_parsing() + check_agent_routing()
+             + check_config_defaults() + check_config_overrides()
              + check_record_repairs_torn_journal()
              + check_retro_cycle_survives_restart()
              + check_retro_callers_derive_the_cycle()

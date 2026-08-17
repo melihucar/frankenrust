@@ -95,17 +95,23 @@ python3 orchestrator/loop.py retro     # retrospective on demand
 
 Knobs: `FR_PARALLEL` (3), `FR_ATTEMPTS` (3), `FR_WALLCLOCK` (8h),
 `FR_AGENT_TIMEOUT` (1h/attempt), `FR_MAX_REVISIONS` (2 re-scopes per issue).
-Agents: `FR_AGENT_IMPL`/`FR_AGENT_FIX` (opencode), `FR_AGENT_REVIEW` (claude),
-`FR_REVIEWER1` (claude), `FR_REVIEWER2` (opencode), `FR_DUEL_AGENTS`
-(opencode,claude). Models: `FR_MODEL_IMPL` (Sonnet), `FR_MODEL_REVIEW`/
-`FR_MODEL_CRITIC` (Opus) for claude; `FR_OPENCODE_MODEL_*` for opencode (a
-free model by default).
+Who runs what, and with which model, lives in **`orchestrator/config.py`** —
+the weekly split change is a one-line edit there (or a `FR_*` value in
+`orchestrator/.env`, copied from `.env.example`). Precedence: real
+environment variables > `.env` file > config.py defaults. The knobs:
+`FR_AGENT_<ROLE>` (implementer/fixer/critic/reviewer/planner/resolver/
+unblocker/retro), `FR_MODEL_<ROLE>` (claude table), `FR_OPENCODE_MODEL_<ROLE>`
+(opencode table), `FR_REVIEWER1`/`FR_REVIEWER2` (review roster),
+`FR_DUEL_AGENTS`/`FR_DUEL_MODELS` (duel rotation), `FR_MODEL_ESCALATE`/
+`FR_OPENCODE_MODEL_ESCALATE` (final attempt of a failing issue).
 
-The loop runs three agents: **opencode** (cheap, free models; the default
-implementer/fixer), **claude** (strongest judgement; review, critic, resolver)
-and **codex** (its own quota; opt-in via `Agent: codex`). Codex and opencode
-run on quotas that can run out mid-run. When one does, the loop detects it,
-falls back to Claude for everything remaining, and keeps going.
+Right now everything defaults to **opencode** on free models — the run is
+testing end to end, and claude is quota-starved. **claude** and **codex** stay
+fully wired (`Agent: codex` in an issue body opts the issue into codex), so
+the day the weekly limit resets, moving the judgement roles (review, critic,
+resolver) back to claude is a config change, not a code change. Codex and
+opencode run on quotas that can run out mid-run. When one does, the loop
+detects it, falls back to claude for everything remaining, and keeps going.
 
 **You have to start it yourself.** The agents run with permission prompts
 disabled — that is what "unattended" requires — and authorizing a multi-hour
@@ -120,10 +126,11 @@ claim ─► critic ─┬─ REVISE ─► resolver ─┬─ REWRITE ─► re
                  │                      └─ PROCEED ─┐ (critic overruled)
                  └─ PROCEED ────────────────────────┴─► implementer
                          │
-                         └─► gate ─┬─ fail ─► retry (≤3, escalating model)
-                                   └─ pass ─► 2 adversarial reviewers
-                                       (claude + opencode, independent
-                                        contexts, diff only)
+└─► gate ─┬─ fail ─► retry (≤3, escalating model)
+                                    └─ pass ─► 2 adversarial reviewers
+                                        (both opencode right now;
+                                         cross-vendor slots via FR_REVIEWER1/2,
+                                         independent contexts, diff only)
                                         ├─ BLOCK ─► fixer ─► re-gate ─► re-review
                                         └─ PASS  ─► rebase, re-gate, merge, close
 ```

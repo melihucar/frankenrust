@@ -72,9 +72,13 @@ frozen list.
   - `Gate: bootstrap` for anything producing no Rust — docs, prompts, scripts,
     orchestrator changes. `default` when you are changing Rust that must build
     and pass conformance. `bench` only for benchmark work.
-  - `Agent: opencode` for mechanical grind (the cheap default), `claude` for
-    design-heavy work, `codex` for the separate quota when it is available,
-    `duel` for the genuinely hard (the two alternate on failure).
+  - `Agent: opencode` is the default for everything right now — the loop is
+    testing end to end on opencode's free models. `claude` (or `codex`) opts
+    an issue into the split the config restores when the weekly quota resets:
+    the judgement roles move back to claude via `orchestrator/config.py` /
+    `.env`, so an issue filed with `claude` today will not be stranded by that
+    change. `duel` for the genuinely hard (the rotation alternates opencode
+    models on failure).
   - **Priority is a label, not a body line**, and it decides what the loop
     claims next — it outranks how much an issue unblocks. Pick one:
 

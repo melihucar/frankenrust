@@ -53,6 +53,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gh  # noqa: E402
+# Which agent runs which role, and with which model: orchestrator/config.py
+# (overridable per run via .env / FR_* environment variables).
+import config  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 ORCH = ROOT / "orchestrator"
@@ -92,42 +95,18 @@ HEARTBEAT = int(os.environ.get("FR_HEARTBEAT", "60"))
 # retro_thread(). A cycle that merges nothing produces no new evidence.
 # -----------------------------------------------------------------------------
 
-# Which agent runs which role. The split is deliberate: implementation is bulk
-# mechanical translation against a spec that already names the files, which a
-# cheap opencode model handles; critique, review and fixing are where judgement
-# matters (unsound unsafe, thread-affinity bugs a green suite misses), so those
-# stay on claude. Every role is overridable per-run via FR_AGENT_<ROLE>.
-AGENTS = ("claude", "codex", "opencode")
-ROLE_AGENT = {
-    "implementer": os.environ.get("FR_AGENT_IMPL", "opencode"),
-    "fixer": os.environ.get("FR_AGENT_FIX", "opencode"),
-    "critic": os.environ.get("FR_AGENT_CRITIC", "claude"),
-    "reviewer": os.environ.get("FR_AGENT_REVIEW", "claude"),
-    "planner": os.environ.get("FR_AGENT_PLAN", "claude"),
-    "resolver": os.environ.get("FR_AGENT_RESOLVE", "claude"),
-    "unblocker": os.environ.get("FR_AGENT_UNBLOCK", "claude"),
-    "retro": os.environ.get("FR_AGENT_RETRO", "claude"),
-}
-# The `duel` Agent: alternates implementation between two agents on failure.
-DUEL_AGENTS = [a.strip() for a in os.environ.get("FR_DUEL_AGENTS",
-                                                  "opencode,claude").split(",")]
+# Agent/model tables: config.py is the source of truth, with .env / FR_* env
+# overrides applied at import. loop.py reads the tables by the same names.
+AGENTS = config.AGENTS
+ROLE_AGENT = config.ROLE_AGENT
+MODELS = config.MODELS
+OPENCODE_MODELS = config.OPENCODE_MODELS
+DUEL_AGENTS = config.DUEL_AGENTS
+DUEL_MODELS = config.DUEL_MODELS
+ESCALATED_MODEL = config.ESCALATED_MODEL
+OPENCODE_ESCALATED_MODEL = config.OPENCODE_ESCALATED_MODEL
+REVIEWER_AGENTS = config.REVIEWER_AGENTS
 
-# Model per role, per agent. claude gets the strong models for the roles where
-# judgement matters; opencode runs whatever FR_OPENCODE_MODEL_<ROLE> names
-# (a free model by default -- the bulk of the work is mechanical and a paid
-# model buys nothing there).
-MODELS = {
-    "implementer": os.environ.get("FR_MODEL_IMPL", "claude-sonnet-5"),
-    "critic": os.environ.get("FR_MODEL_CRITIC", "claude-opus-5"),
-    "reviewer": os.environ.get("FR_MODEL_REVIEW", "claude-opus-5"),
-    "fixer": os.environ.get("FR_MODEL_FIX", "claude-opus-5"),
-    "planner": os.environ.get("FR_MODEL_PLAN", "claude-opus-5"),
-    "resolver": os.environ.get("FR_MODEL_RESOLVE", "claude-opus-5"),
-    "unblocker": os.environ.get("FR_MODEL_UNBLOCK", "claude-opus-5"),
-}
-OPENCODE_MODELS = {role: os.environ.get(f"FR_OPENCODE_MODEL_{role.upper()}",
-                                        "opencode/deepseek-v4-flash-free")
-                   for role in MODELS}
 # How many times an issue may be re-scoped before the resolver must decide it
 # outright. Without a cap, critic and resolver can hand an issue back and forth
 # forever and it never gets built.
@@ -140,7 +119,6 @@ MAX_RECOVERIES = int(os.environ.get("FR_MAX_RECOVERIES", "2"))
 # Consecutive empty polls before believing the queue is finished. GitHub's
 # issue list lags writes by seconds, and one empty read ends the whole run.
 DRAIN_CONFIRMATIONS = int(os.environ.get("FR_DRAIN_CONFIRMATIONS", "3"))
-ESCALATED_MODEL = os.environ.get("FR_MODEL_ESCALATE", "claude-opus-5")
 
 # Codex and opencode run on quotas that can run out mid-run. When one does,
 # its remaining work becomes claude work rather than blocking the queue.
@@ -272,15 +250,27 @@ def disable_opencode(reason: str) -> None:
     _disable_agent("opencode", reason)
 
 
-def resolve(agent: str, role: str, escalate: bool = False) -> tuple[str, str | None]:
-    """Map requested agent+role onto (actual_agent, model)."""
+def resolve(agent: str, role: str, escalate: bool = False,
+            model: str | None = None) -> tuple[str, str | None]:
+    """Map requested agent+role onto (actual_agent, model).
+
+    `model` overrides the role's model when the agent is opencode -- the duel
+    rotation uses it to alternate models across attempts.
+    """
+    if agent == "duel":
+        # A scheduling directive, not an agent: "duel" reaching resolve()
+        # means a stage asked for the issue's agent without unwrapping the
+        # rotation (the critic does). Route to the role's default agent.
+        agent = ROLE_AGENT.get(role, ROLE_AGENT["implementer"])
     if agent not in AGENTS:
         raise ValueError(f"unknown agent {agent!r} (known: {', '.join(AGENTS)})")
     if agent == "codex" and codex_ok() and not escalate:
         return "codex", None
     if agent == "opencode" and opencode_ok() and not escalate:
-        return "opencode", OPENCODE_MODELS.get(role, OPENCODE_MODELS["implementer"])
+        return "opencode", model or OPENCODE_MODELS.get(role, OPENCODE_MODELS["implementer"])
     if escalate:
+        if agent == "opencode" and opencode_ok():
+            return "opencode", OPENCODE_ESCALATED_MODEL
         return "claude", ESCALATED_MODEL
     return "claude", MODELS.get(role, MODELS["implementer"])
 
@@ -502,18 +492,20 @@ FALLBACK_AGENT = {"codex": "claude", "opencode": "claude"}
 
 
 def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
-           role: str = "implementer", escalate: bool = False) -> tuple[str, int, str]:
+           role: str = "implementer", escalate: bool = False,
+           model: str | None = None) -> tuple[str, int, str]:
     """Run an agent. Returns (agent_used, rc, output_text).
 
     Prompt goes over stdin so we never hit argv limits. If codex or opencode
     dies on quota it is disabled for the run and the same prompt retried on
     claude -- a quota wall should cost one wasted invocation, not a whole
-    issue.
+    issue. `model` overrides the role's model for opencode (the duel
+    rotation's model pair).
     """
     logdir.mkdir(parents=True, exist_ok=True)
     (logdir / f"prompt.{tag}.md").write_text(prompt)
     pf = logdir / f"prompt.{tag}.md"
-    use, model = resolve(agent, role, escalate)
+    use, model = resolve(agent, role, escalate, model)
     rc, logpath = 1, logdir / f"{use}.{tag}.log"
     lastmsg = logdir / f"{use}.{tag}.final.txt"
     for _ in range(2):
@@ -1083,19 +1075,6 @@ SILENT_REVIEW = (
     "is unchanged and the review will be retried."
 )
 
-# Who was *asked* to review: reviewer 1 is always claude, reviewer 2 the
-# cheaper cross-model agent (falling back to claude inside invoke() once its
-# quota dies). Both slots are overridable via FR_REVIEWER1/FR_REVIEWER2. This
-# is the roster, not the attendance sheet -- review_stage() seeds its results
-# from it so a reviewer that never came back at all still counts as one that
-# owes a verdict, and retries only the indices that went silent. What actually
-# ran is invoke()'s first return value, and that is what names a reviewer in
-# public.
-REVIEWER_AGENTS = {
-    1: os.environ.get("FR_REVIEWER1", "claude"),
-    2: os.environ.get("FR_REVIEWER2", "opencode"),
-}
-
 
 def review_summary(verdicts: dict[int, str], agents: dict[int, str]) -> str:
     """What the closing comment should claim happened, from a round's verdicts.
@@ -1108,7 +1087,7 @@ def review_summary(verdicts: dict[int, str], agents: dict[int, str]) -> str:
 
     `agents` is who actually ran, captured from invoke(); naming from
     REVIEWER_AGENTS instead would name who was asked, and those differ exactly
-    when it matters. resolve() turns reviewer 2's "opencode" into claude the
+    when it matters. resolve() turns either slot's "opencode" into claude the
     moment the quota latch is armed, so the table credits the diff to a vendor
     that never opened it: replaying #40's own verdicts on a latched run,
     {1: silent, 2: pass} read out as "one adversarial review (opencode)" when
@@ -1589,16 +1568,20 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
 
     failure: str | None = None
     agents = DUEL_AGENTS if issue.agent == "duel" else [issue.agent]
+    duel = issue.agent == "duel"
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         agent = agents[(attempt - 1) % len(agents)]
+        # A duel alternates the model pair as well as the agent pair: attempt 1
+        # on the first model, attempt 2 on the second, and so on.
+        model = DUEL_MODELS[(attempt - 1) % len(DUEL_MODELS)] if duel else None
         extra = ""
         if failure:
             extra = ("\n# The previous attempt FAILED\nFix the root cause; do not "
                      f"paper over it.\n\n```\n{failure[-6000:]}\n```\n")
         with guard_root_writes(tid, f"impl.{attempt}"):
             invoke(agent, wt, prompt_for("implementer", issue, extra), logdir,
-                   f"impl.{attempt}", role="implementer",
+                   f"impl.{attempt}", role="implementer", model=model,
                    escalate=(attempt >= MAX_ATTEMPTS))
 
         rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
@@ -1637,7 +1620,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
                    phase="initial", excerpt=blocking[:1500])
             with guard_root_writes(tid, f"fix.{attempt}"):
                 invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"), logdir,
-                       f"fix.{attempt}", role="fixer")
+                       f"fix.{attempt}", role="fixer", model=model)
             rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
                            logdir / f"gate.fix.{attempt}.log")
             if rc != 0:
