@@ -31,12 +31,23 @@ boundary. scripts/check_orchestrator.py is what keeps that survivable.
 
     python3 orchestrator/loop.py seed      # planner agent files the initial issues
     python3 orchestrator/loop.py run       # drain the queue
+    python3 orchestrator/loop.py unblock   # recovery lane: rescue fr:blocked issues
     python3 orchestrator/loop.py status    # what is open / claimed / blocked
+
+`run` and `unblock` are lanes, meant to run as separate processes under
+scripts/supervise.sh: the claim lane and the recovery lane. A block and the
+work it gates must make progress at the same time, which one process cannot
+do -- recovery used to run inline in the claim loop, and recover_blocked()
+walks the whole blocked queue in one call, so an evening of serial unblocks
+parked every claim (and every wallclock check) for hours. The lanes share
+nothing but GitHub labels (the mutex: run touches fr:ready/fr:claimed, unblock
+touches fr:blocked) and the journal, which is flock-guarded.
 """
 
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -53,6 +64,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gh  # noqa: E402
+# Which agent runs which role, and with which model: orchestrator/config.py
+# (overridable per run via .env / FR_* environment variables).
+import config  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 ORCH = ROOT / "orchestrator"
@@ -85,6 +99,12 @@ def gate_for(wt: Path) -> str:
 MAX_PARALLEL = int(os.environ.get("FR_PARALLEL", "3"))
 MAX_ATTEMPTS = int(os.environ.get("FR_ATTEMPTS", "3"))
 AGENT_TIMEOUT = int(os.environ.get("FR_AGENT_TIMEOUT", str(60 * 60)))
+# The unblocker's own budget: a recovery lane typically gets 30-60 wallclock
+# minutes, and unblocks cluster around 8-22 min (measured), so the 60-minute
+# default consumed the whole lane on #14's 45-minute unblock -- one recovery
+# per lane run. A capped unblock either decides or leaves the issue blocked
+# with its recovery budget intact for the next lane.
+UNBLOCKER_TIMEOUT = int(os.environ.get("FR_UNBLOCKER_TIMEOUT", str(25 * 60)))
 GATE_TIMEOUT = int(os.environ.get("FR_GATE_TIMEOUT", str(30 * 60)))
 WALLCLOCK_LIMIT = int(os.environ.get("FR_WALLCLOCK", str(8 * 60 * 60)))
 HEARTBEAT = int(os.environ.get("FR_HEARTBEAT", "60"))
@@ -92,19 +112,18 @@ HEARTBEAT = int(os.environ.get("FR_HEARTBEAT", "60"))
 # retro_thread(). A cycle that merges nothing produces no new evidence.
 # -----------------------------------------------------------------------------
 
-# Implementation is bulk mechanical translation against a spec that already
-# names the files -- Sonnet handles it. Critique, review and fixing are where
-# judgement matters (unsound unsafe, thread-affinity bugs a green suite misses),
-# so those get Opus.
-MODELS = {
-    "implementer": os.environ.get("FR_MODEL_IMPL", "claude-sonnet-5"),
-    "critic": os.environ.get("FR_MODEL_CRITIC", "claude-opus-5"),
-    "reviewer": os.environ.get("FR_MODEL_REVIEW", "claude-opus-5"),
-    "fixer": os.environ.get("FR_MODEL_FIX", "claude-opus-5"),
-    "planner": os.environ.get("FR_MODEL_PLAN", "claude-opus-5"),
-    "resolver": os.environ.get("FR_MODEL_RESOLVE", "claude-opus-5"),
-    "unblocker": os.environ.get("FR_MODEL_UNBLOCK", "claude-opus-5"),
-}
+# Agent/model tables: config.py is the source of truth, with .env / FR_* env
+# overrides applied at import. loop.py reads the tables by the same names.
+AGENTS = config.AGENTS
+ROLE_AGENT = config.ROLE_AGENT
+MODELS = config.MODELS
+OPENCODE_MODELS = config.OPENCODE_MODELS
+DUEL_AGENTS = config.DUEL_AGENTS
+DUEL_MODELS = config.DUEL_MODELS
+ESCALATED_MODEL = config.ESCALATED_MODEL
+OPENCODE_ESCALATED_MODEL = config.OPENCODE_ESCALATED_MODEL
+REVIEWER_AGENTS = config.REVIEWER_AGENTS
+
 # How many times an issue may be re-scoped before the resolver must decide it
 # outright. Without a cap, critic and resolver can hand an issue back and forth
 # forever and it never gets built.
@@ -117,24 +136,40 @@ MAX_RECOVERIES = int(os.environ.get("FR_MAX_RECOVERIES", "2"))
 # Consecutive empty polls before believing the queue is finished. GitHub's
 # issue list lags writes by seconds, and one empty read ends the whole run.
 DRAIN_CONFIRMATIONS = int(os.environ.get("FR_DRAIN_CONFIRMATIONS", "3"))
-ESCALATED_MODEL = os.environ.get("FR_MODEL_ESCALATE", "claude-opus-5")
 
-# Codex runs on a separate quota that will likely run out mid-run. When it does,
-# remaining codex work becomes claude work rather than blocking the queue.
-# Detection is by output pattern; the CLI gives no distinct exit code for it.
-CODEX_LIMIT_PATTERNS = (
+# Codex and opencode run on quotas that can run out mid-run. When one does,
+# its remaining work becomes claude work rather than blocking the queue.
+# Detection is by output pattern; neither CLI gives a distinct exit code for
+# it (opencode exits 0 even on an API error).
+LIMIT_PATTERNS = (
     "usage limit", "rate limit", "rate_limit", "quota", "429",
     "too many requests", "insufficient_quota", "you've hit your",
     "resource_exhausted", "please try again later",
 )
 
+# claude is the terminal fallback, so its failure modes decide whether the
+# run keeps working at all: an OAuth session expiry or the weekly quota
+# cannot clear within a run, and re-running it per issue only burns the
+# queue. Unlike LIMIT_PATTERNS these strings are auth-layer errors, never
+# legitimate agent output, but the match is still scoped to `use == "claude"`
+# because a transcript an agent is reading aloud can contain either text.
+AUTH_PATTERNS = (
+    "failed to authenticate: oauth session expired and could not be refreshed",
+    "oauth session expired",
+    "authentication error",
+)
+
 _merge_lock = threading.Lock()
 _claim_lock = threading.Lock()
 _codex_lock = threading.Lock()
-# Survives re-exec. A quota wall lasts days, but the flag was process-local, so
-# every self-update handed the successor a clean slate and it re-learned the
-# same wall by burning another invocation on it.
-_codex_disabled = os.environ.get("FR_CODEX_DISABLED") == "1"
+# Survives re-exec. A quota wall lasts days, but the flags were process-local,
+# so every self-update handed the successor a clean slate and it re-learned
+# the same wall by burning another invocation on it. FR_<AGENT>_DISABLED is
+# what restart_into_new_code() carries across.
+_disabled_agents: set[str] = {
+    a for a in AGENTS
+    if os.environ.get(f"FR_{a.upper()}_DISABLED") == "1"
+}
 # Issues whose recovery budget is spent, so the terminal log line is printed
 # once rather than on every 30s poll.
 _recovery_exhausted: set[int] = set()
@@ -150,6 +185,10 @@ def log(msg: str) -> None:
     print(line, flush=True)
     LOGS.mkdir(parents=True, exist_ok=True)
     with (LOGS / "loop.log").open("a") as fh:
+        # run and unblock lanes are separate processes sharing this file.
+        # flock, not just O_APPEND: two processes appending concurrently can
+        # still interleave a pair of short writes.
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         fh.write(line + "\n")
 
 
@@ -198,6 +237,9 @@ def record(event: str, **fields) -> None:
         # silently vanish, so everything below must land before this `with`
         # block exits.
         with JOURNAL.open("a") as fh:
+            # Cross-process, not just cross-thread: run and unblock lanes are
+            # separate processes writing this same file.
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             if tear is not None:
                 # Isolate the fragment on its own line before anything else
                 # touches the file, then say so in the journal itself -- a
@@ -208,33 +250,88 @@ def record(event: str, **fields) -> None:
             fh.write(json.dumps(rec) + "\n")
 
 
+def _agent_ok(agent: str) -> bool:
+    with _codex_lock:
+        return agent not in _disabled_agents
+
+
 def codex_ok() -> bool:
-    with _codex_lock:
-        return not _codex_disabled
+    return _agent_ok("codex")
 
 
-def disable_codex(reason: str) -> None:
-    global _codex_disabled
+def opencode_ok() -> bool:
+    return _agent_ok("opencode")
+
+
+def _disable_agent(agent: str, reason: str) -> None:
+    global _disabled_agents
     with _codex_lock:
-        if _codex_disabled:
+        if agent in _disabled_agents:
             return
-        _codex_disabled = True
-    os.environ["FR_CODEX_DISABLED"] = "1"    # carried through restart_into_new_code
-    log(f"!! codex disabled for the rest of this run ({reason}); falling back to claude")
+        _disabled_agents = _disabled_agents | {agent}
+    os.environ[f"FR_{agent.upper()}_DISABLED"] = "1"  # survives restart_into_new_code
+    log(f"!! {agent} disabled for the rest of this run ({reason})"
+        + ("" if agent == "claude" else "; falling back to claude"))
     # Cross-model review is the reason two reviewers are worth more than one
     # reviewer run twice. Losing it is a change in what a merge means, so it
     # belongs in the journal where the retrospective and the morning review
     # will see it, not only in a log line nobody reads.
-    record("review_diversity_lost", reason=reason)
+    record("review_diversity_lost", agent=agent, reason=reason)
 
 
-def resolve(agent: str, role: str, escalate: bool = False) -> tuple[str, str | None]:
-    """Map requested agent+role onto (actual_agent, model)."""
+def disable_codex(reason: str) -> None:
+    _disable_agent("codex", reason)
+
+
+def disable_opencode(reason: str) -> None:
+    _disable_agent("opencode", reason)
+
+
+class NoAgentUsable(RuntimeError):
+    """Every agent this run could dispatch to is disabled (quota/auth walls).
+
+    Raised by resolve() when its terminal default -- claude -- is disabled,
+    and caught by invoke(), which reports `agent_unavailable` instead of
+    spawning nothing and letting the caller guess why the transcript never
+    appeared.
+    """
+
+
+def resolve(agent: str, role: str, escalate: bool = False,
+            model: str | None = None) -> tuple[str, str | None]:
+    """Map requested agent+role onto (actual_agent, model).
+
+    `model` overrides the role's model when the agent is opencode -- the duel
+    rotation uses it to alternate models across attempts.
+    """
+    if agent == "duel":
+        # A scheduling directive, not an agent: "duel" reaching resolve()
+        # means a stage asked for the issue's agent without unwrapping the
+        # rotation (the critic does). Route to the role's default agent.
+        agent = ROLE_AGENT.get(role, ROLE_AGENT["implementer"])
+    if agent not in AGENTS:
+        raise ValueError(f"unknown agent {agent!r} (known: {', '.join(AGENTS)})")
     if agent == "codex" and codex_ok() and not escalate:
         return "codex", None
+    if agent == "opencode" and opencode_ok() and not escalate:
+        return "opencode", model or OPENCODE_MODELS.get(role, OPENCODE_MODELS["implementer"])
     if escalate:
-        return "claude", ESCALATED_MODEL
-    return "claude", MODELS.get(role, MODELS["implementer"])
+        if agent == "opencode" and opencode_ok():
+            return "opencode", OPENCODE_ESCALATED_MODEL
+        if _agent_ok("claude"):
+            return "claude", ESCALATED_MODEL
+        raise NoAgentUsable(agent)
+    if _agent_ok("claude"):
+        return "claude", MODELS.get(role, MODELS["implementer"])
+    # claude is the terminal default; with it disabled nothing can run. The
+    # pre-disable behaviour -- unconditionally return claude -- is what let
+    # the 08-17 run march 28 blocked issues through an auth-broken claude
+    # before anything stopped it.
+    raise NoAgentUsable(agent)
+
+
+def no_agent_usable() -> bool:
+    return all(not _agent_ok(a) for a in AGENTS)
 
 
 def run(cmd: list[str], cwd: Path, timeout: int, log_path: Path | None = None) -> tuple[int, str]:
@@ -304,6 +401,19 @@ def agent_cmd(agent: str, model: str | None,
         if model:
             cmd += ["--model", model]
         return cmd
+    if agent == "opencode":
+        # Same stream-json discipline as claude: `--format json` emits one
+        # NDJSON event per line as it happens (proof of life in the log) and
+        # carries API errors as `error` events instead of dying quietly --
+        # opencode exits 0 even when the run failed, so the event stream is
+        # the only place the failure is visible. `--auto` is opencode's answer
+        # to claude's --dangerously-skip-permissions: these run for hours
+        # unwatched and must not stall on a permission prompt. The prompt
+        # comes over stdin (`-`) so we never hit argv limits.
+        cmd = ["opencode", "run", "--format", "json", "--auto"]
+        if model:
+            cmd += ["--model", model]
+        return cmd + ["-"]
     raise ValueError(f"unknown agent {agent!r}")
 
 
@@ -335,6 +445,37 @@ def _final_text(logpath: Path, agent: str,
     cannot read is not evidence of a defect, and treating it as one is the bug
     being fixed here.
     """
+    if agent == "opencode":
+        # `--format json` emits one NDJSON event per line: `text` events
+        # carry the assistant's text parts (the last one is the final
+        # message), `error` events carry API failures. opencode exits 0 even
+        # on a failed run, so the error event is the only way a quota wall
+        # or API error is visible -- without this branch a dead run would
+        # read as a clean verdict.
+        if not logpath.exists():
+            return "", "no log"
+        final, err = "", ""
+        for line in logpath.read_text(errors="replace").splitlines():
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "text":
+                part = ev.get("part") or {}
+                if part.get("text"):
+                    final = part["text"]
+            elif ev.get("type") == "error":
+                e = ev.get("error") or {}
+                err = (e.get("data") or {}).get("message") or e.get("name") or "error"
+                # The run failed; text emitted before the error is not a
+                # verdict and must not be parsed as one.
+                final = ""
+        if not final and not err:
+            # No text and no error event: the process died mid-stream.
+            err = "no final message from opencode (killed or crashed mid-stream)"
+        return final, err
     if agent != "claude":
         if last_message and last_message.exists():
             final = last_message.read_text(errors="replace").strip()
@@ -366,7 +507,16 @@ def _final_text(logpath: Path, agent: str,
         if ev.get("type") != "result":
             continue
         final = ev.get("result") or final
-        if ev.get("is_error") or ev.get("subtype") not in (None, "success"):
+        if ev.get("is_error"):
+            # claude tags auth failures with subtype "success" and a terminal
+            # api_error; recording that as err="success" made 25 journal
+            # entries read as wins. The error text itself lives in `result`.
+            err = ev.get("subtype") or "error"
+            if err == "success":
+                err = (ev.get("result") or "error")[:200]
+            if ev.get("api_error_status"):
+                err += f" ({ev['api_error_status']})"
+        elif ev.get("subtype") not in (None, "success"):
             err = ev.get("subtype") or "error"
             if ev.get("api_error_status"):
                 err += f" ({ev['api_error_status']})"
@@ -385,7 +535,11 @@ def agent_env() -> dict[str, str]:
     gate reports as the agent's code being broken, three attempts per issue,
     all night.
     """
-    env = {**os.environ, "FRANKENRUST_AGENT": "1"}
+    env = {**os.environ, "FRANKENRUST_AGENT": "1",
+           # An unattended fleet must not have its toolchain replaced under it:
+           # opencode auto-updates on startup, and a mid-run version change
+           # alters behaviour the reviewers and the gate already judged.
+           "OPENCODE_DISABLE_AUTOUPDATE": "1"}
     have = env.get("PATH", "").split(os.pathsep)
     extra = [str(Path.home() / ".cargo" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
     add = [p for p in extra if p not in have and Path(p).is_dir()]
@@ -398,28 +552,45 @@ def _hit_limit(logpath: Path) -> bool:
     if not logpath.exists():
         return False
     tail = logpath.read_text(errors="replace")[-4000:].lower()
-    return any(p in tail for p in CODEX_LIMIT_PATTERNS)
+    return any(p in tail for p in LIMIT_PATTERNS)
+
+
+def _hit_auth(text: str) -> bool:
+    low = text.lower()
+    return any(p in low for p in AUTH_PATTERNS)
+
+
+# Who a cheap-quota agent falls back to when its quota dies mid-run.
+FALLBACK_AGENT = {"codex": "claude", "opencode": "claude"}
 
 
 def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
-           role: str = "implementer", escalate: bool = False) -> tuple[str, int, str]:
+           role: str = "implementer", escalate: bool = False,
+           model: str | None = None, timeout: int = AGENT_TIMEOUT) -> tuple[str, int, str]:
     """Run an agent. Returns (agent_used, rc, output_text).
 
-    Prompt goes over stdin so we never hit argv limits. If codex dies on quota
-    it is disabled for the run and the same prompt retried on claude -- a quota
-    wall should cost one wasted invocation, not a whole issue.
+    Prompt goes over stdin so we never hit argv limits. If codex or opencode
+    dies on quota it is disabled for the run and the same prompt retried on
+    claude -- a quota wall should cost one wasted invocation, not a whole
+    issue. `model` overrides the role's model for opencode (the duel
+    rotation's model pair).
     """
     logdir.mkdir(parents=True, exist_ok=True)
     (logdir / f"prompt.{tag}.md").write_text(prompt)
     pf = logdir / f"prompt.{tag}.md"
-    use, model = resolve(agent, role, escalate)
+    try:
+        use, model = resolve(agent, role, escalate, model)
+    except NoAgentUsable as exc:
+        log(f"    !! no agent usable for {tag} ({exc}); nothing spawned")
+        record("agent_unavailable", agent=agent, tag=tag, role=role)
+        return None, 1, ""
     rc, logpath = 1, logdir / f"{use}.{tag}.log"
     lastmsg = logdir / f"{use}.{tag}.final.txt"
     for _ in range(2):
         logpath = logdir / f"{use}.{tag}.log"
-        # Named per agent so the codex run and a claude retry of the same tag
-        # cannot read each other's verdict, and unlinked first so a crashed run
-        # inherits nothing from the attempt before it.
+        # Named per agent so a cheap-agent run and a claude retry of the same
+        # tag cannot read each other's verdict, and unlinked first so a crashed
+        # run inherits nothing from the attempt before it.
         lastmsg = logdir / f"{use}.{tag}.final.txt"
         lastmsg.unlink(missing_ok=True)
         log(f"    -> {use}{f'({model})' if model else ''} {tag} ({wt.name})")
@@ -438,15 +609,15 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
                     rc = proc.wait(timeout=HEARTBEAT)
                 except subprocess.TimeoutExpired:
                     waited = time.time() - started
-                    if waited >= AGENT_TIMEOUT:
+                    if waited >= timeout:
                         proc.kill()
-                        log(f"    !! {use} timed out after {AGENT_TIMEOUT}s")
+                        log(f"    !! {use} timed out after {timeout}s")
                         record("agent_timeout", agent=use, tag=tag,
-                               seconds=AGENT_TIMEOUT)
+                               seconds=timeout)
                         return use, 124, ""
                     kb = logpath.stat().st_size // 1024 if logpath.exists() else 0
                     log(f"    .. {tag} running {int(waited // 60)}m"
-                        f" (limit {AGENT_TIMEOUT // 60}m, {kb}KB)")
+                        f" (limit {timeout // 60}m, {kb}KB)")
         text, err = _final_text(logpath, use, lastmsg)
         if err or rc != 0:
             # Say what went wrong at the point it goes wrong. A silent failure
@@ -456,11 +627,30 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
             record("agent_error", agent=use, tag=tag, rc=rc, reason=err)
         # Require BOTH a failure and a quota pattern: "429"/"rate limit" appear
         # legitimately in the output of an agent writing an HTTP server.
-        if use == "codex" and rc != 0 and _hit_limit(logpath):
-            record("agent_fallback", agent="codex", to="claude", tag=tag, rc=rc)
-            disable_codex(f"exit {rc} with a quota pattern")
-            use, model = resolve("codex", role, escalate)
+        if use in FALLBACK_AGENT and rc != 0 and _hit_limit(logpath):
+            to = FALLBACK_AGENT[use]
+            record("agent_fallback", agent=use, to=to, tag=tag, rc=rc)
+            _disable_agent(use, f"exit {rc} with a quota pattern")
+            try:
+                use, model = resolve(use, role, escalate)
+            except NoAgentUsable as exc:
+                # The fallback claude is disabled too: nothing left to retry
+                # on, so stop the retry loop and report what the first agent
+                # said, named honestly as the agent that ran.
+                log(f"    !! no agent usable after disabling {use} ({exc})")
+                record("agent_unavailable", agent=use, tag=tag, role=role)
+                return None, rc, text
             continue
+        # claude is the terminal fallback: nothing retries after it, and an
+        # auth/quota failure cannot clear within a run. Re-running it per
+        # issue only burns the queue -- the 08-17 run marched 28 blocked
+        # issues through an auth-broken claude in 48s. Disabling it makes
+        # resolve() raise NoAgentUsable, and the recovery and claim lanes
+        # bail out cleanly instead of cascading.
+        if use == "claude" and rc != 0 and (
+                _hit_limit(logpath) or _hit_auth(f"{err}\n{text}")):
+            _disable_agent("claude", f"exit {rc} with an auth/quota failure")
+            break
         break
     return use, rc, text
 
@@ -810,9 +1000,26 @@ def guard_root_writes(tid: str, tag: str, root: Path = ROOT):
             for p in changed:
                 rc, _ = git(["cat-file", "-e", f"HEAD:{p}"], cwd=root)
                 (tracked if rc == 0 else untracked).append(p)
-            log(f"    !! stray write(s) to ROOT during {tag} ({tid}): {changed}")
+            log(f"    !! stray write(s) to ROOT during {tag} ({tid}): {changed} -- "
+                f"tracked content reverted to HEAD, so any uncommitted local "
+                f"edits on those paths are destroyed; see the root_write "
+                f"journal event for the reverted diff")
+            # Capture what is about to be destroyed, per path, while it still
+            # exists on disk: the checkout below erases the only copy of any
+            # legitimate uncommitted edit layered under the stray, and the
+            # guard's own docstring says nothing can tell the two apart. The
+            # journal entry then doubles as a recovery source -- a human who
+            # lost an hour of edits to an agent's window can lift their work
+            # out of the diff instead of rewriting it. `root_write` fires on
+            # the rare stray path (~2 of 3900+ events), so a diff payload is
+            # not a journal-bloat risk.
+            reverted_diff: dict[str, str] = {}
+            for p in tracked:
+                rc, out = git(["diff", "HEAD", "--", p], cwd=root)
+                reverted_diff[p] = out if rc == 0 else f"(diff failed: {out[-200:]})"
             record("root_write", issue=tid, stage=tag, paths=changed,
-                   reverted=tracked, not_reverted=untracked)
+                   reverted=tracked, not_reverted=untracked,
+                   reverted_diff=reverted_diff)
             # `git checkout HEAD -- <path>` takes <root>/.git/index.lock to
             # rewrite the index entry, and git does not retry a contended
             # lock. merge_worktree holds _merge_lock across its
@@ -981,14 +1188,6 @@ SILENT_REVIEW = (
     "is unchanged and the review will be retried."
 )
 
-# Who was *asked* to review: index 1 is always claude, index 2 is always codex
-# (falling back to claude inside invoke() once codex is out of quota). This is
-# the roster, not the attendance sheet -- review_stage() seeds its results from
-# it so a reviewer that never came back at all still counts as one that owes a
-# verdict, and retries only the indices that went silent. What actually ran is
-# invoke()'s first return value, and that is what names a reviewer in public.
-REVIEWER_AGENTS = {1: "claude", 2: "codex"}
-
 
 def review_summary(verdicts: dict[int, str], agents: dict[int, str]) -> str:
     """What the closing comment should claim happened, from a round's verdicts.
@@ -1001,15 +1200,16 @@ def review_summary(verdicts: dict[int, str], agents: dict[int, str]) -> str:
 
     `agents` is who actually ran, captured from invoke(); naming from
     REVIEWER_AGENTS instead would name who was asked, and those differ exactly
-    when it matters. resolve() turns reviewer 2's "codex" into claude the
+    when it matters. resolve() turns either slot's "opencode" into claude the
     moment the quota latch is armed, so the table credits the diff to a vendor
     that never opened it: replaying #40's own verdicts on a latched run,
-    {1: silent, 2: pass} read out as "one adversarial review (codex)" when what
-    happened was claude dying and claude passing. That is #40's false record
-    one field over, and a *stronger* claim than the sentence it replaced.
-    Deriving from what ran also drops the old reliance on codex_ok() at close()
-    time -- a run-global latch another worker can arm twenty minutes after this
-    round's codex reviewer read the diff perfectly well.
+    {1: silent, 2: pass} read out as "one adversarial review (opencode)" when
+    what happened was claude dying and claude passing. That is #40's false
+    record one field over, and a *stronger* claim than the sentence it
+    replaced. Deriving from what ran also drops the old reliance on
+    codex_ok()/opencode_ok() at close() time -- run-global latches another
+    worker can arm twenty minutes after this round's cheap reviewer read the
+    diff perfectly well.
     """
     def name(i: int) -> str:
         return agents.get(i) or "an agent that did not identify itself"
@@ -1024,8 +1224,16 @@ def review_summary(verdicts: dict[int, str], agents: dict[int, str]) -> str:
     reported = [name(i) for i, v in sorted(verdicts.items()) if v != "silent"]
     if not any(v == "silent" for v in verdicts.values()):
         seen = sorted(set(reported))
-        return (f"two adversarial reviews ({' + '.join(seen)})" if len(seen) > 1
-                else f"two adversarial reviews, both {seen[0]} — codex was unavailable")
+        if len(seen) > 1:
+            return f"two adversarial reviews ({' + '.join(seen)})"
+        # Both surviving reviews came from one vendor. Say who was asked and
+        # never came back, deriving it from the round rather than hardcoding
+        # the vendor: whichever reviewer 2 is configured to be, this is the
+        # sentence that admits it did not read the diff.
+        missing = sorted({a for a in REVIEWER_AGENTS.values()} - set(agents.values()))
+        return (f"two adversarial reviews, both {seen[0]} — "
+                f"{' + '.join(missing)} was unavailable" if missing
+                else f"two adversarial reviews, both {seen[0]}")
     if not reported:
         return ("no adversarial review at all: every reviewer was killed by the "
                 f"{AGENT_TIMEOUT // 60}-minute timeout (or crashed) and did not "
@@ -1180,7 +1388,7 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
     a quota wall -- gets exactly one retry, into a `.retry`-suffixed tag, same
     prompt. That is a harness fault, not a finding, and the cheap correct
     response to a harness fault is to run it again: invoke() already does this
-    one level down for a codex quota wall. Retrying blindly reads a real BLOCK
+    one level down for a cheap-agent quota wall. Retrying blindly reads a real BLOCK
     as silence and asks for it twice, so only reviewers review_outcome actually
     classified as silent -- never one that blocked -- are re-run.
 
@@ -1234,8 +1442,8 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
             record("agent_error", agent=agent, tag=rtag, rc=None, reason=repr(exc))
             return
         # The agent that ran, not the one requested: invoke() returns claude in
-        # codex's slot once the quota latch is armed, and review_summary must
-        # name whoever actually read the diff.
+        # reviewer 2's slot once the quota latch is armed, and review_summary
+        # must name whoever actually read the diff.
         agents[idx] = use
         results[idx] = text
 
@@ -1268,8 +1476,8 @@ def review_stage(issue: gh.Issue, wt: Path, logdir: Path,
         return blocking, verdicts
 
     # Cross-model on purpose: two instances of one model reviewing a diff behave
-    # closer to one reviewer than to two. Once codex is out of quota both become
-    # Opus, losing vendor diversity but keeping independent contexts.
+    # closer to one reviewer than to two. Once reviewer 2's quota dies both
+    # become Opus, losing vendor diversity but keeping independent contexts.
     #
     # Reviewers run cwd=wt, not cwd=ROOT, but full tool access means nothing
     # stops one from cd-ing there and writing -- guard the whole bracket,
@@ -1304,7 +1512,7 @@ def resolve_question(issue: gh.Issue, wt: Path, logdir: Path, critique: str) -> 
                   "REWRITE is no longer available to you. Decide PROCEED or "
                   "CLOSE, and justify it.\n")
     with guard_root_writes(str(issue.number), f"resolve.{rounds}"):
-        _, _, out = invoke("claude", wt, prompt_for("resolver", issue, extra),
+        _, _, out = invoke(ROLE_AGENT["resolver"], wt, prompt_for("resolver", issue, extra),
                            logdir, f"resolve.{rounds}", role="resolver")
 
     if "RESOLUTION: PROCEED" in out:
@@ -1347,7 +1555,21 @@ def recover_blocked() -> int:
     again immediately rather than sleeping on a queue that just changed.
     """
     recovered = 0
+    if no_agent_usable():
+        # Belt and suspenders under cmd_unblock's own bail: agents can be
+        # disabled mid-recovery (the last one dies inside this call's last
+        # invoke), and this lane should not walk the queue spawning nothing.
+        log("!! all agents disabled; nothing can recover")
+        return 0
     for issue, waiting in gh.blocked_needing_recovery():
+        # The caller's wallclock check only runs between recover_blocked()
+        # calls, and this loop walks the whole blocked queue in one call -- so
+        # without this, a queue of 30 blocked issues overruns the wallclock by
+        # however long the tail of the queue takes. Stop *starting* new
+        # recoveries past the budget; the one in flight completes (its
+        # worktree is crash-preserved either way).
+        if time.time() - _start > WALLCLOCK_LIMIT:
+            break
         if issue.recoveries >= MAX_RECOVERIES:
             # Say this once. The poll that calls us re-runs every 30s while the
             # queue is waiting on dependencies, which is exactly the state a
@@ -1379,8 +1601,9 @@ def recover_blocked() -> int:
                      f"(absolute path; you are in a worktree).\n"
                      f"Rescue {issue.recoveries + 1} of {MAX_RECOVERIES}.\n")
             with guard_root_writes(tid, f"unblock.{issue.recoveries}"):
-                _, _, out = invoke("claude", wt, prompt_for("unblocker", issue, extra),
-                                   logdir, f"unblock.{issue.recoveries}", role="unblocker")
+                _, _, out = invoke(ROLE_AGENT["unblocker"], wt, prompt_for("unblocker", issue, extra),
+                                   logdir, f"unblock.{issue.recoveries}",
+                                   role="unblocker", timeout=UNBLOCKER_TIMEOUT)
 
             if "RECOVERY: CLOSE" in out:
                 gh.close(issue.number,
@@ -1472,24 +1695,28 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
         restore_worktree(wt, critic_snapshot)
 
     failure: str | None = None
-    agents = ["codex", "claude"] if issue.agent == "duel" else [issue.agent]
+    agents = DUEL_AGENTS if issue.agent == "duel" else [issue.agent]
+    duel = issue.agent == "duel"
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         agent = agents[(attempt - 1) % len(agents)]
+        # A duel alternates the model pair as well as the agent pair: attempt 1
+        # on the first model, attempt 2 on the second, and so on.
+        model = DUEL_MODELS[(attempt - 1) % len(DUEL_MODELS)] if duel else None
         extra = ""
         if failure:
             extra = ("\n# The previous attempt FAILED\nFix the root cause; do not "
                      f"paper over it.\n\n```\n{failure[-6000:]}\n```\n")
         with guard_root_writes(tid, f"impl.{attempt}"):
-            invoke(agent, wt, prompt_for("implementer", issue, extra), logdir,
-                   f"impl.{attempt}", role="implementer",
-                   escalate=(attempt >= MAX_ATTEMPTS))
+            used, _, _ = invoke(agent, wt, prompt_for("implementer", issue, extra),
+                                logdir, f"impl.{attempt}", role="implementer",
+                                model=model, escalate=(attempt >= MAX_ATTEMPTS))
 
         rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
                        logdir / f"gate.{attempt}.log")
         if rc != 0:
             log(f"    xx gate failed (#{issue.number} attempt {attempt})")
-            record("gate_fail", issue=issue.number, attempt=attempt, agent=agent,
+            record("gate_fail", issue=issue.number, attempt=attempt, agent=used,
                    gate=issue.gate, tail=tail[-1500:])
             failure = tail
             continue
@@ -1502,7 +1729,11 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
         # closed. Spend the attempt instead.
         if not worktree_diff(wt).strip():
             log(f"    xx #{issue.number} attempt {attempt} changed nothing")
-            record("empty_diff", issue=issue.number, attempt=attempt, agent=agent)
+            # `used`, not `agent`: the rotation slot is what was REQUESTED;
+            # invoke() may have fallen back to claude on a quota latch, and
+            # the journal must name who actually ran. #14's unblocker was
+            # misled by exactly this field.
+            record("empty_diff", issue=issue.number, attempt=attempt, agent=used)
             failure = ("You changed no files. The gate passing means only that you "
                        "broke nothing; it is not evidence of work.")
             continue
@@ -1520,8 +1751,8 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             record("review_block", issue=issue.number, attempt=attempt,
                    phase="initial", excerpt=blocking[:1500])
             with guard_root_writes(tid, f"fix.{attempt}"):
-                invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"), logdir,
-                       f"fix.{attempt}", role="fixer")
+                fused, _, _ = invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"),
+                                     logdir, f"fix.{attempt}", role="fixer", model=model)
             rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
                            logdir / f"gate.fix.{attempt}.log")
             if rc != 0:
@@ -1554,7 +1785,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             if not worktree_diff(wt).strip():
                 log(f"    xx #{issue.number} attempt {attempt} fixer left nothing to merge")
                 record("empty_diff", issue=issue.number, attempt=attempt,
-                       agent=agent, phase="post-fix")
+                       agent=fused, phase="post-fix")
                 failure = ("The fixer removed the work rather than fixing it. "
                            "The gate passing on an empty diff means only that "
                            "nothing is broken; it is not evidence of a fix.")
@@ -1564,17 +1795,18 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             _, sha = git(["rev-parse", "--short", "HEAD"])
             # Say which reviewers actually ran. "Two adversarial reviews" reads
             # as cross-model review whether or not that is what happened, and
-            # once codex is walled off it is two runs of one model -- a weaker
-            # claim that the morning reader deserves to see on the issue. And
-            # if a reviewer was still silent after review_stage()'s retry, this
-            # is one review, not two (#139). Both facts come from the round
-            # itself, never from the static roster or a run-global latch.
+            # once reviewer 2 is walled off it is two runs of one model -- a
+            # weaker claim that the morning reader deserves to see on the
+            # issue. And if a reviewer was still silent after review_stage()'s
+            # retry, this is one review, not two (#139). Both facts come from
+            # the round itself, never from the static roster or a run-global
+            # latch.
             reviewed = review_summary(verdicts, reviewers)
             gh.close(issue.number,
                      f"Merged as `{sha}` after {attempt} attempt(s), gate `{issue.gate}`, "
                      f"and {reviewed}.")
             record("merged", issue=issue.number, title=issue.title,
-                   attempts=attempt, agent=agent, gate=issue.gate)
+                   attempts=attempt, agent=used, gate=issue.gate)
             _merge_signal.set()
             return
         failure = "Passed gate and review but could not merge (rebase conflict or "\
@@ -1591,7 +1823,7 @@ def cmd_seed() -> int:
     wt = ROOT
     p = "\n".join([(PROMPTS / "shared.md").read_text(),
                    (PROMPTS / "planner.md").read_text()])
-    invoke("claude", wt, p, LOGS / "seed", "seed", role="planner")
+    invoke(ROLE_AGENT["planner"], wt, p, LOGS / "seed", "seed", role="planner")
     issues = gh.fetch(label="fr:ready")
     log(f"seeded: {len(issues)} ready issues")
     for i in issues:
@@ -1600,19 +1832,20 @@ def cmd_seed() -> int:
 
 
 def _retro_artifacts(cycle: int) -> list[Path]:
+    retro_agent = ROLE_AGENT["retro"]
     return [
         LOGS / f"retro-{cycle}.md",
         LOGS / "retro" / f"prompt.r{cycle}.md",
-        LOGS / "retro" / f"claude.r{cycle}.log",
-        LOGS / "retro" / f"claude.r{cycle}.final.txt",
+        LOGS / "retro" / f"{retro_agent}.r{cycle}.log",
+        LOGS / "retro" / f"{retro_agent}.r{cycle}.final.txt",
     ]
 
 
 _RETRO_ARTIFACT_PATTERNS = [
     (lambda: LOGS, re.compile(r"^retro-(\d+)\.md$")),
     (lambda: LOGS / "retro", re.compile(r"^prompt\.r(\d+)\.md$")),
-    (lambda: LOGS / "retro", re.compile(r"^claude\.r(\d+)\.log$")),
-    (lambda: LOGS / "retro", re.compile(r"^claude\.r(\d+)\.final\.txt$")),
+    (lambda: LOGS / "retro", re.compile(r"^(\w+)\.r(\d+)\.log$")),
+    (lambda: LOGS / "retro", re.compile(r"^(\w+)\.r(\d+)\.final\.txt$")),
 ]
 
 
@@ -1824,7 +2057,8 @@ def retrospective(cycle: int | str) -> None:
     # analysed. Comparing states rather than deleting keeps the older run's
     # findings on disk.
     before = _report_state(report)
-    _, rc, text = invoke("claude", ROOT, p, LOGS / "retro", f"r{cycle}", role="critic")
+    _, rc, text = invoke(ROLE_AGENT["retro"], ROOT, p, LOGS / "retro",
+                         f"r{cycle}", role="critic")
     # Only a pass that demonstrably produced analysis may advance the
     # watermark. invoke() drops the error reason _final_text() returns
     # alongside its text (see _final_text()/invoke()), so an API-error result
@@ -1907,8 +2141,9 @@ def restart_into_new_code() -> None:
     left = max(int(WALLCLOCK_LIMIT - (time.time() - _start)), 60)
     env = {**os.environ, "FR_WALLCLOCK": str(left),
            "FR_RESTARTS": str(int(os.environ.get("FR_RESTARTS", "0")) + 1)}
+    mode = sys.argv[1] if len(sys.argv) > 1 else "run"
     os.execve(sys.executable,
-              [sys.executable, str(Path(__file__).resolve()), "run"], env)
+              [sys.executable, str(Path(__file__).resolve()), mode], env)
 
 
 def cmd_run() -> int:
@@ -1974,6 +2209,15 @@ def cmd_run() -> int:
                 log("!! wallclock limit reached, stopping")
                 break
 
+            if no_agent_usable():
+                # Every agent is disabled (quota/auth walls). Claims would
+                # burn the queue the same way the 08-17 recovery cascade did.
+                # In-flight futures still complete -- same `break` semantics
+                # as the wallclock, down through shutdown(wait=True).
+                log("!! all agents disabled; claiming nothing further")
+                record("no_agent_usable", phase="claim_lane")
+                break
+
             reap()  # opportunistic, non-blocking: free capacity before budgeting
 
             # No new claims once a self-update is pending -- swapping the
@@ -1989,12 +2233,12 @@ def cmd_run() -> int:
                 break  # unreachable once restart_into_new_code() execve's;
                        # kept so this loop is correct on its own terms too.
 
-            # Recover before claiming, so anything rescued is claimable in this
-            # same round. Cheap when there is nothing to do -- blocked_needing_recovery
-            # only reaches an agent for a block that other open issues wait on.
-            recover_blocked()
-            # Mirror the dependency filter onto the labels. Only writes on a
-            # change, so a queue in steady state costs one read.
+            # Recovery is a lane of its own now (loop.py unblock, supervised
+            # alongside this one): a blocked issue and the work it gates make
+            # progress at the same time, instead of this loop parking every
+            # claim -- and every wallclock check -- for the duration of the
+            # whole blocked queue. This lane only mirrors the dependency
+            # filter onto the labels.
             added, removed = gh.sync_waiting()
             if added or removed:
                 log(f"fr:waiting +{added} -{removed}")
@@ -2094,6 +2338,52 @@ def cmd_run() -> int:
     return 0 if not blocked else 1
 
 
+def cmd_unblock() -> int:
+    """The recovery lane: rescue blocked issues while the claim lane drains.
+
+    A separate process from `run`, and the recovery that used to live inline
+    in the claim loop. Inline meant serial and unbounded: recover_blocked()
+    walks the whole blocked queue in one call, so the claim loop -- its
+    claims, its drain detection, its wallclock check -- suspended for the
+    duration of every blocked issue's unblock. This lane owns all of fr:blocked
+    (the run lane never touches it), runs for its own FR_WALLCLOCK, and is
+    supervised alongside `run`, so a block and the work it gates make progress
+    at the same time. The only shared state is GitHub labels, which is the
+    mutex: this lane never claims, and the run lane never unblocks.
+    """
+    gh.ensure_labels()
+    log(f"unblock lane start: wallclock={WALLCLOCK_LIMIT}s")
+    recovered = 0
+    while True:
+        if time.time() - _start > WALLCLOCK_LIMIT:
+            log("!! unblock wallclock limit reached, stopping")
+            break
+        if no_agent_usable():
+            # Every agent is disabled (quota/auth walls). A recovery lane
+            # that can spawn nothing is worse than no lane: it would walk
+            # the blocked queue creating and destroying worktrees forever.
+            # Stop so the supervisor can surface the exit; a fresh start
+            # (without the FR_*_DISABLED env this process inherited) can
+            # retry once the walls clear.
+            log("!! all agents disabled; unblock lane stopping")
+            record("no_agent_usable", phase="unblock_lane")
+            break
+        if self_update_pending():
+            restart_into_new_code()
+            break  # unreachable once restart_into_new_code() execve's
+        n = recover_blocked()
+        recovered += n
+        # Keep the wait annotations current even if the run lane is down.
+        added, removed = gh.sync_waiting()
+        if added or removed:
+            log(f"fr:waiting +{added} -{removed}")
+        time.sleep(5 if n else 30)
+    stuck = gh.blocked_needing_recovery()
+    log(f"unblock lane end: recovered={recovered} "
+        f"still-blocked={[i.number for i, _ in stuck]}")
+    return 0 if not stuck else 1
+
+
 def cmd_status() -> int:
     for label in ("fr:ready", "fr:waiting", "fr:claimed", "fr:blocked", "fr:questioned"):
         items = gh.fetch(label=label)
@@ -2122,7 +2412,7 @@ def cmd_status() -> int:
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     return {"run": cmd_run, "seed": cmd_seed, "status": cmd_status,
-            "retro": cmd_retro}.get(
+            "retro": cmd_retro, "unblock": cmd_unblock}.get(
         cmd, lambda: (print(__doc__), 2)[1])()
 
 

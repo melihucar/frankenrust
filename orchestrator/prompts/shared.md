@@ -54,7 +54,7 @@ frozen list.
 
   ```
   Gate: bootstrap | default | bench
-  Agent: codex | claude | duel
+  Agent: codex | claude | opencode | duel
   Depends on: #12, #13
   ```
 
@@ -62,8 +62,8 @@ frozen list.
   `Depends on: none`, which parses to no dependencies *and* logs a warning that
   the line was unreadable. `Gate:` and `Agent:` are not optional in practice:
   leaving them out does not mean "the loop picks", it means the loop silently
-  applies `default` and `codex`, and it was measured doing exactly that to 15
-  and 19 open issues respectively. `default` demands build + fmt + clippy +
+  applies `default` and `opencode`, and it was measured doing exactly that to
+  15 and 19 open issues respectively. `default` demands build + fmt + clippy +
   tests + conformance, so a docs correction that inherits it fails a gate it
   cannot satisfy, three times, and lands in `fr:blocked`.
 
@@ -72,8 +72,13 @@ frozen list.
   - `Gate: bootstrap` for anything producing no Rust — docs, prompts, scripts,
     orchestrator changes. `default` when you are changing Rust that must build
     and pass conformance. `bench` only for benchmark work.
-  - `Agent: codex` for mechanical grind, `claude` for design-heavy work, `duel`
-    for the genuinely hard (the two alternate on failure).
+  - `Agent: opencode` is the default for everything right now — the loop is
+    testing end to end on opencode's free models. `claude` (or `codex`) opts
+    an issue into the split the config restores when the weekly quota resets:
+    the judgement roles move back to claude via `orchestrator/config.py` /
+    `.env`, so an issue filed with `claude` today will not be stranded by that
+    change. `duel` for the genuinely hard (the rotation alternates opencode
+    models on failure).
   - **Priority is a label, not a body line**, and it decides what the loop
     claims next — it outranks how much an issue unblocks. Pick one:
 

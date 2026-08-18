@@ -1,6 +1,7 @@
 /orchestrator/worktrees/
 /orchestrator/logs/
 /orchestrator/queue/
+/orchestrator/.env
 /target/
 __pycache__/
 *.pyc

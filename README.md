@@ -89,21 +89,58 @@ weaken.
 ```sh
 python3 orchestrator/loop.py seed      # planner agent files the initial issues
 python3 orchestrator/loop.py run       # drain the queue
+python3 orchestrator/loop.py unblock   # recovery lane: rescue fr:blocked issues
 python3 orchestrator/loop.py status    # ready / claimed / blocked / questioned
 python3 orchestrator/loop.py retro     # retrospective on demand
 ```
 
-Knobs: `FR_PARALLEL` (3), `FR_ATTEMPTS` (3), `FR_WALLCLOCK` (8h),
-`FR_AGENT_TIMEOUT` (1h/attempt), `FR_MAX_REVISIONS` (2 re-scopes per issue).
-Models: `FR_MODEL_IMPL` (Sonnet), `FR_MODEL_REVIEW`/`FR_MODEL_CRITIC` (Opus).
+`run` and `unblock` are **lanes** — separate processes meant to run together
+under `scripts/supervise.sh run unblock`, each with its own log and restart
+budget. Recovery used to run inline in the claim loop, walking the whole
+blocked queue in one call and suspending claims — and the wallclock check —
+for the duration; the lanes share nothing but GitHub labels (the mutex: `run`
+touches `fr:ready`/`fr:claimed`, `unblock` touches `fr:blocked`) and the
+flock-guarded journal, so they make progress at the same time.
 
-Codex runs on a separate quota. When it runs out mid-run the loop detects it,
-falls back to Claude for everything remaining, and keeps going.
+Knobs: `FR_PARALLEL` (3), `FR_ATTEMPTS` (3), `FR_WALLCLOCK` (8h),
+`FR_AGENT_TIMEOUT` (1h/attempt), `FR_UNBLOCKER_TIMEOUT` (25m/unblock —
+the recovery lane's budget is usually 30-60m, so a 1h unblock consumes the
+whole lane), `FR_MAX_REVISIONS` (2 re-scopes per issue).
+Who runs what, and with which model, lives in **`orchestrator/config.py`** —
+the weekly split change is a one-line edit there (or a `FR_*` value in
+`orchestrator/.env`, copied from `.env.example`). Precedence: real
+environment variables > `.env` file > config.py defaults. The knobs:
+`FR_AGENT_<ROLE>` (implementer/fixer/critic/reviewer/planner/resolver/
+unblocker/retro), `FR_MODEL_<ROLE>` (claude table), `FR_OPENCODE_MODEL_<ROLE>`
+(opencode table), `FR_REVIEWER1`/`FR_REVIEWER2` (review roster),
+`FR_DUEL_AGENTS`/`FR_DUEL_MODELS` (duel rotation), `FR_MODEL_ESCALATE`/
+`FR_OPENCODE_MODEL_ESCALATE` (final attempt of a failing issue).
+
+Right now everything defaults to **opencode** on free models — the run is
+testing end to end, and claude is quota-starved. **claude** and **codex** stay
+fully wired (`Agent: codex` in an issue body opts the issue into codex), so
+the day the weekly limit resets, moving the judgement roles (review, critic,
+resolver) back to claude is a config change, not a code change. Codex and
+opencode run on quotas that can run out mid-run. When one does, the loop
+detects it, falls back to claude for everything remaining, and keeps going.
 
 **You have to start it yourself.** The agents run with permission prompts
 disabled — that is what "unattended" requires — and authorizing a multi-hour
 agent fleet with that much latitude is a decision for you to make, not something
 to be started on your behalf. Logs land in `orchestrator/logs/<task-id>/`.
+
+**Do not edit tracked files in the repo root while a lane is running.** Every
+worktree agent stage is bracketed by `guard_root_writes()` (loop.py), which
+reverts any tracked path in ROOT that changed during the stage — an agent
+straying out of its worktree would otherwise poison the prompts the next stage
+reads. The guard cannot tell an agent's stray write from your own uncommitted
+edits in the same file; both are reverted, and it has eaten human work twice
+already. Untouched files are safe; the risk is only for files a running agent
+could plausibly touch. If your edit vanishes, the `root_write` event in
+`orchestrator/logs/events.jsonl` names the path and the stage that reverted it
+(and carries the reverted diff, since the content no longer exists on disk).
+Wait for a quiet moment — no agents in flight — before editing, and re-check
+`git status` afterwards.
 
 ### How an issue is processed
 
@@ -112,11 +149,12 @@ claim ─► critic ─┬─ REVISE ─► resolver ─┬─ REWRITE ─► re
                  │                      ├─ CLOSE   ─► killed, with evidence
                  │                      └─ PROCEED ─┐ (critic overruled)
                  └─ PROCEED ────────────────────────┴─► implementer
-                        │
-                        └─► gate ─┬─ fail ─► retry (≤3, escalating model)
-                                  └─ pass ─► 2 adversarial reviewers
-                                      (claude + codex, independent
-                                       contexts, diff only)
+                         │
+└─► gate ─┬─ fail ─► retry (≤3, escalating model)
+                                    └─ pass ─► 2 adversarial reviewers
+                                        (both opencode right now;
+                                         cross-vendor slots via FR_REVIEWER1/2,
+                                         independent contexts, diff only)
                                         ├─ BLOCK ─► fixer ─► re-gate ─► re-review
                                         └─ PASS  ─► rebase, re-gate, merge, close
 ```

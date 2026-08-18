@@ -325,12 +325,23 @@ if ! docker volume inspect "$CARGO_HOME_VOLUME" >/dev/null 2>&1; then
     echo "-- reclaimed frankenrust-dev-cargo-registry (superseded by $CARGO_HOME_VOLUME)" >&2
 fi
 
+# Mounted at /target, NOT /work/target: a named volume nested under a bind
+# mount is incoherent under Docker Desktop's overlayfs driver (verified
+# 2026-08-18, Docker Desktop 29.7.2): cargo writes fingerprints and build
+# output that vanish mid-build -- "failed to load metadata for path
+# .../invoked.timestamp: No such file or directory" -- while the same volume
+# mounted at a top-level path is fully coherent in the same container, same
+# image, same build. CARGO_TARGET_DIR points cargo at the top-level mount;
+# fingerprints are keyed on the SOURCE path (/work, identical across
+# worktrees) not the target path, so the per-worktree-volume collision
+# rationale above is unchanged.
 exec docker run --rm \
   --platform linux/arm64 \
   --entrypoint "" \
   -v "$WORKTREE:/work" \
-  -v "$TARGET_VOLUME:/work/target" \
+  -v "$TARGET_VOLUME:/target" \
   -e "CARGO_HOME=$CARGO_HOME_IN_CONTAINER" \
+  -e "CARGO_TARGET_DIR=/target" \
   -v "$CARGO_HOME_VOLUME:$CARGO_HOME_IN_CONTAINER" \
   -w /work \
   "$IMAGE" "$@"

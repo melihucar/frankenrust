@@ -318,7 +318,7 @@ def check_blocked_has_a_recovery_path() -> int:
     bad = 0
     if not (ROOT / "orchestrator" / "prompts" / "unblocker.md").exists():
         bad += fail("no prompts/unblocker.md: fr:blocked has no recovery role")
-    for name in ("recover_blocked",):
+    for name in ("recover_blocked", "cmd_unblock"):
         if not hasattr(loop, name):
             bad += fail(f"loop.{name}() is gone; fr:blocked is absorbing again")
     for name in ("blocked_needing_recovery", "unblock"):
@@ -357,11 +357,33 @@ def check_blocked_has_a_recovery_path() -> int:
         bad += fail(f"recovery order regressed: got {order}, want [1, 2] "
                     "(most dependants first, leaves last but never dropped)")
 
-    # ...and cmd_run must actually call it, before claiming.
-    run_src = (ROOT / "orchestrator" / "loop.py").read_text().split("def cmd_run")[-1]
-    if "recover_blocked()" not in run_src:
-        bad += fail("cmd_run() never calls recover_blocked(); the recovery exists "
-                    "but nothing triggers it")
+    # ...and something must actually call it. Recovery is its own lane now:
+    # `loop.py unblock` is a separate process supervised alongside the claim
+    # lane, so a block and the work it gates make progress at the same time.
+    # That only holds if the lanes are actually separated -- recovery creeping
+    # back into the claim loop would resurrect the serial stall it exists to
+    # remove (recover_blocked() walks the whole blocked queue in one call, so
+    # even a single inline call suspends claims and the wallclock for hours),
+    # so cmd_run must NOT recover, and cmd_unblock must.
+    src = (ROOT / "orchestrator" / "loop.py").read_text()
+
+    def body(name: str) -> str:
+        rest = src.split(f"def {name}")[-1]
+        return rest.split("\ndef ")[0]
+
+    if "recover_blocked()" in body("cmd_run"):
+        bad += fail("cmd_run() calls recover_blocked(); recovery belongs to the "
+                    "unblock lane, and a claim lane that recovers serializes "
+                    "every claim behind each unblock")
+    if "recover_blocked()" not in body("cmd_unblock"):
+        bad += fail("cmd_unblock() never calls recover_blocked(); the unblock "
+                    "lane exists but recovers nothing")
+    if '"unblock": cmd_unblock' not in src:
+        bad += fail("main() does not dispatch `loop.py unblock`; the lane "
+                    "cannot be started")
+    if "sys.argv[1]" not in body("restart_into_new_code"):
+        bad += fail("restart_into_new_code() re-execs into a hardcoded mode; "
+                    "an unblock lane self-update would come back as a run lane")
     return bad
 
 
@@ -497,11 +519,11 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
     no test did:
 
       * The closing comment must name the agent that *ran*, not the one the
-        REVIEWER_AGENTS roster asked for. resolve() turns reviewer 2's "codex"
-        into claude the instant the quota latch is armed, so naming from the
-        roster credits the diff to a vendor that never opened it -- on a
-        latched run, #40's own {1: silent, 2: pass} read out as "one
-        adversarial review (codex)" when claude died and claude passed. The
+        REVIEWER_AGENTS roster asked for. resolve() turns either slot's
+        "opencode" into claude the instant the quota latch is armed, so naming
+        from the roster credits the diff to a vendor that never opened it -- on
+        a latched run, #40's own {1: silent, 2: pass} read out as "one
+        adversarial review (opencode)" when claude died and claude passed. The
         stub therefore resolves its return value exactly as invoke() does.
       * A reviewer whose invoke() *raises* -- a renamed agent binary is a bare
         Popen FileNotFoundError, and invoke() is the one Popen site with no
@@ -530,6 +552,7 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
 
     real_invoke, real_record, real_log = loop.invoke, loop.record, loop.log
     real_codex_ok = loop.codex_ok
+    real_opencode_ok = loop.opencode_ok
     # Captured rather than dropped: a reviewer that dies has to leave evidence
     # in the journal the retrospective reads, not just a traceback on stderr.
     events: list[tuple[str, dict]] = []
@@ -539,24 +562,26 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
     def run_case(script: dict, latched: bool = False) -> tuple[tuple, list[str]]:
         """Script a round by tag. A BaseException value is raised, not returned.
 
-        `latched` pins codex_ok() rather than inheriting FR_CODEX_DISABLED from
-        whatever the ambient run happens to be, so both sides of the fallback
-        are covered deterministically.
+        `latched` pins codex_ok()/opencode_ok() rather than inheriting the
+        FR_*_DISABLED envs from whatever the ambient run happens to be, so
+        both sides of the fallback are covered deterministically.
         """
         calls: list[str] = []
         events.clear()
 
-        def stub(agent, wt, prompt, logdir, tag, role="implementer", escalate=False):
+        def stub(agent, wt, prompt, logdir, tag, role="implementer", escalate=False,
+             model=None):
             calls.append(tag)
             scripted = script.get(tag, "")
             if isinstance(scripted, BaseException):
                 raise scripted
             # invoke()'s first return value is the agent that ran *after*
-            # resolve()'s codex->claude fallback, not the one requested.
+            # resolve()'s cheap-agent->claude fallback, not the one requested.
             return loop.resolve(agent, "reviewer")[0], 0, scripted
 
         loop.invoke = stub
         loop.codex_ok = lambda: not latched
+        loop.opencode_ok = lambda: not latched
         with tempfile.TemporaryDirectory() as tmp:
             wt = Path(tmp) / "repo"
             make_repo(wt)
@@ -612,23 +637,24 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
             bad += fail(f"review_summary() must say one review happened, not "
                         f"two, when a reviewer stayed silent through the "
                         f"retry: {summary!r}")
-        if "codex" not in summary:
-            bad += fail(f"codex really did produce the surviving review here "
+        if "opencode" not in summary:
+            bad += fail(f"opencode really did produce the surviving review here "
                         f"and must be named: {summary!r}")
 
-        # The same round with the codex quota latch armed. Slot 2 is claude,
-        # so the surviving review is claude's and the sentence must say so:
-        # telling the morning reader a second vendor read a diff it never saw
-        # is #40's false record one field over.
+        # The same round with the opencode quota latch armed. Both slots
+        # asked for opencode, so both slots fall back to claude, and the
+        # surviving review is claude's -- the sentence must say so: telling
+        # the morning reader a second vendor read a diff it never saw is
+        # #40's false record one field over.
         (blocking, verdicts, reviewers), calls = run_case(still_silent, latched=True)
         if reviewers != {1: "claude", 2: "claude"}:
             bad += fail(f"review_stage must report the agents that ran, and "
                         f"under the latch both slots are claude -- a reviewer "
                         f"that timed out still returns from invoke(): {reviewers}")
         summary = loop.review_summary(verdicts, reviewers)
-        if "codex" in summary or "claude" not in summary:
-            bad += fail(f"with codex walled off, the surviving reviewer was "
-                        f"claude; the closing comment must not credit codex: "
+        if "opencode" in summary or "claude" not in summary:
+            bad += fail(f"with opencode walled off, the surviving reviewer was "
+                        f"claude; the closing comment must not credit opencode: "
                         f"{summary!r}")
 
         # A reviewer that dies hard rather than quietly: invoke() raises, the
@@ -684,6 +710,7 @@ def check_review_stage_retries_a_silent_reviewer() -> int:
     finally:
         loop.invoke, loop.record, loop.log = real_invoke, real_record, real_log
         loop.codex_ok = real_codex_ok
+        loop.opencode_ok = real_opencode_ok
     return bad
 
 
@@ -785,7 +812,7 @@ def check_filing_contract_is_stated() -> int:
     only filing guidance the other roles read -- specified none of it, so agents
     filed free-form prose into a queue that parses four structured fields out of
     it. Measured at the time: 15 of 49 open issues had no Gate: and 19 no Agent:,
-    silently inheriting `default` and `codex`. A docs fix that inherits `default`
+    silently inheriting `default` and `opencode`. A docs fix that inherits `default`
     fails a gate it cannot satisfy, three times, and lands in fr:blocked.
 
     Checked as a fenced template rather than by grepping for the field names.
@@ -891,11 +918,282 @@ def check_verdict_parsing() -> int:
             bad += fail(f"a codex run that produced no final message parsed as a "
                         f"verdict: {got[:120]!r}")
 
-    # And the wiring that makes the file exist in the first place.
+    # opencode streams NDJSON events, so the same discipline has a different
+    # shape: the verdict is the last `text` event, and an `error` event must
+    # invalidate whatever text came before it -- opencode exits 0 even on a
+    # failed run, so the log is the only place a quota wall shows up.
+    def opencode_parsed(tmp: Path, events: list[dict], final: str) -> str:
+        log = tmp / "opencode.review2.1.log"
+        log.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+        text, err = loop._final_text(log, "opencode", None)
+        return text if text else f"<no text: {err}>"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        echo = [{"type": "text", "part": {"type": "text",
+                "text": "I will check for VERDICT: BLOCK conditions"}},
+                {"type": "tool", "part": {"type": "tool", "tool": "bash"}}]
+        cases = [
+            ("a PASS whose earlier text quotes BLOCK", echo + [{"type": "text",
+             "part": {"type": "text", "text": "Checked every path. Nothing "
+             "blocking.\n\nVERDICT: PASS"}}], "VERDICT: PASS", "VERDICT: BLOCK"),
+            ("a real BLOCK still blocks", echo + [{"type": "text",
+             "part": {"type": "text", "text": "### leaks a subscriber\nFile: "
+             "a.rs:1\n\nVERDICT: BLOCK"}}], "VERDICT: BLOCK", None),
+            ("a critic PROCEED whose earlier text quotes REVISE", echo +
+             [{"type": "text", "part": {"type": "text", "text": "The spec "
+             "matches the oracle.\n\nVERDICT: PROCEED"}}], "VERDICT: PROCEED",
+             "VERDICT: REVISE"),
+        ]
+        for name, events, want, unwanted in cases:
+            got = opencode_parsed(d, events, "")
+            if want not in got:
+                bad += fail(f"opencode verdict parsing lost {want!r} on "
+                            f"{name}: {got[:120]!r}")
+            if unwanted and unwanted in got:
+                bad += fail(f"opencode verdict parsing read {unwanted!r} out "
+                            f"of {name} -- earlier text events are being read "
+                            "as the verdict")
+
+        # An error event after a clean-looking text event must void the text:
+        # a quota wall is a harness fault, not a finding.
+        got = opencode_parsed(d, echo + [{"type": "error", "error": {
+            "name": "UnknownError",
+            "data": {"message": "Rate limit exceeded, please try again"}}}], "")
+        if "VERDICT" in got:
+            bad += fail(f"an opencode run that ended in an error event parsed "
+                        f"as a verdict: {got[:120]!r}")
+
+        # A dead run -- no text, no error -- is not a verdict either.
+        got = opencode_parsed(d, [{"type": "step_start",
+                                   "part": {"type": "step-start"}}], "")
+        if "VERDICT" in got:
+            bad += fail(f"an opencode run with no final message parsed as a "
+                        f"verdict: {got[:120]!r}")
+
+    # And the wiring that makes the verdicts reachable in the first place.
     cmd = loop.agent_cmd("codex", None, Path("/tmp/fr-last.txt"))
     if "-o" not in cmd or "/tmp/fr-last.txt" not in cmd:
         bad += fail("agent_cmd no longer asks codex for its last message (-o); "
                     "verdicts fall back to transcript scraping")
+    cmd = loop.agent_cmd("opencode", "opencode/deepseek-v4-flash-free",
+                         Path("/tmp/fr-last.txt"))
+    for flag in ("--format", "json", "--auto", "-"):
+        if flag not in cmd:
+            bad += fail(f"agent_cmd no longer asks opencode for its event "
+                        f"stream ({flag}); verdicts are unreadable")
+    if "opencode/deepseek-v4-flash-free" not in cmd:
+        bad += fail("agent_cmd does not pass opencode's model through; every "
+                    "run falls back to the configured default")
+    return bad
+
+
+def check_agent_routing() -> int:
+    """resolve() must route requested agents to their agents/models.
+
+    The table this exercises is config.py, overlaid with whatever .env / FR_*
+    knobs the ambient run carries -- so every case here requests agents
+    explicitly (routing must hold under any override), and the committed
+    defaults themselves are pinned separately in a subprocess with the
+    environment stripped, by check_config_defaults().
+
+    This is the table every stage in the loop trusts: a wrong route here
+    silently moves implementation onto Opus (costs money for no gain) or a
+    reviewer onto a model the merge gate never meant to rely on, and neither
+    failure leaves a trace in the journal.
+    """
+    sys.path.insert(0, str(ROOT / "orchestrator"))
+    import loop
+    bad = 0
+
+    # Routing table: (requested, role, escalate, latch, want_agent, want_model,
+    # model_override, want_exc).
+    #
+    # Latching pins _disabled_agents directly. The alternative -- calling
+    # disable_<agent>() -- records review_diversity_lost into the MAIN
+    # journal, and gate.sh runs this check inside every gate, so every gate
+    # used to leave a fake diversity-loss record behind (observed 5x on
+    # 08-17/08-18). Once claude became disableable it would also have set
+    # FR_CLAUDE_DISABLED in gate subprocesses.
+    cases = [
+        ("claude", "implementer", False, None, "claude", loop.MODELS["implementer"],
+         None, None),
+        ("opencode", "implementer", False, None, "opencode",
+         loop.OPENCODE_MODELS["implementer"], None, None),
+        ("opencode", "reviewer", False, None, "opencode",
+         loop.OPENCODE_MODELS["reviewer"], None, None),
+        ("codex", "implementer", False, None, "codex", None, None, None),
+        ("claude", "implementer", True, None, "claude", loop.ESCALATED_MODEL, None,
+         None),
+        ("opencode", "implementer", True, None, "opencode",
+         loop.OPENCODE_ESCALATED_MODEL, None, None),
+        ("codex", "implementer", True, None, "claude", loop.ESCALATED_MODEL, None,
+         None),
+        ("opencode", "implementer", False, "opencode", "claude",
+         loop.MODELS["implementer"], None, None),
+        ("codex", "implementer", False, "codex", "claude",
+         loop.MODELS["implementer"], None, None),
+        # claude is the terminal fallback: with it latched nothing can route.
+        # resolve() must refuse loudly (NoAgentUsable) rather than return
+        # claude anyway and let the run cascade -- the 08-17 run marched 28
+        # blocked issues through an auth-broken claude before anything
+        # stopped it.
+        ("claude", "implementer", False, "claude", None, None, None,
+         loop.NoAgentUsable),
+        ("claude", "implementer", True, "claude", None, None, None,
+         loop.NoAgentUsable),
+        # The real 08-17 shape: cheap agent latched, and the claude it would
+        # fall back to latched too.
+        ("opencode", "implementer", False, {"opencode", "claude"}, None, None,
+         None, loop.NoAgentUsable),
+        # "duel" is a scheduling directive: a stage asking for the issue's
+        # agent without unwrapping the rotation routes to the role default.
+        # The want follows the configured critic, whatever the ambient run
+        # sets it to.
+        ("duel", "critic", False, None, loop.ROLE_AGENT["critic"],
+         (loop.OPENCODE_MODELS["critic"] if loop.ROLE_AGENT["critic"] == "opencode"
+          else loop.MODELS["critic"] if loop.ROLE_AGENT["critic"] == "claude"
+          else None), None, None),
+        # The duel rotation's model override threads through to opencode only.
+        ("opencode", "implementer", False, None, "opencode", "opencode/hy3-free",
+         "opencode/hy3-free", None),
+    ]
+    saved_ok = {a: getattr(loop, f"{a}_ok") for a in ("codex", "opencode")}
+    try:
+        for requested, role, escalate, latch, want_agent, want_model, override, want_exc in cases:
+            loop._disabled_agents = ({latch} if isinstance(latch, str)
+                                      else set(latch or ()))
+            try:
+                agent, model = loop.resolve(requested, role, escalate, override)
+            except Exception as exc:
+                if want_exc and isinstance(exc, want_exc):
+                    continue
+                bad += fail(f"resolve({requested!r}, {role!r}, escalate={escalate}"
+                            f", model={override!r}, latched={latch or ()!r}) raised "
+                            f"{exc!r}; want {want_exc or 'no exception'}")
+                continue
+            if want_exc:
+                bad += fail(f"resolve({requested!r}, {role!r}, escalate={escalate}"
+                            f", latched={latch or ()!r}) -> ({agent!r}, {model!r}); "
+                            f"want {want_exc.__name__}")
+                continue
+            if agent != want_agent or model != want_model:
+                bad += fail(f"resolve({requested!r}, {role!r}, escalate={escalate}"
+                            f", model={override!r}"
+                            f", latched={latch or ()!r}) -> "
+                            f"({agent!r}, {model!r}); want ({want_agent!r}, "
+                            f"{want_model!r})")
+        loop._disabled_agents = set()
+        try:
+            loop.resolve("bogus", "implementer")
+            bad += fail("resolve() accepted an unknown agent instead of "
+                        "failing loudly")
+        except ValueError:
+            pass
+    finally:
+        loop._disabled_agents = set()
+        for a, ok in saved_ok.items():
+            setattr(loop, f"{a}_ok", ok)
+    return bad
+
+
+def _clean_env() -> dict:
+    """The ambient environment with every FR_* knob stripped, so config.py's
+    committed defaults are tested, not the run's overrides."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("FR_")}
+    env["FR_ENV_FILE"] = os.devnull  # and ignore orchestrator/.env, if any
+    return env
+
+
+def check_config_defaults() -> int:
+    """config.py's committed defaults must be the all-opencode testing roster.
+
+    Everything runs on opencode's free models while the run tests end to end
+    (claude is quota-starved); claude/codex stay wired -- FR_AGENT_<ROLE>,
+    FR_REVIEWER1/2 and FR_MODEL_<ROLE> restore the implementation-cheap /
+    judgement-strong split the day the quota resets. The check runs in a
+    subprocess with the environment stripped: an ambient .env or exported
+    FR_* knob must not be able to fake a pass.
+    """
+    bad = 0
+    probe = (
+        "import config\n"
+        "t = config.ROLE_AGENT\n"
+        "assert all(a == 'opencode' for a in t.values()), t\n"
+        "assert config.REVIEWER_AGENTS == {1: 'opencode', 2: 'opencode'}, "
+        "config.REVIEWER_AGENTS\n"
+        "assert config.DUEL_AGENTS == ['opencode'], config.DUEL_AGENTS\n"
+        "assert config.DUEL_MODELS == ['opencode/deepseek-v4-flash-free', "
+        "'opencode/hy3-free'], config.DUEL_MODELS\n"
+        "assert config.ESCALATED_MODEL == 'claude-opus-5', "
+        "config.ESCALATED_MODEL\n"
+        "assert config.OPENCODE_ESCALATED_MODEL == "
+        "config.OPENCODE_MODELS['implementer'], "
+        "config.OPENCODE_ESCALATED_MODEL\n"
+    )
+    p = subprocess.run([sys.executable, "-c", probe], cwd=ROOT / "orchestrator",
+                       capture_output=True, text=True, env=_clean_env())
+    if p.returncode != 0:
+        bad += fail("config.py defaults drifted from the all-opencode testing "
+                    f"roster:\n{p.stderr.strip()}")
+    return bad
+
+
+def check_config_overrides() -> int:
+    """Precedence must be env > .env file > config.py defaults, Laravel-style.
+
+    The point of config.py is that the weekly split change is a one-line edit
+    (or a .env value) without touching code: FR_AGENT_PLAN=claude in .env must
+    move planning onto claude, a real environment variable must beat the
+    file, and an unknown agent in either layer must fail at boot, not when
+    the first issue reaches the role.
+    """
+    bad = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        envfile = Path(tmp) / "env"
+        envfile.write_text(
+            "FR_AGENT_PLAN=codex\n"
+            "# a comment line, and a junk line with no '='\n"
+            "FR_MODEL_PLAN=claude-sonnet-5\n"
+            "not-a-knob\n"
+        )
+        probe = (
+            "import config\n"
+            "assert config.ROLE_AGENT['planner'] == 'codex', "
+            "config.ROLE_AGENT['planner']\n"
+            "assert config.MODELS['planner'] == 'claude-sonnet-5', "
+            "config.MODELS['planner']\n"
+            "assert config.REVIEWER_AGENTS == {1: 'opencode', 2: 'opencode'}, "
+            "config.REVIEWER_AGENTS\n"
+        )
+        env = _clean_env()
+        env["FR_ENV_FILE"] = str(envfile)
+        p = subprocess.run([sys.executable, "-c", probe], cwd=ROOT / "orchestrator",
+                           capture_output=True, text=True, env=env)
+        if p.returncode != 0:
+            bad += fail(f".env values must override config.py defaults:\n"
+                        f"{p.stderr.strip()}")
+
+        # A real environment variable beats the file.
+        probe = ("import config\n"
+                 "assert config.ROLE_AGENT['planner'] == 'claude', "
+                 "config.ROLE_AGENT['planner']\n")
+        env["FR_AGENT_PLAN"] = "claude"
+        p = subprocess.run([sys.executable, "-c", probe], cwd=ROOT / "orchestrator",
+                           capture_output=True, text=True, env=env)
+        if p.returncode != 0:
+            bad += fail("a real environment variable must beat the .env file:\n"
+                        f"{p.stderr.strip()}")
+
+        # An unknown agent in the tables must fail at import.
+        env2 = dict(env)
+        env2["FR_AGENT_PLAN"] = "gpt"
+        p = subprocess.run([sys.executable, "-c", "import config"],
+                           cwd=ROOT / "orchestrator", capture_output=True,
+                           text=True, env=env2)
+        if p.returncode == 0:
+            bad += fail("config.py accepted an unknown agent in the tables "
+                        "instead of failing at boot")
     return bad
 
 
@@ -1280,7 +1578,7 @@ def check_retro_through_is_snapshotted_before_invoke() -> int:
             loop.JOURNAL, loop.LOGS = journal, logs
 
             def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
-                            escalate=False):
+                            escalate=False, model=None):
                 # A merge landing while the agent is "running" -- must not be
                 # folded into `through`, which was already taken.
                 with journal.open("a") as fh:
@@ -1475,7 +1773,7 @@ def check_retro_damaged_line_and_tolerant_prompt_command() -> int:
             loop.JOURNAL, loop.LOGS = journal, logs
 
             def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
-                            escalate=False):
+                            escalate=False, model=None):
                 captured["prompt"] = prompt
                 (logs / "retro-2.md").write_text("findings\n")
                 return "claude", 0, "some analysis"
@@ -1590,7 +1888,7 @@ def check_retro_first_pass_still_gets_tolerant_recipe() -> int:
             loop.JOURNAL, loop.LOGS = journal, logs
 
             def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
-                            escalate=False):
+                            escalate=False, model=None):
                 captured["prompt"] = prompt
                 (logs / "retro-1.md").write_text("findings\n")
                 return "claude", 0, "some analysis"
@@ -1772,10 +2070,12 @@ def check_rolling_pool(join_timeout: float = 15.0) -> int:
     import loop
 
     class FakeGh:
-        """Every method cmd_run (and the recover_blocked/sync_waiting it
-        calls) touches, with no network. `ready` is the only state a scenario
-        drives: claim() pops from it and records when; a work stub can push a
-        new issue back mid-run via requeue() to simulate a resolver's REWRITE.
+        """Every method cmd_run (and the sync_waiting it calls) touches, with
+        no network. `ready` is the only state a scenario drives: claim() pops
+        from it and records when; a work stub can push a new issue back
+        mid-run via requeue() to simulate a resolver's REWRITE. blocked_needing_recovery
+        is empty so recovery (a separate lane, not the claim loop's business)
+        never gets exercised here.
         """
         Issue = gh.Issue
 
@@ -2428,7 +2728,8 @@ def check_reviewer_patch_file_is_complete_and_applies() -> int:
     prompts: list[str] = []
 
     def fake_invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
-                    role: str = "implementer", escalate: bool = False):
+                    role: str = "implementer", escalate: bool = False,
+                    model: str | None = None):
         # The real invoke's side effects on logdir, verbatim -- these are the
         # files that sit next to the patch the reviewer is pointed at.
         logdir.mkdir(parents=True, exist_ok=True)
@@ -2588,7 +2889,8 @@ def check_post_fix_empty_diff_does_not_merge() -> int:
     saved = {name: getattr(loop, name) for name in
              ("invoke", "run", "record", "log", "gh", "merge_worktree", "MAX_ATTEMPTS")}
 
-    def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer", escalate=False):
+    def fake_invoke(agent, wt, prompt, logdir, tag, role="implementer",
+                    escalate=False, model=None):
         use = loop.resolve(agent, role, escalate)[0]
         if role == "critic":
             return use, 0, "Nothing wrong with this issue.\n\nVERDICT: PROCEED"
@@ -3423,7 +3725,9 @@ if __name__ == "__main__":
              + check_unmerged_work_survives_reclaim()
              + check_filing_contract_is_stated() + check_reviewer_restore()
              + check_priority_leads_the_queue()
-             + check_verdict_parsing() + check_record_repairs_torn_journal()
+             + check_verdict_parsing() + check_agent_routing()
+             + check_config_defaults() + check_config_overrides()
+             + check_record_repairs_torn_journal()
              + check_retro_cycle_survives_restart()
              + check_retro_callers_derive_the_cycle()
              + check_retro_no_clobber() + check_retro_cycle_claim_is_atomic()

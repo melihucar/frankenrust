@@ -24,7 +24,7 @@ Every issue body must contain these lines, exactly:
 
 ```
 Gate: bootstrap
-Agent: codex
+Agent: opencode
 Depends on: #3, #4
 ```
 
@@ -32,8 +32,11 @@ Depends on: #3, #4
   produces no Rust at all) or `default` (build + clippy + fmt + tests +
   conformance). Use `bootstrap` for anything landing before the conformance
   harness exists, or it will fail a gate it cannot possibly satisfy.
-- **Agent** — `codex` for mechanical grind, `claude` for design-heavy work,
-  `duel` for the two or three hardest (agents alternate on failure).
+- **Agent** — `opencode` for everything right now (the all-opencode testing
+  default; see `orchestrator/config.py` for the per-role tables), `claude` or
+  `codex` for an issue that should follow the split config restores when the
+  weekly quota resets, `duel` for the two or three hardest (the rotation
+  alternates opencode models on failure).
 - **Depends on** — issue numbers whose **behaviour this issue calls into**. Omit
   the line if none. An edge means "I invoke something #N implements", never "I
   need a file #N creates". Those sound alike and are not: scaffolding is created

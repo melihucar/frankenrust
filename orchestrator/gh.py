@@ -152,7 +152,10 @@ class Issue:
     @property
     def agent(self) -> str:
         m = re.search(r"^\s*agent:\s*(\w+)", self.body or "", re.I | re.M)
-        return m.group(1).lower() if m else "codex"
+        # opencode is the default implementer: the bulk of the work is
+        # mechanical, and a cheap model is the right default for a field the
+        # planner forgot to fill in.
+        return m.group(1).lower() if m else "opencode"
 
     @property
     def revisions(self) -> int:
