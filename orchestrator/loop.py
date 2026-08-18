@@ -31,12 +31,23 @@ boundary. scripts/check_orchestrator.py is what keeps that survivable.
 
     python3 orchestrator/loop.py seed      # planner agent files the initial issues
     python3 orchestrator/loop.py run       # drain the queue
+    python3 orchestrator/loop.py unblock   # recovery lane: rescue fr:blocked issues
     python3 orchestrator/loop.py status    # what is open / claimed / blocked
+
+`run` and `unblock` are lanes, meant to run as separate processes under
+scripts/supervise.sh: the claim lane and the recovery lane. A block and the
+work it gates must make progress at the same time, which one process cannot
+do -- recovery used to run inline in the claim loop, and recover_blocked()
+walks the whole blocked queue in one call, so an evening of serial unblocks
+parked every claim (and every wallclock check) for hours. The lanes share
+nothing but GitHub labels (the mutex: run touches fr:ready/fr:claimed, unblock
+touches fr:blocked) and the journal, which is flock-guarded.
 """
 
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -88,6 +99,12 @@ def gate_for(wt: Path) -> str:
 MAX_PARALLEL = int(os.environ.get("FR_PARALLEL", "3"))
 MAX_ATTEMPTS = int(os.environ.get("FR_ATTEMPTS", "3"))
 AGENT_TIMEOUT = int(os.environ.get("FR_AGENT_TIMEOUT", str(60 * 60)))
+# The unblocker's own budget: a recovery lane typically gets 30-60 wallclock
+# minutes, and unblocks cluster around 8-22 min (measured), so the 60-minute
+# default consumed the whole lane on #14's 45-minute unblock -- one recovery
+# per lane run. A capped unblock either decides or leaves the issue blocked
+# with its recovery budget intact for the next lane.
+UNBLOCKER_TIMEOUT = int(os.environ.get("FR_UNBLOCKER_TIMEOUT", str(25 * 60)))
 GATE_TIMEOUT = int(os.environ.get("FR_GATE_TIMEOUT", str(30 * 60)))
 WALLCLOCK_LIMIT = int(os.environ.get("FR_WALLCLOCK", str(8 * 60 * 60)))
 HEARTBEAT = int(os.environ.get("FR_HEARTBEAT", "60"))
@@ -130,6 +147,18 @@ LIMIT_PATTERNS = (
     "resource_exhausted", "please try again later",
 )
 
+# claude is the terminal fallback, so its failure modes decide whether the
+# run keeps working at all: an OAuth session expiry or the weekly quota
+# cannot clear within a run, and re-running it per issue only burns the
+# queue. Unlike LIMIT_PATTERNS these strings are auth-layer errors, never
+# legitimate agent output, but the match is still scoped to `use == "claude"`
+# because a transcript an agent is reading aloud can contain either text.
+AUTH_PATTERNS = (
+    "failed to authenticate: oauth session expired and could not be refreshed",
+    "oauth session expired",
+    "authentication error",
+)
+
 _merge_lock = threading.Lock()
 _claim_lock = threading.Lock()
 _codex_lock = threading.Lock()
@@ -156,6 +185,10 @@ def log(msg: str) -> None:
     print(line, flush=True)
     LOGS.mkdir(parents=True, exist_ok=True)
     with (LOGS / "loop.log").open("a") as fh:
+        # run and unblock lanes are separate processes sharing this file.
+        # flock, not just O_APPEND: two processes appending concurrently can
+        # still interleave a pair of short writes.
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         fh.write(line + "\n")
 
 
@@ -204,6 +237,9 @@ def record(event: str, **fields) -> None:
         # silently vanish, so everything below must land before this `with`
         # block exits.
         with JOURNAL.open("a") as fh:
+            # Cross-process, not just cross-thread: run and unblock lanes are
+            # separate processes writing this same file.
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             if tear is not None:
                 # Isolate the fragment on its own line before anything else
                 # touches the file, then say so in the journal itself -- a
@@ -234,7 +270,8 @@ def _disable_agent(agent: str, reason: str) -> None:
             return
         _disabled_agents = _disabled_agents | {agent}
     os.environ[f"FR_{agent.upper()}_DISABLED"] = "1"  # survives restart_into_new_code
-    log(f"!! {agent} disabled for the rest of this run ({reason}); falling back to claude")
+    log(f"!! {agent} disabled for the rest of this run ({reason})"
+        + ("" if agent == "claude" else "; falling back to claude"))
     # Cross-model review is the reason two reviewers are worth more than one
     # reviewer run twice. Losing it is a change in what a merge means, so it
     # belongs in the journal where the retrospective and the morning review
@@ -248,6 +285,16 @@ def disable_codex(reason: str) -> None:
 
 def disable_opencode(reason: str) -> None:
     _disable_agent("opencode", reason)
+
+
+class NoAgentUsable(RuntimeError):
+    """Every agent this run could dispatch to is disabled (quota/auth walls).
+
+    Raised by resolve() when its terminal default -- claude -- is disabled,
+    and caught by invoke(), which reports `agent_unavailable` instead of
+    spawning nothing and letting the caller guess why the transcript never
+    appeared.
+    """
 
 
 def resolve(agent: str, role: str, escalate: bool = False,
@@ -271,8 +318,20 @@ def resolve(agent: str, role: str, escalate: bool = False,
     if escalate:
         if agent == "opencode" and opencode_ok():
             return "opencode", OPENCODE_ESCALATED_MODEL
-        return "claude", ESCALATED_MODEL
-    return "claude", MODELS.get(role, MODELS["implementer"])
+        if _agent_ok("claude"):
+            return "claude", ESCALATED_MODEL
+        raise NoAgentUsable(agent)
+    if _agent_ok("claude"):
+        return "claude", MODELS.get(role, MODELS["implementer"])
+    # claude is the terminal default; with it disabled nothing can run. The
+    # pre-disable behaviour -- unconditionally return claude -- is what let
+    # the 08-17 run march 28 blocked issues through an auth-broken claude
+    # before anything stopped it.
+    raise NoAgentUsable(agent)
+
+
+def no_agent_usable() -> bool:
+    return all(not _agent_ok(a) for a in AGENTS)
 
 
 def run(cmd: list[str], cwd: Path, timeout: int, log_path: Path | None = None) -> tuple[int, str]:
@@ -448,7 +507,16 @@ def _final_text(logpath: Path, agent: str,
         if ev.get("type") != "result":
             continue
         final = ev.get("result") or final
-        if ev.get("is_error") or ev.get("subtype") not in (None, "success"):
+        if ev.get("is_error"):
+            # claude tags auth failures with subtype "success" and a terminal
+            # api_error; recording that as err="success" made 25 journal
+            # entries read as wins. The error text itself lives in `result`.
+            err = ev.get("subtype") or "error"
+            if err == "success":
+                err = (ev.get("result") or "error")[:200]
+            if ev.get("api_error_status"):
+                err += f" ({ev['api_error_status']})"
+        elif ev.get("subtype") not in (None, "success"):
             err = ev.get("subtype") or "error"
             if ev.get("api_error_status"):
                 err += f" ({ev['api_error_status']})"
@@ -487,13 +555,18 @@ def _hit_limit(logpath: Path) -> bool:
     return any(p in tail for p in LIMIT_PATTERNS)
 
 
+def _hit_auth(text: str) -> bool:
+    low = text.lower()
+    return any(p in low for p in AUTH_PATTERNS)
+
+
 # Who a cheap-quota agent falls back to when its quota dies mid-run.
 FALLBACK_AGENT = {"codex": "claude", "opencode": "claude"}
 
 
 def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
            role: str = "implementer", escalate: bool = False,
-           model: str | None = None) -> tuple[str, int, str]:
+           model: str | None = None, timeout: int = AGENT_TIMEOUT) -> tuple[str, int, str]:
     """Run an agent. Returns (agent_used, rc, output_text).
 
     Prompt goes over stdin so we never hit argv limits. If codex or opencode
@@ -505,7 +578,12 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
     logdir.mkdir(parents=True, exist_ok=True)
     (logdir / f"prompt.{tag}.md").write_text(prompt)
     pf = logdir / f"prompt.{tag}.md"
-    use, model = resolve(agent, role, escalate, model)
+    try:
+        use, model = resolve(agent, role, escalate, model)
+    except NoAgentUsable as exc:
+        log(f"    !! no agent usable for {tag} ({exc}); nothing spawned")
+        record("agent_unavailable", agent=agent, tag=tag, role=role)
+        return None, 1, ""
     rc, logpath = 1, logdir / f"{use}.{tag}.log"
     lastmsg = logdir / f"{use}.{tag}.final.txt"
     for _ in range(2):
@@ -531,15 +609,15 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
                     rc = proc.wait(timeout=HEARTBEAT)
                 except subprocess.TimeoutExpired:
                     waited = time.time() - started
-                    if waited >= AGENT_TIMEOUT:
+                    if waited >= timeout:
                         proc.kill()
-                        log(f"    !! {use} timed out after {AGENT_TIMEOUT}s")
+                        log(f"    !! {use} timed out after {timeout}s")
                         record("agent_timeout", agent=use, tag=tag,
-                               seconds=AGENT_TIMEOUT)
+                               seconds=timeout)
                         return use, 124, ""
                     kb = logpath.stat().st_size // 1024 if logpath.exists() else 0
                     log(f"    .. {tag} running {int(waited // 60)}m"
-                        f" (limit {AGENT_TIMEOUT // 60}m, {kb}KB)")
+                        f" (limit {timeout // 60}m, {kb}KB)")
         text, err = _final_text(logpath, use, lastmsg)
         if err or rc != 0:
             # Say what went wrong at the point it goes wrong. A silent failure
@@ -553,8 +631,26 @@ def invoke(agent: str, wt: Path, prompt: str, logdir: Path, tag: str,
             to = FALLBACK_AGENT[use]
             record("agent_fallback", agent=use, to=to, tag=tag, rc=rc)
             _disable_agent(use, f"exit {rc} with a quota pattern")
-            use, model = resolve(use, role, escalate)
+            try:
+                use, model = resolve(use, role, escalate)
+            except NoAgentUsable as exc:
+                # The fallback claude is disabled too: nothing left to retry
+                # on, so stop the retry loop and report what the first agent
+                # said, named honestly as the agent that ran.
+                log(f"    !! no agent usable after disabling {use} ({exc})")
+                record("agent_unavailable", agent=use, tag=tag, role=role)
+                return None, rc, text
             continue
+        # claude is the terminal fallback: nothing retries after it, and an
+        # auth/quota failure cannot clear within a run. Re-running it per
+        # issue only burns the queue -- the 08-17 run marched 28 blocked
+        # issues through an auth-broken claude in 48s. Disabling it makes
+        # resolve() raise NoAgentUsable, and the recovery and claim lanes
+        # bail out cleanly instead of cascading.
+        if use == "claude" and rc != 0 and (
+                _hit_limit(logpath) or _hit_auth(f"{err}\n{text}")):
+            _disable_agent("claude", f"exit {rc} with an auth/quota failure")
+            break
         break
     return use, rc, text
 
@@ -904,9 +1000,26 @@ def guard_root_writes(tid: str, tag: str, root: Path = ROOT):
             for p in changed:
                 rc, _ = git(["cat-file", "-e", f"HEAD:{p}"], cwd=root)
                 (tracked if rc == 0 else untracked).append(p)
-            log(f"    !! stray write(s) to ROOT during {tag} ({tid}): {changed}")
+            log(f"    !! stray write(s) to ROOT during {tag} ({tid}): {changed} -- "
+                f"tracked content reverted to HEAD, so any uncommitted local "
+                f"edits on those paths are destroyed; see the root_write "
+                f"journal event for the reverted diff")
+            # Capture what is about to be destroyed, per path, while it still
+            # exists on disk: the checkout below erases the only copy of any
+            # legitimate uncommitted edit layered under the stray, and the
+            # guard's own docstring says nothing can tell the two apart. The
+            # journal entry then doubles as a recovery source -- a human who
+            # lost an hour of edits to an agent's window can lift their work
+            # out of the diff instead of rewriting it. `root_write` fires on
+            # the rare stray path (~2 of 3900+ events), so a diff payload is
+            # not a journal-bloat risk.
+            reverted_diff: dict[str, str] = {}
+            for p in tracked:
+                rc, out = git(["diff", "HEAD", "--", p], cwd=root)
+                reverted_diff[p] = out if rc == 0 else f"(diff failed: {out[-200:]})"
             record("root_write", issue=tid, stage=tag, paths=changed,
-                   reverted=tracked, not_reverted=untracked)
+                   reverted=tracked, not_reverted=untracked,
+                   reverted_diff=reverted_diff)
             # `git checkout HEAD -- <path>` takes <root>/.git/index.lock to
             # rewrite the index entry, and git does not retry a contended
             # lock. merge_worktree holds _merge_lock across its
@@ -1442,7 +1555,21 @@ def recover_blocked() -> int:
     again immediately rather than sleeping on a queue that just changed.
     """
     recovered = 0
+    if no_agent_usable():
+        # Belt and suspenders under cmd_unblock's own bail: agents can be
+        # disabled mid-recovery (the last one dies inside this call's last
+        # invoke), and this lane should not walk the queue spawning nothing.
+        log("!! all agents disabled; nothing can recover")
+        return 0
     for issue, waiting in gh.blocked_needing_recovery():
+        # The caller's wallclock check only runs between recover_blocked()
+        # calls, and this loop walks the whole blocked queue in one call -- so
+        # without this, a queue of 30 blocked issues overruns the wallclock by
+        # however long the tail of the queue takes. Stop *starting* new
+        # recoveries past the budget; the one in flight completes (its
+        # worktree is crash-preserved either way).
+        if time.time() - _start > WALLCLOCK_LIMIT:
+            break
         if issue.recoveries >= MAX_RECOVERIES:
             # Say this once. The poll that calls us re-runs every 30s while the
             # queue is waiting on dependencies, which is exactly the state a
@@ -1475,7 +1602,8 @@ def recover_blocked() -> int:
                      f"Rescue {issue.recoveries + 1} of {MAX_RECOVERIES}.\n")
             with guard_root_writes(tid, f"unblock.{issue.recoveries}"):
                 _, _, out = invoke(ROLE_AGENT["unblocker"], wt, prompt_for("unblocker", issue, extra),
-                                   logdir, f"unblock.{issue.recoveries}", role="unblocker")
+                                   logdir, f"unblock.{issue.recoveries}",
+                                   role="unblocker", timeout=UNBLOCKER_TIMEOUT)
 
             if "RECOVERY: CLOSE" in out:
                 gh.close(issue.number,
@@ -1580,15 +1708,15 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             extra = ("\n# The previous attempt FAILED\nFix the root cause; do not "
                      f"paper over it.\n\n```\n{failure[-6000:]}\n```\n")
         with guard_root_writes(tid, f"impl.{attempt}"):
-            invoke(agent, wt, prompt_for("implementer", issue, extra), logdir,
-                   f"impl.{attempt}", role="implementer", model=model,
-                   escalate=(attempt >= MAX_ATTEMPTS))
+            used, _, _ = invoke(agent, wt, prompt_for("implementer", issue, extra),
+                                logdir, f"impl.{attempt}", role="implementer",
+                                model=model, escalate=(attempt >= MAX_ATTEMPTS))
 
         rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
                        logdir / f"gate.{attempt}.log")
         if rc != 0:
             log(f"    xx gate failed (#{issue.number} attempt {attempt})")
-            record("gate_fail", issue=issue.number, attempt=attempt, agent=agent,
+            record("gate_fail", issue=issue.number, attempt=attempt, agent=used,
                    gate=issue.gate, tail=tail[-1500:])
             failure = tail
             continue
@@ -1601,7 +1729,11 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
         # closed. Spend the attempt instead.
         if not worktree_diff(wt).strip():
             log(f"    xx #{issue.number} attempt {attempt} changed nothing")
-            record("empty_diff", issue=issue.number, attempt=attempt, agent=agent)
+            # `used`, not `agent`: the rotation slot is what was REQUESTED;
+            # invoke() may have fallen back to claude on a quota latch, and
+            # the journal must name who actually ran. #14's unblocker was
+            # misled by exactly this field.
+            record("empty_diff", issue=issue.number, attempt=attempt, agent=used)
             failure = ("You changed no files. The gate passing means only that you "
                        "broke nothing; it is not evidence of work.")
             continue
@@ -1619,8 +1751,8 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             record("review_block", issue=issue.number, attempt=attempt,
                    phase="initial", excerpt=blocking[:1500])
             with guard_root_writes(tid, f"fix.{attempt}"):
-                invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"), logdir,
-                       f"fix.{attempt}", role="fixer", model=model)
+                fused, _, _ = invoke(agent, wt, prompt_for("fixer", issue, f"\n{blocking}\n"),
+                                     logdir, f"fix.{attempt}", role="fixer", model=model)
             rc, tail = run(["bash", gate_for(wt), issue.gate], wt, GATE_TIMEOUT,
                            logdir / f"gate.fix.{attempt}.log")
             if rc != 0:
@@ -1653,7 +1785,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
             if not worktree_diff(wt).strip():
                 log(f"    xx #{issue.number} attempt {attempt} fixer left nothing to merge")
                 record("empty_diff", issue=issue.number, attempt=attempt,
-                       agent=agent, phase="post-fix")
+                       agent=fused, phase="post-fix")
                 failure = ("The fixer removed the work rather than fixing it. "
                            "The gate passing on an empty diff means only that "
                            "nothing is broken; it is not evidence of a fix.")
@@ -1674,7 +1806,7 @@ def _work(issue: gh.Issue, tid: str, wt: Path, logdir: Path) -> None:
                      f"Merged as `{sha}` after {attempt} attempt(s), gate `{issue.gate}`, "
                      f"and {reviewed}.")
             record("merged", issue=issue.number, title=issue.title,
-                   attempts=attempt, agent=agent, gate=issue.gate)
+                   attempts=attempt, agent=used, gate=issue.gate)
             _merge_signal.set()
             return
         failure = "Passed gate and review but could not merge (rebase conflict or "\
@@ -2009,8 +2141,9 @@ def restart_into_new_code() -> None:
     left = max(int(WALLCLOCK_LIMIT - (time.time() - _start)), 60)
     env = {**os.environ, "FR_WALLCLOCK": str(left),
            "FR_RESTARTS": str(int(os.environ.get("FR_RESTARTS", "0")) + 1)}
+    mode = sys.argv[1] if len(sys.argv) > 1 else "run"
     os.execve(sys.executable,
-              [sys.executable, str(Path(__file__).resolve()), "run"], env)
+              [sys.executable, str(Path(__file__).resolve()), mode], env)
 
 
 def cmd_run() -> int:
@@ -2076,6 +2209,15 @@ def cmd_run() -> int:
                 log("!! wallclock limit reached, stopping")
                 break
 
+            if no_agent_usable():
+                # Every agent is disabled (quota/auth walls). Claims would
+                # burn the queue the same way the 08-17 recovery cascade did.
+                # In-flight futures still complete -- same `break` semantics
+                # as the wallclock, down through shutdown(wait=True).
+                log("!! all agents disabled; claiming nothing further")
+                record("no_agent_usable", phase="claim_lane")
+                break
+
             reap()  # opportunistic, non-blocking: free capacity before budgeting
 
             # No new claims once a self-update is pending -- swapping the
@@ -2091,12 +2233,12 @@ def cmd_run() -> int:
                 break  # unreachable once restart_into_new_code() execve's;
                        # kept so this loop is correct on its own terms too.
 
-            # Recover before claiming, so anything rescued is claimable in this
-            # same round. Cheap when there is nothing to do -- blocked_needing_recovery
-            # only reaches an agent for a block that other open issues wait on.
-            recover_blocked()
-            # Mirror the dependency filter onto the labels. Only writes on a
-            # change, so a queue in steady state costs one read.
+            # Recovery is a lane of its own now (loop.py unblock, supervised
+            # alongside this one): a blocked issue and the work it gates make
+            # progress at the same time, instead of this loop parking every
+            # claim -- and every wallclock check -- for the duration of the
+            # whole blocked queue. This lane only mirrors the dependency
+            # filter onto the labels.
             added, removed = gh.sync_waiting()
             if added or removed:
                 log(f"fr:waiting +{added} -{removed}")
@@ -2196,6 +2338,52 @@ def cmd_run() -> int:
     return 0 if not blocked else 1
 
 
+def cmd_unblock() -> int:
+    """The recovery lane: rescue blocked issues while the claim lane drains.
+
+    A separate process from `run`, and the recovery that used to live inline
+    in the claim loop. Inline meant serial and unbounded: recover_blocked()
+    walks the whole blocked queue in one call, so the claim loop -- its
+    claims, its drain detection, its wallclock check -- suspended for the
+    duration of every blocked issue's unblock. This lane owns all of fr:blocked
+    (the run lane never touches it), runs for its own FR_WALLCLOCK, and is
+    supervised alongside `run`, so a block and the work it gates make progress
+    at the same time. The only shared state is GitHub labels, which is the
+    mutex: this lane never claims, and the run lane never unblocks.
+    """
+    gh.ensure_labels()
+    log(f"unblock lane start: wallclock={WALLCLOCK_LIMIT}s")
+    recovered = 0
+    while True:
+        if time.time() - _start > WALLCLOCK_LIMIT:
+            log("!! unblock wallclock limit reached, stopping")
+            break
+        if no_agent_usable():
+            # Every agent is disabled (quota/auth walls). A recovery lane
+            # that can spawn nothing is worse than no lane: it would walk
+            # the blocked queue creating and destroying worktrees forever.
+            # Stop so the supervisor can surface the exit; a fresh start
+            # (without the FR_*_DISABLED env this process inherited) can
+            # retry once the walls clear.
+            log("!! all agents disabled; unblock lane stopping")
+            record("no_agent_usable", phase="unblock_lane")
+            break
+        if self_update_pending():
+            restart_into_new_code()
+            break  # unreachable once restart_into_new_code() execve's
+        n = recover_blocked()
+        recovered += n
+        # Keep the wait annotations current even if the run lane is down.
+        added, removed = gh.sync_waiting()
+        if added or removed:
+            log(f"fr:waiting +{added} -{removed}")
+        time.sleep(5 if n else 30)
+    stuck = gh.blocked_needing_recovery()
+    log(f"unblock lane end: recovered={recovered} "
+        f"still-blocked={[i.number for i, _ in stuck]}")
+    return 0 if not stuck else 1
+
+
 def cmd_status() -> int:
     for label in ("fr:ready", "fr:waiting", "fr:claimed", "fr:blocked", "fr:questioned"):
         items = gh.fetch(label=label)
@@ -2224,7 +2412,7 @@ def cmd_status() -> int:
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     return {"run": cmd_run, "seed": cmd_seed, "status": cmd_status,
-            "retro": cmd_retro}.get(
+            "retro": cmd_retro, "unblock": cmd_unblock}.get(
         cmd, lambda: (print(__doc__), 2)[1])()
 
 

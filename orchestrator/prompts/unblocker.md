@@ -40,6 +40,12 @@ which one, with evidence:
 - **The environment is wrong.** The gate demanded a toolchain that is not
   installed, disk ran out, an agent hit a quota wall. Nothing about the issue
   is at fault and re-running it unchanged will fail identically.
+- **The loop itself is wrong.** The issue is fine, but the machinery failed it:
+  the journal mislabeled who ran, a broken fallback agent was dispatched, a
+  record lied about the failure. Re-running will fail identically until the
+  loop is fixed. This is the rarest cause and the most valuable one to catch —
+  and it is invisible unless you actually read the transcripts instead of the
+  summary fields.
 - **The work is genuinely hard and the attempts were genuinely bad.** Rarer
   than it looks. Say what a fourth attempt would do differently, concretely,
   or pick a different outcome.
@@ -63,6 +69,23 @@ Say what, and say what changed. If the fix is in the issue text, rewrite the
 body first with `gh issue edit`. Use this when a fresh attempt has a genuine
 reason to go differently, not as a way of hoping.
 
+**Filing a loop defect** — when your diagnosis is "the loop itself is wrong",
+file the defect so the loop fixes itself instead of rediscovering it issue by
+issue. Do this *before* emitting your decision line:
+
+- `gh issue list --state all --label fr:meta` first. If the defect is already
+  filed, do not duplicate it — say in your comment that it is already tracked.
+- File with `gh issue create --title "orchestrator: <the defect>" --body
+  "<evidence>" --label fr:ready,fr:meta,fr:p2`. The body must open with
+  `Gate: bootstrap` and `Agent: opencode` on their own lines, quote the
+  evidence from `orchestrator/logs/<N>/` (exact lines, file names, timestamps)
+  and name this issue (`#<N>`) as the occurrence. **No `Depends on:` line** —
+  it would wait on this very issue and deadlock.
+- This is an *action*, not an outcome: you still end with exactly one of
+  `RECOVERY: SPLIT`, `RECOVERY: REQUEUE`, `RECOVERY: CLOSE`. A loop defect
+  means the issue itself is usually fine, so `REQUEUE` is the natural
+  companion — say what changed.
+
 **`RECOVERY: CLOSE`** — the work should not happen: already landed, made
 irrelevant by something merged since, or outside the scope in `README.md`.
 State the evidence.
@@ -84,3 +107,6 @@ because it is hard. Close it only when you can show it should not exist.
 depend on this one. If that list is long, splitting to unblock them is worth
 more than any amount of polish on this issue, and closing it strands every one
 of them.
+
+Filing a loop defect is not a way out of deciding: it is a byproduct of a
+correct diagnosis. The issue still needs one of the three lines.

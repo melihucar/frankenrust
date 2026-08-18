@@ -318,7 +318,7 @@ def check_blocked_has_a_recovery_path() -> int:
     bad = 0
     if not (ROOT / "orchestrator" / "prompts" / "unblocker.md").exists():
         bad += fail("no prompts/unblocker.md: fr:blocked has no recovery role")
-    for name in ("recover_blocked",):
+    for name in ("recover_blocked", "cmd_unblock"):
         if not hasattr(loop, name):
             bad += fail(f"loop.{name}() is gone; fr:blocked is absorbing again")
     for name in ("blocked_needing_recovery", "unblock"):
@@ -357,11 +357,33 @@ def check_blocked_has_a_recovery_path() -> int:
         bad += fail(f"recovery order regressed: got {order}, want [1, 2] "
                     "(most dependants first, leaves last but never dropped)")
 
-    # ...and cmd_run must actually call it, before claiming.
-    run_src = (ROOT / "orchestrator" / "loop.py").read_text().split("def cmd_run")[-1]
-    if "recover_blocked()" not in run_src:
-        bad += fail("cmd_run() never calls recover_blocked(); the recovery exists "
-                    "but nothing triggers it")
+    # ...and something must actually call it. Recovery is its own lane now:
+    # `loop.py unblock` is a separate process supervised alongside the claim
+    # lane, so a block and the work it gates make progress at the same time.
+    # That only holds if the lanes are actually separated -- recovery creeping
+    # back into the claim loop would resurrect the serial stall it exists to
+    # remove (recover_blocked() walks the whole blocked queue in one call, so
+    # even a single inline call suspends claims and the wallclock for hours),
+    # so cmd_run must NOT recover, and cmd_unblock must.
+    src = (ROOT / "orchestrator" / "loop.py").read_text()
+
+    def body(name: str) -> str:
+        rest = src.split(f"def {name}")[-1]
+        return rest.split("\ndef ")[0]
+
+    if "recover_blocked()" in body("cmd_run"):
+        bad += fail("cmd_run() calls recover_blocked(); recovery belongs to the "
+                    "unblock lane, and a claim lane that recovers serializes "
+                    "every claim behind each unblock")
+    if "recover_blocked()" not in body("cmd_unblock"):
+        bad += fail("cmd_unblock() never calls recover_blocked(); the unblock "
+                    "lane exists but recovers nothing")
+    if '"unblock": cmd_unblock' not in src:
+        bad += fail("main() does not dispatch `loop.py unblock`; the lane "
+                    "cannot be started")
+    if "sys.argv[1]" not in body("restart_into_new_code"):
+        bad += fail("restart_into_new_code() re-execs into a hardcoded mode; "
+                    "an unblock lane self-update would come back as a run lane")
     return bad
 
 
@@ -984,24 +1006,46 @@ def check_agent_routing() -> int:
     import loop
     bad = 0
 
-    # Routing table: (requested, role, escalate, latch_agent, want_agent,
-    # want_model, model_override).
+    # Routing table: (requested, role, escalate, latch, want_agent, want_model,
+    # model_override, want_exc).
+    #
+    # Latching pins _disabled_agents directly. The alternative -- calling
+    # disable_<agent>() -- records review_diversity_lost into the MAIN
+    # journal, and gate.sh runs this check inside every gate, so every gate
+    # used to leave a fake diversity-loss record behind (observed 5x on
+    # 08-17/08-18). Once claude became disableable it would also have set
+    # FR_CLAUDE_DISABLED in gate subprocesses.
     cases = [
         ("claude", "implementer", False, None, "claude", loop.MODELS["implementer"],
-         None),
+         None, None),
         ("opencode", "implementer", False, None, "opencode",
-         loop.OPENCODE_MODELS["implementer"], None),
+         loop.OPENCODE_MODELS["implementer"], None, None),
         ("opencode", "reviewer", False, None, "opencode",
-         loop.OPENCODE_MODELS["reviewer"], None),
-        ("codex", "implementer", False, None, "codex", None, None),
-        ("claude", "implementer", True, None, "claude", loop.ESCALATED_MODEL, None),
+         loop.OPENCODE_MODELS["reviewer"], None, None),
+        ("codex", "implementer", False, None, "codex", None, None, None),
+        ("claude", "implementer", True, None, "claude", loop.ESCALATED_MODEL, None,
+         None),
         ("opencode", "implementer", True, None, "opencode",
-         loop.OPENCODE_ESCALATED_MODEL, None),
-        ("codex", "implementer", True, None, "claude", loop.ESCALATED_MODEL, None),
+         loop.OPENCODE_ESCALATED_MODEL, None, None),
+        ("codex", "implementer", True, None, "claude", loop.ESCALATED_MODEL, None,
+         None),
         ("opencode", "implementer", False, "opencode", "claude",
-         loop.MODELS["implementer"], None),
+         loop.MODELS["implementer"], None, None),
         ("codex", "implementer", False, "codex", "claude",
-         loop.MODELS["implementer"], None),
+         loop.MODELS["implementer"], None, None),
+        # claude is the terminal fallback: with it latched nothing can route.
+        # resolve() must refuse loudly (NoAgentUsable) rather than return
+        # claude anyway and let the run cascade -- the 08-17 run marched 28
+        # blocked issues through an auth-broken claude before anything
+        # stopped it.
+        ("claude", "implementer", False, "claude", None, None, None,
+         loop.NoAgentUsable),
+        ("claude", "implementer", True, "claude", None, None, None,
+         loop.NoAgentUsable),
+        # The real 08-17 shape: cheap agent latched, and the claude it would
+        # fall back to latched too.
+        ("opencode", "implementer", False, {"opencode", "claude"}, None, None,
+         None, loop.NoAgentUsable),
         # "duel" is a scheduling directive: a stage asking for the issue's
         # agent without unwrapping the rotation routes to the role default.
         # The want follows the configured critic, whatever the ambient run
@@ -1009,23 +1053,34 @@ def check_agent_routing() -> int:
         ("duel", "critic", False, None, loop.ROLE_AGENT["critic"],
          (loop.OPENCODE_MODELS["critic"] if loop.ROLE_AGENT["critic"] == "opencode"
           else loop.MODELS["critic"] if loop.ROLE_AGENT["critic"] == "claude"
-          else None), None),
+          else None), None, None),
         # The duel rotation's model override threads through to opencode only.
         ("opencode", "implementer", False, None, "opencode", "opencode/hy3-free",
-         "opencode/hy3-free"),
+         "opencode/hy3-free", None),
     ]
     saved_ok = {a: getattr(loop, f"{a}_ok") for a in ("codex", "opencode")}
     try:
-        for requested, role, escalate, latch, want_agent, want_model, override in cases:
-            if latch:
-                getattr(loop, f"disable_{latch}")("routing check")
-            else:
-                loop._disabled_agents = set()
-            agent, model = loop.resolve(requested, role, escalate, override)
+        for requested, role, escalate, latch, want_agent, want_model, override, want_exc in cases:
+            loop._disabled_agents = ({latch} if isinstance(latch, str)
+                                      else set(latch or ()))
+            try:
+                agent, model = loop.resolve(requested, role, escalate, override)
+            except Exception as exc:
+                if want_exc and isinstance(exc, want_exc):
+                    continue
+                bad += fail(f"resolve({requested!r}, {role!r}, escalate={escalate}"
+                            f", model={override!r}, latched={latch or ()!r}) raised "
+                            f"{exc!r}; want {want_exc or 'no exception'}")
+                continue
+            if want_exc:
+                bad += fail(f"resolve({requested!r}, {role!r}, escalate={escalate}"
+                            f", latched={latch or ()!r}) -> ({agent!r}, {model!r}); "
+                            f"want {want_exc.__name__}")
+                continue
             if agent != want_agent or model != want_model:
                 bad += fail(f"resolve({requested!r}, {role!r}, escalate={escalate}"
                             f", model={override!r}"
-                            f"{', latched ' + latch if latch else ''}) -> "
+                            f", latched={latch or ()!r}) -> "
                             f"({agent!r}, {model!r}); want ({want_agent!r}, "
                             f"{want_model!r})")
         loop._disabled_agents = set()
@@ -2015,10 +2070,12 @@ def check_rolling_pool(join_timeout: float = 15.0) -> int:
     import loop
 
     class FakeGh:
-        """Every method cmd_run (and the recover_blocked/sync_waiting it
-        calls) touches, with no network. `ready` is the only state a scenario
-        drives: claim() pops from it and records when; a work stub can push a
-        new issue back mid-run via requeue() to simulate a resolver's REWRITE.
+        """Every method cmd_run (and the sync_waiting it calls) touches, with
+        no network. `ready` is the only state a scenario drives: claim() pops
+        from it and records when; a work stub can push a new issue back
+        mid-run via requeue() to simulate a resolver's REWRITE. blocked_needing_recovery
+        is empty so recovery (a separate lane, not the claim loop's business)
+        never gets exercised here.
         """
         Issue = gh.Issue
 
