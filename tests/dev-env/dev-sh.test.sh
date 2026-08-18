@@ -229,7 +229,9 @@ reset; dev a true; vol_a="$(target_volume)"
 reset; dev b true; vol_b="$(target_volume)"
 assert_nonempty "worktree a mounts a target volume" "$vol_a"
 assert_ne "distinct worktrees get distinct target volumes" "$vol_a" "$vol_b"
-assert_log_has "the volume is mounted at /work/target" "$vol_b:/work/target"
+assert_log_has "the volume is mounted at /target" "$vol_b:/target"
+assert_log_has "the container is pointed at the /target mount" \
+  "CARGO_TARGET_DIR=/target"
 
 reset; dev a true; vol_a2="$(target_volume)"
 assert_eq "the same worktree reuses its volume across runs" "$vol_a" "$vol_a2"
@@ -293,8 +295,8 @@ printf '\n# a change that must invalidate the target cache\n' >> "$TMP/a/docker/
 : > "$DOCKER_LOG"
 dev a true; vol2="$(target_volume)"
 assert_ne "an image change changes the target volume name" "$vol1" "$vol2"
-assert_log_has "the new image's volume is the one mounted" "$vol2:/work/target"
-assert_log_lacks "the old image's cache is not mounted" "$vol1:/work/target"
+assert_log_has "the new image's volume is the one mounted" "$vol2:/target"
+assert_log_lacks "the old image's cache is not mounted" "$vol1:/target"
 
 # A volume from before the image was part of the name cannot collide with one
 # that has it, so it is never mounted -- but it is still ours, and still a
@@ -332,7 +334,7 @@ assert_eq "an unremovable superseded volume is not a failure" 0 "$rc"
 assert_log_has "the reclaim is still attempted" "volume rm $held"
 assert_stderr_has "the leak is warned about, not swallowed" \
   "WARNING: could not reclaim $held"
-assert_log_has "the run proceeds on a fresh volume" "$(target_volume):/work/target"
+assert_log_has "the run proceeds on a fresh volume" "$(target_volume):/target"
 assert_ne "and that volume is not the one it could not remove" "$held" "$(target_volume)"
 
 # A peer worktree's volume is not ours to reclaim: a sibling on a different
@@ -461,7 +463,7 @@ dev a true
 assert_log_has "the unlabelled volume is discarded, not reused" "volume rm $vol1"
 assert_log_has "a properly labelled volume is created under the same name" \
   "volume create --label com.frankenrust.worktree=$TMP/a"
-assert_log_has "the recreated volume is still the one mounted" "$vol1:/work/target"
+assert_log_has "the recreated volume is still the one mounted" "$vol1:/target"
 
 # A superseded (different-image) sibling can be unlabelled for the same
 # reason. It must be reclaimed too, but a sibling that IS labelled -- in
